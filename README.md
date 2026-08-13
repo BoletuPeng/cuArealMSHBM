@@ -3,6 +3,8 @@
 <a id="english"></a>
 **English** | [简体中文](#chinese)
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21922832.svg)](https://doi.org/10.5281/zenodo.21922832)
+
 **CPU/GPU-accelerated Areal-MSHBM** — individual-specific cortical
 parcellation from resting-state fMRI, ported end-to-end to Python with
 numba (CPU) and CuPy (GPU) backends. First stable release, validated
@@ -278,6 +280,10 @@ If you use cuArealMSHBM, please cite this repository (see
 > Behavior.* Cerebral Cortex, 2021;31(10):4477–4500.
 > doi:10.1093/cercor/bhab101
 
+All versions of this software are archived on Zenodo — cite via
+[doi:10.5281/zenodo.21922832](https://doi.org/10.5281/zenodo.21922832)
+(resolves to the latest release).
+
 ## Acknowledgments
 
 To the **Computational Brain Imaging Group (CBIG)** at the National
@@ -454,6 +460,8 @@ MIT —— 见 [`LICENSE`](LICENSE)。许可证覆盖本仓库中的源代码。
 > Parcellations Improve Functional Connectivity Prediction of
 > Behavior.* Cerebral Cortex, 2021;31(10):4477–4500.
 > doi:10.1093/cercor/bhab101
+
+本软件的所有版本均存档于 Zenodo——可通过 [doi:10.5281/zenodo.21922832](https://doi.org/10.5281/zenodo.21922832) 引用（自动解析到最新版本）。
 
 ## 致谢
 
