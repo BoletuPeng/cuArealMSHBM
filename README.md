@@ -293,84 +293,45 @@ field, we extend our sincere greetings and deepest respect.
 
 [English](#english) | **简体中文**
 
-**CPU/GPU 加速的 Areal-MSHBM** —— 基于静息态 fMRI 的个体化皮层分区，
-以 numba（CPU）与 CuPy（GPU）双后端完成端到端的 Python 移植。
-本版本为第一个稳定版，已在大规模数据（300+ 名被试、1,800+ 个 fMRI
-session）上与原版 MATLAB 实现完成对照校验。
+**CPU/GPU 加速的 Areal-MSHBM** —— 基于静息态 fMRI 的个体化皮层分区，以 numba（CPU）与 CuPy（GPU）双后端完成端到端的 Python 移植。本版本为第一个稳定版，已在大规模数据（300+ 名被试、1,800+ 个 fMRI session）上与原版 MATLAB 实现完成对照校验。
 
 ---
 
 ## 为什么是 Areal-MSHBM
 
 **Areal 多 session 层级贝叶斯模型**
-（[Kong et al., 2021, *Cerebral Cortex*](https://doi.org/10.1093/cercor/bhab101)；
-[CBIG 参考实现](https://github.com/ThomasYeoLab/CBIG)）
-是一个非常出色的个体化分区方案：它以严谨的生成式模型在 session 与被试
-两个层级间汇聚信息，得到的个体化 areal 级分区在同质性与行为预测上均
-优于群体图谱。
+（[Kong et al., 2021, *Cerebral Cortex*](https://doi.org/10.1093/cercor/bhab101)；[CBIG 参考实现](https://github.com/ThomasYeoLab/CBIG)）是一个非常出色的个体化分区方案：它以严谨的生成式模型在 session 与被试两个层级间汇聚信息，得到的个体化 areal 级分区在同质性与行为预测上均优于群体图谱。
 
-然而在实践中，参考流水线速度慢、内存占用大，且专为 Linux 大规模计算
-集群设计（MATLAB + 编译 MEX、集群作业提交、逐步骤中间结果落盘）。在
-工作站上完成单个被试的分区需要数十分钟和约 11 GB 内存；队列级的先验
-训练更是离开集群便无从谈起。这样的部署门槛切实阻碍了该方法的普及——
-而这与它的科学价值并不相称。
+然而在实践中，参考流水线速度慢、内存占用大，且专为 Linux 大规模计算集群设计（MATLAB + 编译 MEX、集群作业提交、逐步骤中间结果落盘）。在工作站上完成单个被试的分区需要数十分钟和约 11 GB 内存；队列级的先验训练更是离开集群便无从谈起。这样的部署门槛切实阻碍了该方法的普及——而这与它的科学价值并不相称。
 
 ## 我们的愿景
 
-我们的目标是将先进的 GPU 加速工程引入这类有潜力的神经影像方法，
-使它们能够以前所未有的规模得到详细的评估与使用。曾经需要计算集群的
-方法，应当能在一块笔记本 GPU 上运行；曾经只能抽样少数被试的评估，
-应当能横扫整个队列。
+我们的目标是将先进的 GPU 加速工程引入这类有潜力的神经影像方法，使它们能够以前所未有的规模得到详细的评估与使用。曾经需要计算集群的方法，应当能在一块笔记本 GPU 上运行；曾经只能抽样少数被试的评估，应当能横扫整个队列。
 
 ## 本项目做了什么
 
-cuArealMSHBM 用 Python 重新实现了全部四个流水线步骤（RSFC 梯度嵌入 →
-连接 profile 与 vMF 初始化 → 组先验 EM 训练 → 逐被试分区 EM），提供两个
-可互换的后端：
+cuArealMSHBM 用 Python 重新实现了全部四个流水线步骤（RSFC 梯度嵌入 →连接 profile 与 vMF 初始化 → 组先验 EM 训练 → 逐被试分区 EM），提供两个可互换的后端：
 
 - **CPU 后端** —— numba-JIT 内核，无需 GPU。
 - **GPU 后端** —— CuPy + 手写 RawKernel。
 
 工程亮点：
 
-- **更快、更精确的贝塞尔类函数数值计算。** vMF 归一化常数与浓度参数
-  更新均改用 `log I_ν` 的闭式解与渐近展开，而非参考实现的通用贝塞尔
-  路径。经 mpmath 50 位精度审计：d=3 的 vMF 对数归一化常数精确到
-  0.31 × fp32 eps —— 在 κ = 1000 处比 MATLAB 原版**精确至多 19 倍**，
-  且无分支、对 JIT/GPU 友好。
-- **位打包的显存压缩。** 二值化 BOLD profile 在设备上以位打包的
-  `uint8 (N, T, ⌈D/8⌉)` 张量存放 —— 8 倍压缩，使 40 被试 × 6 session
-  队列的 BOLD 仅占 1.45 GB 显存（未打包约 11.6 GB），并由基于 popcount
-  的内核直接消费打包形式。
-- **瓶颈步骤上的算子融合与算子调优**：融合的 profile 生成内核、带
-  逐被试 fp64 暂存的融合 E-step softmax 链（fp32 存储，精度关键处
-  fp64）、调优的归约，以及将 I/O 隐藏在 GPU 计算之后的流水线化 BOLD
-  解码。
+- **更快、更精确的贝塞尔类函数数值计算。** vMF 归一化常数与浓度参数更新均改用 `log I_ν` 的闭式解与渐近展开，而非参考实现的通用贝塞尔路径。经 mpmath 50 位精度审计：d=3 的 vMF 对数归一化常数精确到 0.31 × fp32 eps —— 在 κ = 1000 处比 MATLAB 原版**精确至多 19 倍**，且无分支、对 JIT/GPU 友好。
+- **位打包的显存压缩。** 二值化 BOLD profile 在设备上以位打包的 `uint8 (N, T, ⌈D/8⌉)` 张量存放 —— 8 倍压缩，使 40 被试 × 6 session 队列的 BOLD 仅占 1.45 GB 显存（未打包约 11.6 GB），并由基于 popcount 的内核直接消费打包形式。
+- **瓶颈步骤上的算子融合与算子调优**：融合的 profile 生成内核、带逐被试 fp64 暂存的融合 E-step softmax 链（fp32 存储，精度关键处fp64）、调优的归约，以及将 I/O 隐藏在 GPU 计算之后的流水线化 BOLD 解码。
 
-结果：在最重的瓶颈内核上，相对 MATLAB 参考实现的加速在单张 Blackwell
-GPU 上达到**两到三个数量级**（如 step-3 连通域修剪：448.8 s → 0.30 s，
-约 1,500 倍；step-3 分区 EM：763 s → 3.3 s，约 230 倍），单被试全流程
-端到端提速**约 68 倍**。
+结果：在最重的瓶颈内核上，相对 MATLAB 参考实现的加速在单张 BlackwellGPU 上达到**两到三个数量级**（如 step-3 连通域修剪：448.8 s → 0.30 s，约 1,500 倍；step-3 分区 EM：763 s → 3.3 s，约 230 倍），单被试全流程端到端提速**约 68 倍**。
 
 ## 项目状态
 
-**这是第一个稳定版**，包含 CPU 与 GPU 两个后端。在迄今超过 **300 名
-被试、1,800 个 fMRI session** 的大规模校验中，它与原版实现的输出在
-数值所允许的极限水平上保持一致（逐顶点一致率约 98%；跨 BLAS/归约
-顺序边界的位级一致在数学上不可达），同时带来显著的速度与内存节约
-（见下方表格）。
+**这是第一个稳定版**，包含 CPU 与 GPU 两个后端。在迄今超过 **300 名被试、1,800 个 fMRI session** 的大规模校验中，它与原版实现的输出在数值所允许的极限水平上保持一致（逐顶点一致率约 98%；跨 BLAS/归约顺序边界的位级一致在数学上不可达），同时带来显著的速度与内存节约（见下方表格）。
 
-项目仍在持续完善中。**所有预计算数据**（网格资产包、step-0 缓存、
-预训练 HCP 组先验、空间掩膜）**将由带 GUI 的发行版（开发中）的安装
-程序部署。** 本源码版本刻意不包含这些资产 —— 安装程序部署的目录布局
-见 [`arealmshbm/data/README.md`](arealmshbm/data/README.md)。
+项目仍在持续完善中。**所有预计算数据**（网格资产包、step-0 缓存、预训练 HCP 组先验、空间掩膜）**将由带 GUI 的发行版（开发中）的安装程序部署。** 本源码版本刻意不包含这些资产 —— 安装程序部署的目录布局见 [`arealmshbm/data/README.md`](arealmshbm/data/README.md)。
 
 ## 基准测试
 
-所有数字均在同一台 Windows 11 笔记本上测得：RTX 5090 Laptop GPU
-（Blackwell，24 GB）、Python 3.13、numba 0.63.1、CuPy 13.6.0。MATLAB
-基线为 CBIG 参考流水线**并启用其编译 MEX 热路径**（`mtimesx`），在同
-一台机器上运行 —— 比典型集群节点更强的基线。
+所有数字均在同一台 Windows 11 笔记本上测得：RTX 5090 Laptop GPU（Blackwell，24 GB）、Python 3.13、numba 0.63.1、CuPy 13.6.0。MATLAB基线为 CBIG 参考流水线**并启用其编译 MEX 热路径**（`mtimesx`），在同一台机器上运行 —— 比典型集群节点更强的基线。
 
 ### Mode A —— 基于预训练先验的个体化分区
 
@@ -389,10 +350,7 @@ gMSHBM，β = 5，w = 50，c = 10：
 MATLAB 路径还额外需要一次 1,527 s 的 GIFTI→NIfTI 一次性格式转换；
 cuArealMSHBM 原生读取 `.func.gii`。
 
-¹ 皮层顶点，剔除内侧壁。两个 Python 后端彼此的一致率为 98.21%。
-MATLAB↔Python 的位级一致不可达 —— 移植跨越了 BLAS/归约顺序边界 ——
-且残余分歧主要来自*参考实现*精度较低的贝塞尔计算，而非我们
-（审计见 `arealmshbm/spatial_priors/_cdln.py`）。
+¹ 皮层顶点，剔除内侧壁。两个 Python 后端彼此的一致率为 98.21%。MATLAB↔Python 的位级一致不可达 —— 移植跨越了 BLAS/归约顺序边界 ——且残余分歧主要来自*参考实现*精度较低的贝塞尔计算，而非我们（审计见 `arealmshbm/spatial_priors/_cdln.py`）。
 
 ### Mode B —— 在本地队列上训练组先验
 
@@ -404,38 +362,13 @@ MATLAB↔Python 的位级一致不可达 —— 移植跨越了 BLAS/归约顺�
 | 全流程 step 0–3，整个队列（生产运行） | 工作站上不可实施² | — | **~478 s（≈8 分钟）** |
 | 40 被试全队列的内存占用 | **≈ 370–490 GB RAM**（预估²） | — | **峰值 ~9 GB / 24 GB 显存** |
 
-² 由参考实现源码
-（`CBIG_ArealMSHBM_gMSHBM_estimate_group_priors_{parent,child}.m`）
-推算，而非实测 —— 因为它在工作站上*无法*实测。参考实现的 step 2
-被架构为 **1 个 parent + S 个 child 集群作业**（其源码头注释原文：
-*"user should submit 1 parent job and num_sub child jobs"*），在
-**每个 M-step 内层迭代**都通过文件系统交换 `.mat` 文件。child 会阻塞
-在迭代中途等待 parent 的回复，因此被试无法串行处理：40 个 child 必须
-**同时**常驻。在本基准形状下（N = 81,924 顶点、D = 1,175 profile 维、
-T = 6 session、L = 300 分区、全 fp64），每个 child 持有 profile 主存储
-`data_series`（N × D × T，4.6 GB），外加代码以*不同内存布局*物化的
-多份全尺寸拷贝 —— 每 session 的 N × D 切片副本、`mtimesx` 产出的
-N × L × T κ 更新乘积、转置的 L × N × T log-vMF 堆栈、(N, L, T) 空间
-先验堆栈 —— 工作集达**每被试约 9–12 GB**；parent 另持有 (N, L, S)
-后验（S = 40 时 7.9 GB）及同尺寸临时量。合计：41 个进程约 370–490 GB
-的同时常驻内存，外加每迭代经共享存储的 `.mat` 流量 —— 计算集群是
-硬性前提，而非可选优化。
+² 由参考实现源码（`CBIG_ArealMSHBM_gMSHBM_estimate_group_priors_{parent,child}.m`）推算，而非实测 —— 因为它在工作站上*无法*实测。参考实现的 step 2被架构为 **1 个 parent + S 个 child 集群作业**（其源码头注释原文：*"user should submit 1 parent job and num_sub child jobs"*），在**每个 M-step 内层迭代**都通过文件系统交换 `.mat` 文件。child 会阻塞在迭代中途等待 parent 的回复，因此被试无法串行处理：40 个 child 必须**同时**常驻。在本基准形状下（N = 81,924 顶点、D = 1,175 profile 维、T = 6 session、L = 300 分区、全 fp64），每个 child 持有 profile 主存储`data_series`（N × D × T，4.6 GB），外加代码以*不同内存布局*物化的多份全尺寸拷贝 —— 每 session 的 N × D 切片副本、`mtimesx` 产出的N × L × T κ 更新乘积、转置的 L × N × T log-vMF 堆栈、(N, L, T) 空间先验堆栈 —— 工作集达**每被试约 9–12 GB**；parent 另持有 (N, L, S) 后验（S = 40 时 7.9 GB）及同尺寸临时量。合计：41 个进程约 370–490 GB 的同时常驻内存，外加每迭代经共享存储的 `.mat` 流量 —— 计算集群是硬性前提，而非可选优化。
 
-cuArealMSHBM 将这一切收拢到单个设备上：每份二值化 profile 在显存中
-**只存在一次**，以位打包的 `uint8 (N, T, ⌈D/8⌉)` 张量存放（每被试
-72 MB，整个队列 1.45 GB —— 对比未打包的约 11.6 GB，以及参考实现
-*尚未计入额外拷贝*的每被试约 4.6 GB fp64），并在所有内核间按引用共享。
-后验以 fp32 而非 fp64 存储（40 被试共 3.93 GB；仅在 softmax 需要处
-使用 fp64 暂存），算子融合则使参考实现在内存与磁盘间往返的 N × L × T
-中间量根本不被物化。设备峰值占用约 9 GB —— **整个 40 被试队列所需的
-显存比参考实现单个被试所需的内存还少。** 同一预算下，单张 24 GB 显卡
-可容纳约 140 名被试的队列。
+cuArealMSHBM 将这一切收拢到单个设备上：每份二值化 profile 在显存中**只存在一次**，以位打包的 `uint8 (N, T, ⌈D/8⌉)` 张量存放（每被试72 MB，整个队列 1.45 GB —— 对比未打包的约 11.6 GB，以及参考实现*尚未计入额外拷贝*的每被试约 4.6 GB fp64），并在所有内核间按引用共享。后验以 fp32 而非 fp64 存储（40 被试共 3.93 GB；仅在 softmax 需要处使用 fp64 暂存），算子融合则使参考实现在内存与磁盘间往返的 N × L × T中间量根本不被物化。设备峰值占用约 9 GB —— **整个 40 被试队列所需的显存比参考实现单个被试所需的内存还少。** 同一预算下，单张 24 GB 显卡可容纳约 140 名被试的队列。
 
 ## 关于原论文的声明
 
-Areal-MSHBM 的大规模稳定性分析与独立第三方评估将于近期公布。我们的
-先期结果表明：原论文关于该方法优势与改进的声明是**诚实、可靠、可复现
-的 —— 并且能够在原发表所用数据集之外的其它数据集上复现。**
+Areal-MSHBM 的大规模稳定性分析与独立第三方评估将于近期公布。我们的先期结果表明：原论文关于该方法优势与改进的声明是**诚实、可靠、可复现的 —— 并且能够在原发表所用数据集之外的其它数据集上复现。**
 
 ## 快速开始
 
@@ -465,8 +398,7 @@ result = Pipeline("projects/<name>").run()
 ```
 
 分区结果写入
-`projects/<name>/ind_parcellation_<variant>/<N>_sess/beta<B>/`，文件名为
-`Ind_parcellation_MSHBM_sub<S>_w<W>_MRF<C>_beta<B>.mat`。
+`projects/<name>/ind_parcellation_<variant>/<N>_sess/beta<B>/`，文件名为`Ind_parcellation_MSHBM_sub<S>_w<W>_MRF<C>_beta<B>.mat`。
 
 ### 运行模式
 
@@ -476,11 +408,7 @@ result = Pipeline("projects/<name>").run()
 | `modeA_batch`（N 被试） | 0 → 1 → 3 | 预置于项目内 |
 | `modeB_train_prior`（队列） | 0 → 1 → 2 → 3 | 由 step 2 在你的队列上训练 |
 
-Mode A 读取 `<project>/priors/<variant>/beta<B>/Params_Final.mat`；
-将先验放到该位置是项目创建者的职责。变体：gMSHBM 与 dMSHBM 已提供；
-cMSHBM 的 step 2 未接入（其 step 3 已接入）。参见
-[`docs/pipeline_modes.md`](docs/pipeline_modes.md) 与
-[`docs/pipeline_variants.md`](docs/pipeline_variants.md)。
+Mode A 读取 `<project>/priors/<variant>/beta<B>/Params_Final.mat`；将先验放到该位置是项目创建者的职责。变体：gMSHBM 与 dMSHBM 已提供；cMSHBM 的 step 2 未接入（其 step 3 已接入）。参见[`docs/pipeline_modes.md`](docs/pipeline_modes.md) 与[`docs/pipeline_variants.md`](docs/pipeline_variants.md)。
 
 ## 仓库结构
 
@@ -503,12 +431,8 @@ original_paper.md           — 算法出处（Kong et al. 2021）
 ## 环境要求
 
 - Python 3.13；numba 0.63.1、numpy 2.2.6、scipy 1.16.0
-- CuPy 13.6.0（可选 —— 仅 GPU 后端需要）；可选
-  `nvidia-nvcomp-cu12` 用于 GPU GIFTI 解码
-- 已部署的预计算资产（由安装程序部署；见
-  [`arealmshbm/data/README.md`](arealmshbm/data/README.md)），以及
-  指向 `<targ_mesh>/label/` 下含 Schaefer2018 + aparc `.annot` 文件
-  目录的 `MSHBM_ATLAS_DIR`（图谱目录在运行时的唯一用途）
+- CuPy 13.6.0（可选 —— 仅 GPU 后端需要）；可选 `nvidia-nvcomp-cu12` 用于 GPU GIFTI 解码
+- 已部署的预计算资产（由安装程序部署；见[`arealmshbm/data/README.md`](arealmshbm/data/README.md)），以及指向 `<targ_mesh>/label/` 下含 Schaefer2018 + aparc `.annot` 文件目录的 `MSHBM_ATLAS_DIR`（图谱目录在运行时的唯一用途）
 
 BOLD 输入仅支持 GIFTI `.func.gii`。
 
@@ -520,14 +444,11 @@ python -m pytest arealmshbm/
 
 ## 许可证
 
-MIT —— 见 [`LICENSE`](LICENSE)。许可证覆盖本仓库中的源代码。由安装
-程序部署的预计算数据（如 HCP 派生的组先验）不属于本仓库，仍受其自身
-数据使用条款约束。
+MIT —— 见 [`LICENSE`](LICENSE)。许可证覆盖本仓库中的源代码。由安装程序部署的预计算数据（如 HCP 派生的组先验）不属于本仓库，仍受其自身数据使用条款约束。
 
 ## 引用
 
-若您使用了 cuArealMSHBM，请引用本仓库（见
-[`CITATION.cff`](CITATION.cff)），**并**引用原方法：
+若您使用了 cuArealMSHBM，请引用本仓库（见[`CITATION.cff`](CITATION.cff)），**并**引用原方法：
 
 > Kong R, Yang Q, Gordon E, et al. *Individual-Specific Areal-Level
 > Parcellations Improve Functional Connectivity Prediction of
@@ -536,7 +457,4 @@ MIT —— 见 [`LICENSE`](LICENSE)。许可证覆盖本仓库中的源代码。
 
 ## 致谢
 
-谨向新加坡国立大学的 **Computational Brain Imaging Group（CBIG）**
-致意：Areal-MSHBM 开创了这一研究方向，其开放且精心打磨的参考实现使
-忠实的移植成为可能。为其对领域的贡献，我们致以诚挚的问候与最深的
-敬意。
+谨向新加坡国立大学的 **Computational Brain Imaging Group（CBIG）** 致意：Areal-MSHBM 开创了这一研究方向，其开放且精心打磨的参考实现使忠实的移植成为可能。为其对领域的贡献，我们致以诚挚的问候与最深的敬意。
