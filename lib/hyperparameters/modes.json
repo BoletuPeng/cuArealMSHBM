@@ -1,0 +1,51 @@
+{
+  "schema_version": "1",
+  "description": "Mode manifest. Each mode declares which step files participate in its flow, its mode-level constraints, and per-entry overrides that collapse shared enum entries (mode, variant) to mode-specific subsets. UI/tools reconstruct a per-mode hyperparameter view by union'ing the `includes` files in order, then applying `overrides` per matching `key`.",
+  "modes": {
+    "modeA_single": {
+      "description": "Mode A single-subject personalisation against a pre-staged group prior (K=1; runs step 0/1/3)",
+      "includes": ["project_basics", "step0", "step1", "step3"],
+      "constraints": {
+        "num_subjects": {"min": 1, "max": 1, "exact": true, "note": "Mode A single requires exactly 1 subject"},
+        "variants_supported": ["gMSHBM", "cMSHBM", "dMSHBM"],
+        "steps_executed": ["step0", "step1", "step3"],
+        "step2_run": false
+      },
+      "overrides": {
+        "mode": {"values": ["modeA_single"], "default": "modeA_single"}
+      }
+    },
+    "modeA_batch": {
+      "description": "Mode A batch personalisation against a pre-staged group prior (K>=1; runs step 0/1/3 per subject)",
+      "includes": ["project_basics", "step0", "step1", "step3"],
+      "constraints": {
+        "num_subjects": {"min": 1, "max": null, "exact": false, "note": "Mode A batch supports any K>=1 subjects"},
+        "variants_supported": ["gMSHBM", "cMSHBM", "dMSHBM"],
+        "steps_executed": ["step0", "step1", "step3"],
+        "step2_run": false
+      },
+      "overrides": {
+        "mode": {"values": ["modeA_batch"], "default": "modeA_batch"}
+      }
+    },
+    "modeB_train_prior": {
+      "description": "Mode B coupled-EM training of a cohort-specific group prior (K>=2; runs step 0/1/2/3; cMSHBM excluded)",
+      "includes": ["project_basics", "step0", "step1", "step2", "step3"],
+      "constraints": {
+        "num_subjects": {"min": 2, "max": null, "exact": false, "note": "Mode B requires K>=2 - coupled EM needs a cohort"},
+        "variants_supported": ["gMSHBM", "dMSHBM"],
+        "steps_executed": ["step0", "step1", "step2", "step3"],
+        "step2_run": true,
+        "cMSHBM_excluded_reason": "step2 has no xyz-vMF path in the master kernel; Step2Config raises NotImplementedError on cMSHBM (Step2Config.__post_init__ in step2_pipeline/config.py)"
+      },
+      "overrides": {
+        "mode": {"values": ["modeB_train_prior"], "default": "modeB_train_prior"},
+        "variant": {
+          "values": ["gMSHBM", "dMSHBM"],
+          "default": "gMSHBM",
+          "description": "Pipeline variant. cMSHBM is EXCLUDED in Mode B because step2 has no xyz-vMF path in the master kernel; Step2Config raises NotImplementedError on cMSHBM (Step2Config.__post_init__ in step2_pipeline/config.py)."
+        }
+      }
+    }
+  }
+}

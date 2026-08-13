@@ -1,0 +1,65 @@
+{
+  "schema_version": "2",
+  "mode": "modeB_train_prior",
+  "variant": "gMSHBM",
+  "num_clusters": 300,
+  "beta_scalar": 5,
+  "w": 50,
+  "c": 10,
+  "n_grad_components": 100,
+  "backend_step0": "cpu",
+  "backend_step1": "cpu",
+  "backend_step2": "cpu",
+  "backend_step3": "cpu",
+
+  "step0": {
+    "sub_FC": 100,
+    "sub_verts": 200,
+    "block_a": 3,
+    "block_b": 10,
+    "smooth_sigma": 2.55,
+    "K_hop": 3,
+    "watershed_steps": 50,
+    "watershed_frac": 1.0,
+    "downsample": 3.2,
+    "emb_output_format": "npy",
+    "save_geodesic_distance": false,
+    "save_edge_density": false,
+    "enable_tf32": false
+  },
+
+  "step1": {
+    "threshold": 0.1,
+    "split_flag": "0",
+    "profile_dtype": "float64",
+    "reduction_dtype": "float64",
+    "radius_mask_radius_mm": 30.0
+  },
+
+  "step2": {
+    "max_iter_inter": 10,
+    "max_iter_intra_em": 15,
+    "max_iter_em": 100,
+    "max_iter_m": 50,
+    "max_iter_intra_var": 20,
+    "epsilon": 0.0001,
+    "intra_em_convergence_eps": 0.0001,
+    "inter_convergence_eps": 0.00001,
+    "em_convergence_eps": 0.0001,
+    "bold_cache_mode": "auto",
+    "gpu_cache_safety_margin_gb": 4.0,
+    "verbose": true,
+    "enable_tf32": false
+  },
+
+  "step3": {
+    "connect_th": 15.0,
+    "epsilon": 0.0001,
+    "max_iter_intra_em": 50,
+    "max_iter_em": 100,
+    "max_iter_lambda": 50,
+    "max_iter_m": 50,
+    "max_iter_comp": 15,
+    "cMSHBM_isolated_component_min_size": 5
+  }
+}

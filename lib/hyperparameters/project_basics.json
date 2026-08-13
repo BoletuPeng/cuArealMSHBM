@@ -1,0 +1,141 @@
+{
+  "section": "project_basics",
+  "schema_version": "1",
+  "description": "Project-wide decisions: pipeline mode, variant, cohort-spanning algorithm weights (num_clusters, beta_scalar, w, c, n_grad_components), and dataset layout (BOLD inputs). Mode-specific constraints + per-entry overrides live in modes.json.",
+  "source_note": "`source` fields name the file owning the field's authoritative default. Line numbers are intentionally omitted — they drift on every reformat and the file/symbol name is the stable contract.",
+  "range_policy": "advisory — `min`/`max` fields are UI hints documenting the values authors have validated; the parser/validator in arealmshbm/pipeline/config.py enforces only hard constraints (positivity on numeric fields, enum membership on `values`-typed fields). Out-of-range-but-positive values are accepted at parse time and surface as algorithm-side failures downstream.",
+  "entries": [
+    {
+      "key": "mode",
+      "type": "enum",
+      "values": [
+        "modeA_single",
+        "modeA_batch",
+        "modeB_train_prior"
+      ],
+      "default": "modeA_batch",
+      "source": "arealmshbm/pipeline/config.py (PipelineConfig.mode)",
+      "description": "Run mode; selects step path.",
+      "notes": "Each mode in modes.json constrains this entry's `values` to a single-element list via an override."
+    },
+    {
+      "key": "variant",
+      "type": "enum",
+      "values": [
+        "gMSHBM",
+        "cMSHBM",
+        "dMSHBM"
+      ],
+      "default": "gMSHBM",
+      "source": "arealmshbm/pipeline/config.py (PipelineConfig.variant)",
+      "description": "Pipeline variant.",
+      "notes": "Mode B excludes cMSHBM via override (step2 has no xyz-vMF path; Step2Config raises NotImplementedError in step2_pipeline/config.py:__post_init__)."
+    },
+    {
+      "key": "num_clusters",
+      "type": "enum",
+      "values": [
+        100,
+        200,
+        300,
+        400,
+        500,
+        600,
+        700,
+        800,
+        900,
+        1000
+      ],
+      "unit": "parcels",
+      "default": 300,
+      "source": "arealmshbm/pipeline/config.py (PipelineConfig.num_clusters)",
+      "description": "L = number of cortical parcels (ROIs). Drives step1 schaefer_resolution, step2/step3 EM.",
+      "notes": "Quantized to the Schaefer-2018 Kong2022 17-network annot resolutions staged at $MSHBM_ATLAS_DIR/<targ_mesh>/label/{lh,rh}.Schaefer2018_<N>Parcels_Kong2022_17Networks_order.annot (N in {100, 200, ..., 1000}). step1_runners.resolve_group_labels raises FileNotFoundError on any other N."
+    },
+    {
+      "key": "beta_scalar",
+      "type": "integer",
+      "min": 1,
+      "max": 100,
+      "default": 5,
+      "source": "arealmshbm/pipeline/config.py (PipelineConfig.beta_scalar)",
+      "applies_to_variants": [
+        "gMSHBM",
+        "cMSHBM"
+      ],
+      "description": "beta weight (consumed by step2 EM in Mode B and by step3 EM).",
+      "notes": "Internal in step2: beta_scalar * 1000 for gMSHBM, 0 for dMSHBM. Internal in step3: gMSHBM x1000, cMSHBM x1, dMSHBM = 0. Same field drives both steps."
+    },
+    {
+      "key": "w",
+      "type": "integer",
+      "min": 0,
+      "max": 1000,
+      "default": 50,
+      "source": "arealmshbm/pipeline/config.py (PipelineConfig.w)",
+      "description": "Group spatial prior log(theta) weight (step3 EM).",
+      "notes": "w=0 disables the spatial prior term."
+    },
+    {
+      "key": "c",
+      "type": "integer",
+      "min": 0,
+      "max": 1000,
+      "default": 10,
+      "source": "arealmshbm/pipeline/config.py (PipelineConfig.c)",
+      "description": "MRF Potts smoothness prior weight (step3 EM).",
+      "notes": "c=0 disables MRF smoothing."
+    },
+    {
+      "key": "n_grad_components",
+      "type": "integer",
+      "min": 50,
+      "max": 200,
+      "unit": "components",
+      "default": 100,
+      "source": "arealmshbm/pipeline/config.py (PipelineConfig.n_grad_components)",
+      "description": "Number of diffusion-embedding components kept after step0. Consumed by step3 (gMSHBM only) and step2 (gMSHBM gradient prior in Mode B).",
+      "notes": "Bound to Step0Config.num_components AND Step3Config.n_grad_components AND Step2Config.n_grad_components. Changing requires step0 rerun."
+    },
+    {
+      "key": "bold_inputs.dataset_name",
+      "type": "string",
+      "default": null,
+      "source": "arealmshbm/pipeline/inputs.py (BoldInputs.dataset_name)",
+      "description": "Display name for the dataset. Required.",
+      "notes": "Free string; no algorithmic effect."
+    },
+    {
+      "key": "bold_inputs.targ_mesh",
+      "type": "enum",
+      "values": [
+        "fsaverage6"
+      ],
+      "default": "fsaverage6",
+      "source": "arealmshbm/pipeline/inputs.py (BoldInputs.targ_mesh)",
+      "description": "Target mesh (vertex space for BOLD).",
+      "notes": "Step0 hard-restricts to fsaverage6 (Step0Config._SUPPORTED_MESHES). Other meshes work for step1/2/3 standalone but not via the unified driver."
+    },
+    {
+      "key": "bold_inputs.seed_mesh",
+      "type": "enum",
+      "values": [
+        "fsaverage3",
+        "fsaverage4",
+        "fsaverage5"
+      ],
+      "default": "fsaverage3",
+      "source": "arealmshbm/pipeline/inputs.py (BoldInputs.seed_mesh)",
+      "description": "Seed mesh for step1 RSFC profile.",
+      "notes": "Drives D = 1175 / 4661 / 18715 verts respectively."
+    },
+    {
+      "key": "bold_inputs.subjects",
+      "type": "array",
+      "default": [],
+      "source": "arealmshbm/pipeline/inputs.py (BoldInputs.subjects)",
+      "description": "List of subjects, each with sessions and BOLD path pairs (lh, rh).",
+      "notes": "Subject count constraint depends on mode (see modes.json constraints.num_subjects)."
+    }
+  ]
+}

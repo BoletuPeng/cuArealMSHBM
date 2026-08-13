@@ -1,0 +1,116 @@
+{
+  "section": "step3",
+  "schema_version": "1",
+  "description": "Step 3 - single-subject parcellation EM. All three variants supported with per-entry applies_to_variants gating.",
+  "source_note": "`source` fields name the file owning the field's authoritative default. Line numbers are intentionally omitted — they drift on every reformat and the file/symbol name is the stable contract.",
+  "range_policy": "advisory — `min`/`max` fields are UI hints documenting the values authors have validated; the parser/validator enforces only positivity (numeric fields) and enum membership (enum fields). Out-of-range-but-positive values are accepted at parse time.",
+  "entries": [
+    {
+      "key": "backend_step3",
+      "type": "enum",
+      "values": [
+        "cpu",
+        "gpu_elambda",
+        "gpu_full"
+      ],
+      "default": "cpu",
+      "source": "arealmshbm/pipeline/config.py (PipelineConfig.backend_step3)",
+      "description": "step3 backend.",
+      "notes": "gpu_full recommended; uses fused unpack+normalize for bitpacked BOLD."
+    },
+    {
+      "key": "step3.connect_th",
+      "type": "continuous",
+      "min": 0.0,
+      "max": 50.0,
+      "unit": "mm",
+      "default": null,
+      "default_resolved_per_variant": {
+        "gMSHBM": 15.0,
+        "cMSHBM": 0.0,
+        "dMSHBM": null
+      },
+      "nullable": true,
+      "source": "arealmshbm/step3_pipeline/config.py (Step3Config.connect_th)",
+      "applies_to_variants": [
+        "gMSHBM",
+        "cMSHBM"
+      ],
+      "description": "Connectedness threshold for distributed-parcel detection.",
+      "notes": "Literal default is null; Step3Config.__post_init__ resolves it to 15.0 (gMSHBM), 0.0 (cMSHBM); dMSHBM never reads it. Explicit float overrides the variant default."
+    },
+    {
+      "key": "step3.epsilon",
+      "type": "continuous",
+      "min": 1e-08,
+      "max": 0.1,
+      "default": 0.0001,
+      "source": "arealmshbm/step3_pipeline/config.py (Step3Config.epsilon)",
+      "description": "EM convergence tolerance (shared across the 4 nested loops)."
+    },
+    {
+      "key": "step3.max_iter_intra_em",
+      "type": "integer",
+      "min": 1,
+      "max": 200,
+      "default": 50,
+      "source": "arealmshbm/step3_pipeline/config.py (Step3Config.max_iter_intra_em)",
+      "description": "Outer intra-EM cap."
+    },
+    {
+      "key": "step3.max_iter_em",
+      "type": "integer",
+      "min": 1,
+      "max": 1000,
+      "default": 100,
+      "source": "arealmshbm/step3_pipeline/config.py (Step3Config.max_iter_em)",
+      "description": "Inner EM cap."
+    },
+    {
+      "key": "step3.max_iter_lambda",
+      "type": "integer",
+      "min": 1,
+      "max": 200,
+      "default": 50,
+      "source": "arealmshbm/step3_pipeline/config.py (Step3Config.max_iter_lambda)",
+      "description": "lambda-loop cap."
+    },
+    {
+      "key": "step3.max_iter_m",
+      "type": "integer",
+      "min": 1,
+      "max": 200,
+      "default": 50,
+      "source": "arealmshbm/step3_pipeline/config.py (Step3Config.max_iter_m)",
+      "description": "M-step cap."
+    },
+    {
+      "key": "step3.max_iter_comp",
+      "type": "integer",
+      "min": 1,
+      "max": 50,
+      "default": 15,
+      "source": "arealmshbm/step3_pipeline/config.py (Step3Config.max_iter_comp)",
+      "applies_to_variants": [
+        "gMSHBM",
+        "cMSHBM"
+      ],
+      "description": "comp_iter cap (component iteration wrapper).",
+      "notes": "dMSHBM has no comp_iter wrap (flat lambda-loop)."
+    },
+    {
+      "key": "step3.cMSHBM_isolated_component_min_size",
+      "type": "integer",
+      "min": 1,
+      "max": 50,
+      "unit": "vertices",
+      "default": 5,
+      "source": "arealmshbm/step3_pipeline/config.py (Step3Config.cMSHBM_isolated_component_min_size) ; arealmshbm/vmf_clustering/vmf_clustering.py (VmfClusteringSession.cMSHBM_isolated_component_min_size)",
+      "applies_to_variants": [
+        "cMSHBM"
+      ],
+      "description": "Minimum component size for cMSHBM remove_isolated_surface_components.",
+      "notes": "Threaded through to both inner pre_predicate (vmf_clustering) and outer final (step3_pipeline.save) call sites."
+    }
+  ]
+}

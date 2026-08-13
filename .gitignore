@@ -1,0 +1,37 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Precomputed assets — subject-invariant binary blobs staged by the
+# installer of the GUI distribution, never committed (keeps the repo
+# small). NOT rebuildable caches: a missing asset is a hard
+# "reinstall" error, not a cache miss. See arealmshbm/data/README.md.
+arealmshbm/data/precomputed/
+arealmshbm/data/group_priors/
+arealmshbm/data/spatial_mask/
+
+# Local-only group prior + spatial mask staging dropped under lib/
+# for ad-hoc runs; never committed.
+lib/group_priors*/
+lib/spatial_mask*/
+
+# Per-project run caches/outputs. The committed files in
+# projects/<name>/ are user inputs (bold_inputs.json,
+# pipeline_config.json); everything else is a per-run cache the
+# driver re-creates.
+projects/*/_smoke_*/
+projects/*/data_list/
+projects/*/gradients/
+projects/*/profiles/
+projects/*/profiles_raw/
+projects/*/priors/
+projects/*/spatial_mask/
+projects/*/group/
+projects/*/ind_parcellation_gMSHBM/
+projects/*/ind_parcellation_dMSHBM/
+projects/*/ind_parcellation_cMSHBM/
+projects/*/ind_parcellation_*_profile/
+projects/*/priors_profile/
+projects/*/cohort.json
+projects/*/logs/
+projects/*/pipeline_run_*.log

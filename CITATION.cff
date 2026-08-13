@@ -1,0 +1,55 @@
+cff-version: 1.2.0
+message: >-
+  If you use cuArealMSHBM, please cite it as below, together with the
+  original Areal-MSHBM method paper (Kong et al., 2021, Cerebral
+  Cortex, doi:10.1093/cercor/bhab101).
+title: "cuArealMSHBM: CPU/GPU-accelerated Areal-MSHBM individual-specific cortical parcellation"
+type: software
+authors:
+  - family-names: Peng
+    given-names: Boletu
+    email: zesheng.peng.21@ucl.ac.uk
+version: 1.0.0
+date-released: "2026-08-13"
+keywords:
+  - cortical parcellation
+  - individual-specific parcellation
+  - resting-state fMRI
+  - MSHBM
+  - GPU acceleration
+  - CUDA
+references:
+  - type: article
+    title: "Individual-Specific Areal-Level Parcellations Improve Functional Connectivity Prediction of Behavior"
+    authors:
+      - family-names: Kong
+        given-names: Ru
+      - family-names: Yang
+        given-names: Qing
+      - family-names: Gordon
+        given-names: Evan
+      - family-names: Xue
+        given-names: Aihuiping
+      - family-names: Yan
+        given-names: Xiaoxuan
+      - family-names: Orban
+        given-names: Csaba
+      - family-names: Zuo
+        given-names: Xi-Nian
+      - family-names: Spreng
+        given-names: Nathan
+      - family-names: Ge
+        given-names: Tian
+      - family-names: Holmes
+        given-names: Avram
+      - family-names: Eickhoff
+        given-names: Simon
+      - family-names: Yeo
+        given-names: B. T. Thomas
+    journal: "Cerebral Cortex"
+    volume: 31
+    issue: 10
+    start: 4477
+    end: 4500
+    year: 2021
+    doi: "10.1093/cercor/bhab101"

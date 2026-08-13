@@ -1,0 +1,143 @@
+{
+  "section": "step2",
+  "schema_version": "1",
+  "description": "Step 2 - coupled-EM group prior training. Mode B only. Variants: gMSHBM + dMSHBM (cMSHBM has no xyz-vMF path in the master kernel; Step2Config raises NotImplementedError).",
+  "source_note": "`source` fields name the file owning the field's authoritative default. Line numbers are intentionally omitted — they drift on every reformat and the file/symbol name is the stable contract.",
+  "range_policy": "advisory — `min`/`max` fields are UI hints documenting the values authors have validated; the parser/validator enforces only positivity (numeric fields) and enum membership (enum fields). Out-of-range-but-positive values are accepted at parse time.",
+  "entries": [
+    {
+      "key": "backend_step2",
+      "type": "enum",
+      "values": [
+        "cpu",
+        "gpu"
+      ],
+      "default": "cpu",
+      "source": "arealmshbm/pipeline/config.py (PipelineConfig.backend_step2)",
+      "description": "step2 backend.",
+      "notes": "GPU is 13-16x faster but bound by VRAM (s_lambda buffer ~19.7 GB at S=200/L=300)."
+    },
+    {
+      "key": "step2.enable_tf32",
+      "type": "boolean",
+      "default": false,
+      "source": "arealmshbm/pipeline/config.py (Step2Knobs.enable_tf32)",
+      "conditional": "backend_step2 == 'gpu'",
+      "description": "Opt-in TF32 cuBLAS sgemm math mode for step2.",
+      "notes": "~15% step2 em_total speedup, rel-drift ~1e-4 on cost. Relocated from top-level ``enable_tf32_step2`` into the step2 block in 2026-06. Mode A configs no longer carry this field at all (the entire step2 block is forbidden in Mode A), so the previous Mode-A-writes-true-silently-does-nothing footgun is gone by construction."
+    },
+    {
+      "key": "step2.max_iter_inter",
+      "type": "integer",
+      "min": 1,
+      "max": 50,
+      "default": 10,
+      "source": "arealmshbm/step2_pipeline/config.py (Step2Config.max_iter_inter)",
+      "description": "Outer EM iteration cap."
+    },
+    {
+      "key": "step2.max_iter_intra_em",
+      "type": "integer",
+      "min": 1,
+      "max": 100,
+      "default": 15,
+      "source": "arealmshbm/step2_pipeline/config.py (Step2Config.max_iter_intra_em)",
+      "description": "intra-EM cap inside each outer iter."
+    },
+    {
+      "key": "step2.max_iter_em",
+      "type": "integer",
+      "min": 1,
+      "max": 1000,
+      "default": 100,
+      "source": "arealmshbm/step2_pipeline/config.py (Step2Config.max_iter_em)",
+      "description": "vMF clustering EM body cap."
+    },
+    {
+      "key": "step2.max_iter_m",
+      "type": "integer",
+      "min": 1,
+      "max": 200,
+      "default": 50,
+      "source": "arealmshbm/step2_pipeline/config.py (Step2Config.max_iter_m)",
+      "description": "M-step cap."
+    },
+    {
+      "key": "step2.max_iter_intra_var",
+      "type": "integer",
+      "min": 1,
+      "max": 100,
+      "default": 20,
+      "source": "arealmshbm/step2_pipeline/config.py (Step2Config.max_iter_intra_var)",
+      "description": "intra_subject_var inner loop cap."
+    },
+    {
+      "key": "step2.epsilon",
+      "type": "continuous",
+      "min": 1e-08,
+      "max": 0.1,
+      "default": 0.0001,
+      "source": "arealmshbm/step2_pipeline/config.py (Step2Config.epsilon)",
+      "description": "Per-cluster convergence tolerance on cosine / rel-diff."
+    },
+    {
+      "key": "step2.intra_em_convergence_eps",
+      "type": "continuous",
+      "min": 1e-08,
+      "max": 0.1,
+      "default": 0.0001,
+      "source": "arealmshbm/step2_pipeline/config.py (Step2Config.intra_em_convergence_eps)",
+      "description": "intra-EM cost relative-diff threshold."
+    },
+    {
+      "key": "step2.inter_convergence_eps",
+      "type": "continuous",
+      "min": 1e-08,
+      "max": 0.1,
+      "default": 1e-05,
+      "source": "arealmshbm/step2_pipeline/config.py (Step2Config.inter_convergence_eps)",
+      "description": "Outer-EM cost relative-diff threshold."
+    },
+    {
+      "key": "step2.em_convergence_eps",
+      "type": "continuous",
+      "min": 1e-08,
+      "max": 0.1,
+      "default": 0.0001,
+      "source": "arealmshbm/step2_pipeline/config.py (Step2Config.em_convergence_eps)",
+      "description": "vMF EM body per-subject cost relative-diff threshold."
+    },
+    {
+      "key": "step2.bold_cache_mode",
+      "type": "enum",
+      "values": [
+        "auto",
+        "eager_bitpacked",
+        "stream"
+      ],
+      "default": "auto",
+      "source": "arealmshbm/step2_pipeline/config.py (Step2Config.bold_cache_mode)",
+      "conditional": "backend_step2 == 'gpu'",
+      "description": "How per-subject BOLD reaches the GPU.",
+      "notes": "auto picks eager_bitpacked when it fits, else stream. eager_bitpacked stores (S, N, T, ⌈D/8⌉) uint8 on device (1 bit/cell, ~14.5 GB at S=200/T=6/fsa6). The legacy unpacked-uint8 'eager' mode was removed 2026-06 — bitpacked subsumes it on every axis."
+    },
+    {
+      "key": "step2.gpu_cache_safety_margin_gb",
+      "type": "continuous",
+      "min": 0.0,
+      "max": 32.0,
+      "unit": "GB",
+      "default": 4.0,
+      "source": "arealmshbm/step2_pipeline/config.py (Step2Config.gpu_cache_safety_margin_gb)",
+      "conditional": "backend_step2 == 'gpu' AND bold_cache_mode == 'auto'",
+      "description": "GPU memory safety margin (covers sgemm scratch / softmax / etc.)."
+    },
+    {
+      "key": "step2.verbose",
+      "type": "boolean",
+      "default": true,
+      "source": "arealmshbm/step2_pipeline/config.py (Step2Config.verbose)",
+      "description": "Print per-stage / per-iter timing logs."
+    }
+  ]
+}

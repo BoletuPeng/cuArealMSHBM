@@ -1,0 +1,19 @@
+{
+  "schema_version": "1",
+  "dataset_name": "sample_modeA_single",
+  "targ_mesh": "fsaverage6",
+  "seed_mesh": "fsaverage3",
+  "subjects": [
+    {
+      "id": "1",
+      "sessions": [
+        {"id": "1", "lh": "<replace-with-path-to-sub-001_ses-01_hemi-L_space-fsaverage6_bold.func.gii>", "rh": "<replace-with-path-to-sub-001_ses-01_hemi-R_space-fsaverage6_bold.func.gii>"},
+        {"id": "2", "lh": "<replace-with-path-to-sub-001_ses-02_hemi-L_space-fsaverage6_bold.func.gii>", "rh": "<replace-with-path-to-sub-001_ses-02_hemi-R_space-fsaverage6_bold.func.gii>"},
+        {"id": "3", "lh": "<replace-with-path-to-sub-001_ses-03_hemi-L_space-fsaverage6_bold.func.gii>", "rh": "<replace-with-path-to-sub-001_ses-03_hemi-R_space-fsaverage6_bold.func.gii>"},
+        {"id": "4", "lh": "<replace-with-path-to-sub-001_ses-04_hemi-L_space-fsaverage6_bold.func.gii>", "rh": "<replace-with-path-to-sub-001_ses-04_hemi-R_space-fsaverage6_bold.func.gii>"},
+        {"id": "5", "lh": "<replace-with-path-to-sub-001_ses-05_hemi-L_space-fsaverage6_bold.func.gii>", "rh": "<replace-with-path-to-sub-001_ses-05_hemi-R_space-fsaverage6_bold.func.gii>"},
+        {"id": "6", "lh": "<replace-with-path-to-sub-001_ses-06_hemi-L_space-fsaverage6_bold.func.gii>", "rh": "<replace-with-path-to-sub-001_ses-06_hemi-R_space-fsaverage6_bold.func.gii>"}
+      ]
+    }
+  ]
+}

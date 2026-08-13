@@ -1,0 +1,139 @@
+{
+  "section": "step0",
+  "schema_version": "1",
+  "description": "Step 0 - RSFC gradient + diffusion embedding. Variant-invariant, mode-invariant. Backend selector + all step0 internal knobs.",
+  "source_note": "`source` fields name the file owning the field's authoritative default. Line numbers are intentionally omitted — they drift on every reformat and the file/symbol name is the stable contract.",
+  "range_policy": "advisory — `min`/`max` fields are UI hints documenting the values authors have validated; the parser/validator enforces only positivity (numeric fields) and enum membership (enum fields). Out-of-range-but-positive values are accepted at parse time.",
+  "entries": [
+    {
+      "key": "backend_step0",
+      "type": "enum",
+      "values": [
+        "cpu",
+        "gpu"
+      ],
+      "default": "cpu",
+      "source": "arealmshbm/pipeline/config.py (PipelineConfig.backend_step0)",
+      "description": "step0 backend (cpu=numba; gpu=CuPy eigsh + RawKernel)."
+    },
+    {
+      "key": "step0.enable_tf32",
+      "type": "boolean",
+      "default": false,
+      "source": "arealmshbm/pipeline/config.py (Step0Knobs.enable_tf32)",
+      "conditional": "backend_step0 == 'gpu'",
+      "description": "Opt-in TF32 cuBLAS sgemm math mode for step0 (affects fc_similarity only).",
+      "notes": "~15% step0 speedup with minor fp32 precision drift. Relocated from top-level ``enable_tf32_step0`` into the step0 block in 2026-06 — the field belongs in the step that consumes it, and the relocation lines the step0.json catalog file up with the actual config namespace."
+    },
+    {
+      "key": "step0.sub_FC",
+      "type": "integer",
+      "min": 50,
+      "max": 300,
+      "default": 100,
+      "source": "arealmshbm/step0_pipeline/config.py (Step0Config.sub_FC)",
+      "description": "FC sub-sampling block (CBIG canonical=100)."
+    },
+    {
+      "key": "step0.sub_verts",
+      "type": "integer",
+      "min": 50,
+      "max": 1000,
+      "default": 200,
+      "source": "arealmshbm/step0_pipeline/config.py (Step0Config.sub_verts)",
+      "description": "Vertex sub-sampling (CBIG canonical=200)."
+    },
+    {
+      "key": "step0.block_a",
+      "type": "integer",
+      "min": 1,
+      "max": 10,
+      "default": 3,
+      "source": "arealmshbm/step0_pipeline/config.py (Step0Config.block_a)",
+      "description": "Outer block iteration count (CBIG canonical=3)."
+    },
+    {
+      "key": "step0.block_b",
+      "type": "integer",
+      "min": 1,
+      "max": 20,
+      "default": 10,
+      "source": "arealmshbm/step0_pipeline/config.py (Step0Config.block_b)",
+      "description": "Inner block iteration count (CBIG canonical=10)."
+    },
+    {
+      "key": "step0.smooth_sigma",
+      "type": "continuous",
+      "min": 0.5,
+      "max": 10.0,
+      "unit": "mm",
+      "default": 2.55,
+      "source": "arealmshbm/step0_pipeline/config.py (Step0Config.smooth_sigma)",
+      "description": "Surface smoothing sigma (CBIG canonical=2.55 mm)."
+    },
+    {
+      "key": "step0.K_hop",
+      "type": "integer",
+      "min": 1,
+      "max": 5,
+      "default": 3,
+      "source": "arealmshbm/step0_pipeline/config.py (Step0Config.K_hop)",
+      "description": "Neighbor adjacency hop count (CBIG canonical=3)."
+    },
+    {
+      "key": "step0.watershed_steps",
+      "type": "integer",
+      "min": 5,
+      "max": 200,
+      "default": 50,
+      "source": "arealmshbm/step0_pipeline/config.py (Step0Config.watershed_steps)",
+      "description": "Watershed iteration count (CBIG canonical=50)."
+    },
+    {
+      "key": "step0.watershed_frac",
+      "type": "continuous",
+      "min": 0.1,
+      "max": 1.0,
+      "default": 1.0,
+      "source": "arealmshbm/step0_pipeline/config.py (Step0Config.watershed_frac)",
+      "description": "Watershed local-minima fraction."
+    },
+    {
+      "key": "step0.downsample",
+      "type": "continuous",
+      "min": 1.0,
+      "max": 10.0,
+      "default": 3.2,
+      "source": "arealmshbm/step0_pipeline/config.py (Step0Config.downsample)",
+      "description": "Icosphere downsample factor (CBIG canonical=3.2)."
+    },
+    {
+      "key": "step0.emb_output_format",
+      "type": "enum",
+      "values": [
+        "npy",
+        "mat",
+        "both"
+      ],
+      "default": "npy",
+      "source": "arealmshbm/step0_pipeline/config.py (Step0Config.emb_output_format)",
+      "description": "Embedding output format (.npy is ~6x faster to read than .mat)."
+    },
+    {
+      "key": "step0.save_geodesic_distance",
+      "type": "boolean",
+      "default": false,
+      "source": "arealmshbm/step0_pipeline/config.py (Step0Config.save_geodesic_distance)",
+      "description": "Persist (N_down, N_down) geodesic distance matrices to disk.",
+      "notes": "~672 MB/hemi/subject. Only needed for diffusion_map microbenchmarks."
+    },
+    {
+      "key": "step0.save_edge_density",
+      "type": "boolean",
+      "default": false,
+      "source": "arealmshbm/step0_pipeline/config.py (Step0Config.save_edge_density)",
+      "description": "Persist edge_density.npy (cortex-only fp32 watershed boundary count) to disk.",
+      "notes": "Step-0 intermediate with no production downstream reader (subgraph B consumes it in-memory). Only the internal CPU-vs-GPU diff harness reads the disk artifact. Default false since 2026-06."
+    }
+  ]
+}

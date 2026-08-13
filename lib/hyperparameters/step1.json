@@ -1,0 +1,75 @@
+{
+  "section": "step1",
+  "schema_version": "1",
+  "description": "Step 1 - RSFC profile + cohort-avg + Schaefer init prior + spatial radius mask. Variant-invariant, mode-invariant.",
+  "source_note": "`source` fields name the file owning the field's authoritative default. Line numbers are intentionally omitted — they drift on every reformat and the file/symbol name is the stable contract.",
+  "range_policy": "advisory by default — `min`/`max` fields are UI hints documenting the values authors have validated; the parser/validator enforces only positivity (numeric fields) and enum membership (enum fields). Out-of-range-but-positive values are accepted at parse time. ENTRY-LEVEL EXCEPTION: `step1.threshold` IS hard-enforced to [0, 1] at parse time — a top-fraction outside that range is not a tuning question (FC binarization expects a fraction), so its `min` / `max` are part of the contract, not UI advice. See the per-entry `notes` field for the exception flag.",
+  "exclusion_criterion": "Internal kernel-precision dtypes are intentionally NOT exposed in step1 even though they have function-signature defaults. Specifically: `run_generate_profiles.profile_dtype_reduce` (pinned at np.float32) and `run_radius_mask.dtype` (pinned at np.float32). These follow the validated CBIG fp32 convention; promoting them to user-tunable would invite silent 2x disk-footprint regressions with no quality upside. The runners' positional defaults remain authoritative for them.",
+  "entries": [
+    {
+      "key": "backend_step1",
+      "type": "enum",
+      "values": [
+        "cpu",
+        "gpu"
+      ],
+      "default": "cpu",
+      "source": "arealmshbm/pipeline/config.py (PipelineConfig.backend_step1)",
+      "description": "step1 backend."
+    },
+    {
+      "key": "step1.threshold",
+      "type": "continuous",
+      "min": 0.0,
+      "max": 1.0,
+      "default": 0.1,
+      "source": "arealmshbm/pipeline/step1_runners.py (run_generate_profiles.threshold)",
+      "description": "Top-fraction threshold for FC profile binarization.",
+      "notes": "Range [0, 1] is HARD-ENFORCED at parse time (`_validate_step1`); see the section-level `range_policy` exception clause. A value outside this range is meaningless for top-fraction binarization."
+    },
+    {
+      "key": "step1.split_flag",
+      "type": "enum",
+      "values": [
+        "0"
+      ],
+      "default": "0",
+      "source": "arealmshbm/pipeline/step1_runners.py (run_generate_profiles.split_flag)",
+      "description": "Profile split flag.",
+      "notes": "Only '0' is implemented; other values raise NotImplementedError at generate_profiles/profiles.py."
+    },
+    {
+      "key": "step1.profile_dtype",
+      "type": "enum",
+      "values": [
+        "float32",
+        "float64"
+      ],
+      "default": "float64",
+      "source": "arealmshbm/pipeline/step1_runners.py (run_ini_params.profile_dtype)",
+      "description": "ini_params avg profile load precision."
+    },
+    {
+      "key": "step1.reduction_dtype",
+      "type": "enum",
+      "values": [
+        "float32",
+        "float64"
+      ],
+      "default": "float64",
+      "source": "arealmshbm/pipeline/step1_runners.py (run_ini_params.reduction_dtype)",
+      "description": "ini_params reduction (demean / normalize / matmul / sum) precision."
+    },
+    {
+      "key": "step1.radius_mask_radius_mm",
+      "type": "continuous",
+      "min": 5.0,
+      "max": 100.0,
+      "unit": "mm",
+      "default": 30.0,
+      "source": "arealmshbm/pipeline/step1_runners.py (run_radius_mask.radius_mm)",
+      "description": "Spatial radius mask geodesic radius (CBIG canonical=30 mm).",
+      "notes": "Directly bounds step3 spatial prior reachability."
+    }
+  ]
+}
