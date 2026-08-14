@@ -122,10 +122,17 @@ conversion pass; cuArealMSHBM ingests `.func.gii` natively.
 
 ¹ Cortical vertices, medial wall excluded. The two Python backends
 agree with each other at 98.21 %. Bit-exact MATLAB↔Python equality is
-unattainable — the port crosses BLAS/reduction-order boundaries — and
-the residual disagreement is dominated by the *reference's* less
-accurate Bessel evaluation, not ours (see
-`arealmshbm/spatial_priors/_cdln.py` for the audit).
+not attainable in the first place: the residual disagreement is the
+combined effect of several benign sources — BLAS reduction-order
+differences between numerical libraries (every backend has its own
+numerical noise band, and the GPU additionally shows small run-to-run
+variation), different numerical routes for the Bessel-type functions
+(ours is audited against mpmath in
+`arealmshbm/spatial_priors/_cdln.py`), and a few small, deliberate
+implementation choices where the port diverges from the reference.
+The four-layer framework we use to judge whether differences of this
+kind are functionally meaningful is described in
+`docs/precision_impact_analysis.md`.
 
 ### Mode B — group-prior training on a local cohort
 
@@ -356,7 +363,7 @@ gMSHBM，β = 5，w = 50，c = 10：
 MATLAB 路径还额外需要一次 1,527 s 的 GIFTI→NIfTI 一次性格式转换；
 cuArealMSHBM 原生读取 `.func.gii`。
 
-¹ 皮层顶点，剔除内侧壁。两个 Python 后端彼此的一致率为 98.21%。MATLAB↔Python 的位级一致不可达 —— 移植跨越了 BLAS/归约顺序边界 ——且残余分歧主要来自*参考实现*精度较低的贝塞尔计算，而非我们（审计见 `arealmshbm/spatial_priors/_cdln.py`）。
+¹ 皮层顶点，剔除内侧壁。两个 Python 后端彼此的一致率为 98.21%。MATLAB↔Python 的位级一致本就不可达：残余分歧是多个良性来源叠加的结果——不同数值库之间的 BLAS 归约顺序差异（每个后端各有自己的数值噪声带，GPU 还存在小幅的逐次运行波动）、贝塞尔类函数所采用的不同数值路径（我们的实现经 mpmath 审计，见 `arealmshbm/spatial_priors/_cdln.py`），以及移植中少数几处与参考实现有意为之的细小实现差异。我们用于判断此类差异是否具有功能意义的四层评估框架见 `docs/precision_impact_analysis.md`。
 
 ### Mode B —— 在本地队列上训练组先验
 
