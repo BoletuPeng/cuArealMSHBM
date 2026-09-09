@@ -12,13 +12,22 @@ both label vectors.
 
 Backends (dispatched by the ``backend=`` kwarg on the supercall):
     cpu — numba ``@njit(parallel=True)`` kernels + numpy/MKL BLAS.
-    gpu — CuPy RawKernel row-demean/L2 + cuBLAS dgemm via dense one-
-          hot ``mtc = profile.T @ one_hot``; invAd (scipy Bessel root
-          solve, ~ms on a single scalar) stays CPU. cupy imported lazily.
+    gpu — CuPy RawKernels end to end: row-demean/L2, a parcel-CSR
+          fp64 ``groupsum`` in the CPU kernel's exact summation order
+          (bit-exact ``mtc``), an in-place column L2-renorm in numpy's
+          ``sum(axis=0)`` order, and a fused per-row dot for the
+          epsilon input (replacing the ``profile @ mtc`` dgemm and its
+          (N, L) intermediate). invAd (scipy Bessel root solve, ~ms on
+          a single scalar) stays CPU. cupy imported lazily.
 
 Public API:
     generate_ini_params(seed_mesh, targ_mesh, lh_labels, rh_labels, out_dir,
                          …, backend='cpu' | 'gpu')
+        Optional hand-offs: ``precomputed_{lh,rh}_avg`` (host arrays),
+        ``precomputed_{lh,rh}_avg_dev`` (cupy arrays from
+        ``avg_profiles_from_packed_gpu``; GPU backend only),
+        ``save_async`` (background ``group.mat`` write — join via
+        ``result.writer.wait()``).
 
 Reads:
     <out_dir>/profiles/avg_profile/{lh,rh}_<targ>_roi<seed>_avg_profile.npy
@@ -36,6 +45,7 @@ Writes:
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """
 
+from ._group_mat_writer import IniParamsResult
 from .ini_params import generate_ini_params
 
-__all__ = ["generate_ini_params"]
+__all__ = ["IniParamsResult", "generate_ini_params"]

@@ -10,6 +10,12 @@ arealmshbm/data/precomputed/
 arealmshbm/data/group_priors/
 arealmshbm/data/spatial_mask/
 
+# Default output roots of the per-step profiling harnesses
+# (arealmshbm/step{0,1,2,3}_pipeline/profile.py) and of the bench
+# fixtures some tests look for; both are local scratch, never committed.
+profile_runs/
+testdata/
+
 # Local-only group prior + spatial mask staging dropped under lib/
 # for ad-hoc runs; never committed.
 lib/group_priors*/

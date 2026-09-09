@@ -92,48 +92,42 @@ class Step2Config:
     beta_scalar: float = 5.0
 
     # ── backend ──
-    # 'cpu' — numba master kernel (default).
-    # 'gpu' — CuPy port of the master; outer-EM closure leaves (L16/L17/L18)
-    #          stay on CPU since they run only I·J ≈ 30 times per pipeline.
-    #          State lives device-resident across all I·J·K outer-EM iters;
-    #          only s_t_nu (~11 MB), kappa (1.6 KB) and cost_em (24 B)
-    #          round-trip per vmf_clustering_batch call.
+    # 'cpu' — numba master kernel (default). The numerical reference for
+    #          the GPU backend (docs/step2_sparse_design.md §1).
+    # 'gpu' — the P-layout / bit-packed CuPy backend
+    #          (``Step2SparseSession``). BOLD stays bit-packed on device,
+    #          state is carried on the ``P = nnz(boundary_mask)`` support
+    #          instead of the dense (N, L) grid, and the three outer-EM
+    #          closure leaves run on-device too, so nothing but ``cost_S``
+    #          and the final Params leave the GPU. Pipeline path:
+    #          ``load_inputs_sparse`` → ``initialize_params_sparse`` →
+    #          ``_run_em_sparse``. Static kernel limits, refused below:
+    #          a seed mesh with ⌈D/8⌉ ≤ 256 (fsaverage3), num_clusters ≤
+    #          512 and n_grad_components ≤ 11772.
     backend: Literal["cpu", "gpu"] = "cpu"
 
-    # GPU-only knob — how the per-subject BOLD reaches the device.
-    # 'auto'             — picks ``eager_bitpacked`` when it fits in
-    #                       free device memory minus
-    #                       ``gpu_cache_safety_margin_gb`` headroom;
-    #                       otherwise falls through to ``stream``.
-    #                       Default.
-    # 'eager_bitpacked'  — preload (S, N, T, ⌈D/8⌉) uint8 packed cache
-    #                       on device (1 bit/cell); per-iter BOLD comes
-    #                       from a device-side bitpacked→fp32 widen+
-    #                       normalize RawKernel. Footprint: ~72 MB at
-    #                       S=3 fsa6 T=2 D=1175; ~14.5 GB at S=200
-    #                       fsa6 T=6. Note: this only sizes the BOLD
-    #                       cache — other on-device state (notably the
-    #                       (S, N, L) fp32 s_lambda buffer at ~19.7 GB
-    #                       for S=200 L=300, ~26 GB for L=400) is the
-    #                       real ceiling on a 24 GB card; eager_bitpacked
-    #                       enables the largest cohort the buffer
-    #                       budget admits, not arbitrary S=200.
-    # 'stream'           — per-iter disk decode + pinned-host H2D. Safe
-    #                       fallback for cohorts that don't fit the
-    #                       packed cache; ~10-15× slower em_total than
-    #                       eager_bitpacked.
-    #
-    # The legacy ``'eager'`` (unpacked uint8 device cache, ~8× larger
-    # than bitpacked) mode was removed in 2026-06 — bitpacked subsumes
-    # it (same fp32 contract, 8× less device read traffic, ~15% faster
-    # kernel wall).
+    # How the per-subject BOLD is held. On the GPU backend
+    # (``Step2SparseSession._resolve_cache_mode``, design §2.2):
+    # 'auto'             — ``eager_bitpacked`` when the (S, T, N, ⌈D/8⌉)
+    #                       uint8 packed cache plus the resident state
+    #                       (grad, s_t_nu / X_dot_sl, s_lambda on P, the
+    #                       iteration-1 scratch) fits in free device
+    #                       memory minus ``gpu_cache_safety_margin_gb``;
+    #                       otherwise ``stream``. Default.
+    # 'eager_bitpacked'  — the packed cache is device-resident (~72 MB
+    #                       per subject at fsaverage6 / T=6); raises when
+    #                       it does not fit.
+    # 'stream'           — one pinned (T, N, ⌈D/8⌉) slot refilled from a
+    #                       pageable host cache, two H2D visits per
+    #                       subject per EM iteration.
+    # On the CPU backend the same knob picks the loader's host-side
+    # bit-packed cache ('auto' / 'eager_bitpacked') or per-call disk
+    # decode ('stream').
     bold_cache_mode: Literal[
         "auto", "eager_bitpacked", "stream"
     ] = "auto"
-    # Headroom (GB) reserved on device when ``bold_cache_mode='auto'``
-    # decides whether eager fits. Should cover sgemm scratch + softmax
-    # + the rest of step-2's session state (~1-2 GB at S=3, more at
-    # large L); 4 GB is conservative for fsa6 / L=400.
+    # Headroom (GB) added to the GPU sizing rule when
+    # ``bold_cache_mode='auto'`` decides whether the packed cache fits.
     gpu_cache_safety_margin_gb: float = 4.0
 
     # ── mesh ──
@@ -197,6 +191,41 @@ class Step2Config:
                 f"Step2Config: backend must be one of {sorted(_VALID_BACKENDS)} "
                 f"(got {self.backend!r})"
             )
+        # The sparse kernels pack the seed dimension into ⌈D/8⌉ ≤ 256
+        # bytes of shared memory per row, which only fsaverage3's
+        # D = 1175 satisfies. Fail here rather than inside the first
+        # kernel launch.
+        if self.backend == "gpu":
+            if self.seed_mesh != "fsaverage3":
+                raise ValueError(
+                    f"Step2Config: backend='gpu' requires "
+                    f"seed_mesh='fsaverage3' (ceil(D/8) <= 256); got "
+                    f"{self.seed_mesh!r}. Use backend='cpu'."
+                )
+            # The other two static kernel limits: ``init_hard_labels``
+            # keeps ``INIT_MAXJ`` per-lane accumulators over a 32-lane
+            # warp, and ``connect_u`` stages one float per gradient
+            # component in shared memory. Checked here as well as in
+            # ``check_dims`` because the session ctor only runs after
+            # step 0/1 and the cohort's BOLD decode; the literals mirror
+            # ``_kernels_gpu``'s MAX_CLUSTERS / MAX_D_GRAD (no
+            # kernel import — this dataclass must stay cupy-free) and
+            # ``test_config_backend.py`` pins the equality.
+            _SPARSE_MAX_CLUSTERS = 512      # 32 * INIT_MAXJ
+            _SPARSE_MAX_D_GRAD = 11772      # (49152 - connect_u static) // 4
+            if self.num_clusters > _SPARSE_MAX_CLUSTERS:
+                raise ValueError(
+                    f"Step2Config: backend='gpu' supports "
+                    f"num_clusters <= {_SPARSE_MAX_CLUSTERS}; got "
+                    f"{self.num_clusters}. Use backend='cpu'."
+                )
+            if (self.mode == "gMSHBM"
+                    and self.n_grad_components > _SPARSE_MAX_D_GRAD):
+                raise ValueError(
+                    f"Step2Config: backend='gpu' supports "
+                    f"n_grad_components <= {_SPARSE_MAX_D_GRAD}; got "
+                    f"{self.n_grad_components}. Use backend='cpu'."
+                )
         # Loop-cap / tolerance / GPU-headroom range checks. These used
         # to live in a duplicate parser-side ``_validate_step2`` —
         # consolidated here as the single owner so future range edits

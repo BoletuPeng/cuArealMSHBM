@@ -291,11 +291,9 @@ def _prefetch_session_bold(
     ``_step0_bold_prefetcher._load_session_bold_cpu``) the driver
     pool — one source of truth for "what a session load is".
 
-    Always CPU IO regardless of ``cfg.backend`` — same reason as the
-    unified driver's Step0BoldPrefetcher wiring (see #55 docstring
-    callout): nvCOMP decode would serialize with subgraph A's compute
-    on cupy's legacy default stream, while parallel CPU decode hides
-    fully behind compute via GIL-released isal_zlib.
+    Always CPU IO regardless of ``cfg.backend`` — same as the unified
+    driver's Step0BoldPrefetcher: parallel CPU decode hides fully
+    behind the GPU compute via GIL-released isal_zlib, and
     ``_subgraph_A``'s ``cp.asarray(curr_data)`` H2D is the right
     seam — cheap, fully overlapped.
     """

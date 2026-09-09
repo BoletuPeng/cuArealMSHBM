@@ -31,8 +31,8 @@ this once at construction (BOLD, gradients, `s_psi`) and once per
 
 | Tensor          | External (legacy CBIG shape)     | Internal (this kernel)        | Notes                                    |
 |-----------------|----------------------------------|-------------------------------|------------------------------------------|
-| BOLD            | `(N, D, T)` per subject (list)   | `(S, T, N, D)` fp32 C-contig | one stacked transpose at Session ctor    |
-| gradient        | `(N, D_grad, T)` per subject     | `(S, T, N, D_grad)` fp32     | gMSHBM only; same transpose at ctor      |
+| BOLD            | `(N, D, T)` per subject (list)   | `(N, T, D)` fp32 C-contig per subject | NTD, streamed one subject at a time into a re-used scratch slot — there is no `(S, …)` BOLD array |
+| gradient        | `(N, D_grad, T)` per subject     | `(T, N, D_grad)` fp32 per subject | gMSHBM only; same per-subject streaming  |
 | `s_t_nu`        | `(D, L, T, S)`                   | `(S, T, L, D)` fp32          | UNIFIED — M-step + E-step share this    |
 | `s_lambda`      | `(N, L, S)`                      | `(S, N, L)` fp32             | fp32 storage; fp64 only on the per-subject Phase D / E.1 scratch |
 | `s_psi`         | `(D, L, S)`                      | `(S, L, D)` fp32             | precomputed → `sigma_psi` once / iter    |
@@ -48,19 +48,19 @@ innermost axis (col-norm + cosine). Unit-stride access on the d axis
 lets numba's SIMD autovectoriser emit packed FMAs. A d-strided inner
 loop loses ~3× throughput.
 
-### How does the E-step keep `(S, T, L, D)` without a transpose?
+### How does the E-step read `(S, T, L, D)`?
 
-The fused E-step's per-session sgemm needs `(N, D) @ (D, L) → (N, L)`.
-With `s_t_nu_TLD[t]` shape `(L, D)`, the kernel slots `s_t_nu_TLD[t].T`
-as the right operand — numba's `np.dot` dispatches the `.T` view to
-cblas_sgemm with the transB flag (no materialised transpose, no copy).
-The strided sgemm path has ~5 % overhead vs C-contig both sides on
-fp32 at this size.
+The fused E-step folds the per-`t` loop and the `d` contraction into one
+sgemm, `(N, T·D) @ (T·D, L) → (N, L)`, so it needs the right operand as
+`(T, D, L)`. The kernel materialises that transpose into a Session-owned
+scratch buffer once per Phase D call (`_kernels.py`, `session.py`), and
+`s_t_nu` itself stays in `(S, T, L, D)` — the M-step's preferred
+unit-stride-`d` layout — for the whole EM-iter loop.
 
-**Result: zero per-iter transpose copies.** `s_t_nu` is owned in
-`(S, T, L, D)` for the entire EM-iter loop; both M-step and E-step
-read it with their preferred indexing without touching a single byte
-of duplicated layout.
+(An earlier design slotted `s_t_nu_TLD[t].T` straight into a per-session
+strided sgemm and therefore claimed "zero per-iter transpose copies".
+That is not what the code does; the fused `T·D` sgemm was the faster
+trade and it needs the explicit repack.)
 
 ### Contiguity contract for the master kernel
 
@@ -107,15 +107,39 @@ SIMD doesn't accelerate it — the policy is shaped to be GPU-port-ready
 (RTX 5090 has a 1:64 fp64:fp32 throughput ratio, so the policy directly
 sizes the cost of a future GPU port).
 
-The CuPy GPU port (`step2_em_iter_master/_kernels_gpu.py`) honors this
-precision contract verbatim. CuPy's parallel-tree fp32 reductions
-differ from numba's serial accumulators at fp32-ULP; bit equality
-across backends is NOT a goal. The numerical-equivalence spec is
-5e-3 max-rel-diff after 1 outer-EM iter on the random-init test cohort
-(see `arealmshbm/step2_em_iter_master/tests/test_numerical_match_gpu.py`);
-at production scale + many iters, gMSHBM is additionally chaotic
-because β=5000 amplifies any tiny `log_connect` drift into different
-argmax flips at parcel boundaries.
+### What the GPU backend does with this contract
+
+**`backend='gpu'`** (the P-layout backend,
+`step2_em_iter_master/_kernels_gpu.py` + `session_gpu.py`) restores the
+CPU semantics on device: fp64 `exp` with an fp64 `scr`, fp64
+row-normalise, and subnormal-aware fp32 stores that work around CuPy's
+forced `-ftz=true` (`f32_rn` / `f32_to_f64` helpers). Its numerics
+contract — which sites are bit-exact, which are merely reassociated, and
+the full deviation list — is `docs/step2_sparse_design.md` §1 and §9.
+CuPy's parallel-tree reductions differ from numba's serial accumulators
+at ULP level; bit equality across backends is NOT a goal (measured: 0
+`theta` argmax flips vs the CPU at S=1 and S=2, 2 at S=10).
+
+The dense CuPy port that held `backend='gpu'` until 2026-09 ran the
+Phase-D softmax `exp` and the Phase-E row-normalise in fp32 (CuPy's
+`-ftz=true` puts the `exp` cliff at −87.3 where fp64 reaches −745): on
+the S=1 bench it killed 5 528 alive vertices vs 1 303 on the CPU, moved
+cost −5 % and `kappa` 954 vs 922, flipped 4 744 `theta` argmaxes, and its
+widen kernel carried a nondeterministic `atomicAdd`. It was removed in
+favour of the P-layout backend; configurations outside that backend's
+static limits (a seed mesh above fsaverage3, L > 512) run on `cpu`.
+
+### Two constants worth stating exactly
+
+* `_LOG_EPS20 = log(eps_f64 ** 20)` = **-720.8730677823431**
+  (fp32: `-720.87305`). The in-code comment's "≈ -720.4391" is stale —
+  the runtime value has always been correct.
+* The E-step's `tmp_idx` (dead-row) test is `log_vmf == 0`, and the
+  in-code warning frames a false positive at a non-medial vertex as
+  unlikely. It is not merely unlikely: at `dim = 1174` it is
+  **impossible for `κ < Cdln(κ) ≈ 2308`**, because an alive row's
+  `|lv_sum| ≤ n_alive` bounds `|κ·lv| < n_alive·Cdln`. Production κ sits
+  in [400, 1200]. Restate it as that bound, not as a probability.
 
 
 ## 3. spatial_connect 0/0 rule

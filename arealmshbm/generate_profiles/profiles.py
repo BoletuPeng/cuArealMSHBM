@@ -1,15 +1,14 @@
 """profiles.py
 
-Supercall for per-session FC-profile generation. Reads BOLD path lists
-and returns binarized top-fraction profile arrays. The caller (step-1
-pipeline) routes the resulting arrays into the per-subject blosc2
-``.b2nd`` writer (:mod:`arealmshbm.data_io.profile_io`).
+CPU supercall for per-session FC-profile generation. Reads BOLD path
+lists and returns binarized top-fraction profile arrays. The caller
+(step-1 pipeline) routes the resulting arrays into the per-subject
+blosc2 ``.b2nd`` writer (:mod:`arealmshbm.data_io.profile_io`).
 
-CPU path: numba kernels in :mod:`._kernels` called directly.
-Dispatch on ``backend='gpu'`` defers to :mod:`.profiles_gpu` (all
-device-resident: cuBLAS sgemm + RawKernel zscore + ufuncs for
-threshold / binarize). cupy is imported lazily — the CPU path never
-touches it.
+numba kernels in :mod:`._kernels`, called directly; no cupy anywhere on
+this path. The GPU path is a different shape entirely — one fused
+whole-subject call, :mod:`.profiles_subject_gpu` — not a backend of
+this function.
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """
@@ -38,9 +37,10 @@ def _apply_mw_zero(lh_bin_KxV: np.ndarray, rh_bin_KxV: np.ndarray,
     Writer-side enforcement of the bitpacked ``.b2nd`` contract: rows
     flagged ``MARS_label == 1`` (medial wall) MUST be zero in every
     subject profile that step2 ``SubjectProfileLoader`` will consume.
-    Shared between the CPU and GPU production paths so the contract
-    lives in exactly one place — and so the unit test in
-    ``tests/test_mw_clamp.py`` can exercise it without disk I/O.
+    Factored out of the supercall so the unit test in
+    ``tests/test_mw_clamp.py`` can exercise it without disk I/O; the
+    GPU leaf enforces the same contract inside
+    ``binarize_mwzero_pack_cupy``, in packed form.
 
     Asserts strict equality between the (lh, rh) MARS_label sizes and
     the bin column counts (``==``, not ``>=`` — an oversized
@@ -71,12 +71,12 @@ def _read_run_pair(lh_path, rh_path):
 
     Used as a thread-pool task; the GIFTI reader's per-darray base64 +
     isal_zlib decompress releases the GIL, so a multi-worker pool over
-    the cohort's BOLD files actually parallelizes the CPU decode.
+    the cohort's BOLD files actually parallelizes the CPU decode. The
+    reader hands back its own time-major layout, so there is no host
+    transpose on either side.
     """
-    lh_vol_VxT = read_surface_gifti(lh_path)
-    rh_vol_VxT = read_surface_gifti(rh_path)
-    lh_TxV = np.ascontiguousarray(lh_vol_VxT.T, dtype=np.float32)
-    rh_TxV = np.ascontiguousarray(rh_vol_VxT.T, dtype=np.float32)
+    lh_TxV = read_surface_gifti(lh_path, time_major=True)
+    rh_TxV = read_surface_gifti(rh_path, time_major=True)
     return lh_TxV, rh_TxV
 
 
@@ -92,9 +92,9 @@ def _read_censor_vector(p: Path) -> np.ndarray:
 
 
 class _SessionInputs(NamedTuple):
-    """Decoded inputs for one (sub, sess) compute call. Both CPU and
-    GPU supercalls consume the same disk reads + mesh metadata + censor
-    logic; the only per-backend split is the per-run kernel dispatch.
+    """Decoded inputs for one (sub, sess) compute call: the disk reads,
+    mesh metadata and censor logic :func:`compute_profile_arrays` runs
+    before its per-run kernels.
     """
     lh_runs: List           # n_runs × (T, V_lh) — host numpy unless
     rh_runs: List           # the caller pre-staged on device.
@@ -138,11 +138,9 @@ def _load_session_inputs(seed_mesh: str,
                           threshold,
                           precomputed_bold_runs,
                           ) -> _SessionInputs:
-    """Common mesh + BOLD + censor setup for ``compute_profile_arrays``
-    (CPU) and ``compute_profile_arrays_gpu``. Returns the decoded
-    per-session inputs that both backends consume identically; each
-    backend then builds its own seed-mask/index representation and runs
-    its own per-run kernels.
+    """Mesh + BOLD + censor setup for :func:`compute_profile_arrays`:
+    the decoded per-session inputs it then builds its seed mask from
+    and runs its per-run kernels over.
     """
     out_dir = Path(out_dir)
     if not targ_mesh.startswith("fsaverage"):
@@ -274,7 +272,6 @@ def compute_profile_arrays(seed_mesh: str,
                             split_flag: str = "0",
                             threshold="0.1",
                             dtype_reduce: np.dtype = np.float32,
-                            backend: str = "cpu",
                             precomputed_bold_runs=None,
                             ):
     """Compute one (sub, sess) FC-profile array pair WITHOUT writing.
@@ -285,65 +282,41 @@ def compute_profile_arrays(seed_mesh: str,
         When set, skip the internal gzip-decode ThreadPoolExecutor and
         use the pre-decoded BOLD buffers. Used by the driver-level
         :class:`Step1BoldPrefetcher` to hoist gzip decompress out of the
-        serial GPU loop. The leaf still consumes ``out_dir / sub / sess``
-        for the censor list (which the prefetcher does not handle).
+        serial per-session loop. The leaf still consumes
+        ``out_dir / sub / sess`` for the censor list (which the
+        prefetcher does not handle).
 
     Returns
     -------
-    (lh_arr, rh_arr, K_unpacked)
-        On ``backend='cpu'``:
-          * ``lh_arr`` / ``rh_arr`` are ``(K, V_h) fp32`` C-contig
-            binarized FC-profile arrays with MW columns already zeroed.
-          * ``K_unpacked`` is ``None`` — signals the caller that the
-            arrays are unpacked fp32 (legacy path; the stage pipeline
-            still does the host transpose + packbits in the writer).
+    (lh_arr, rh_arr)
+        ``(K, V_h) fp32`` C-contig binarized FC-profile arrays with MW
+        columns already zeroed. The writer still owes the transpose +
+        packbits — cheap on host, so there is no win in pre-packing here
+        the way the GPU leaf does.
 
-        On ``backend='gpu'``:
-          * ``lh_arr`` / ``rh_arr`` are ``(V_h, ⌈K/8⌉) uint8``
-            pre-packed bytes — fused binarize + MW-zero + transpose +
-            packbits-along-K was done in a single device RawKernel.
-          * ``K_unpacked`` is the integer ``K`` (seed-axis size). The
-            stage pipeline passes this through to the writer's
-            ``D_unpacked`` argument so the .b2nd vlmeta records the
-            correct unpacked length.
-
-    The CPU/GPU return-type split is intentional: the GPU backend
-    skips a 385 MB → 12 MB / sess D2H by emitting packed bytes
-    directly, but the CPU path's fp32 → packed step is a cheap host
-    operation handled at the writer boundary, so there's no win in
-    forcing the CPU path to pre-pack too.
+    CPU only; the GPU path is
+    :func:`~arealmshbm.generate_profiles.profiles_subject_gpu.generate_subject_profiles_gpu`,
+    a whole-subject call with its own entry point.
     """
     if np.dtype(dtype_reduce) != np.float32:
         raise ValueError(
             f"compute_profile_arrays: dtype_reduce must be np.float32 (got "
-            f"{np.dtype(dtype_reduce)!r}); both cpu and gpu paths are "
-            "hard-coded fp32."
+            f"{np.dtype(dtype_reduce)!r}); the leaf is hard-coded fp32."
         )
-    if backend == "gpu":
-        from .profiles_gpu import compute_profile_arrays_gpu
-        return compute_profile_arrays_gpu(
-            seed_mesh=seed_mesh, targ_mesh=targ_mesh, out_dir=out_dir,
-            sub=sub, sess=sess, split_flag=split_flag,
-            threshold=threshold,
-            precomputed_bold_runs=precomputed_bold_runs,
-        )
-    if backend != "cpu":
-        raise ValueError(f"compute_profile_arrays: unknown backend {backend!r}")
-    # Backend-mismatch guard: if a caller pairs the GPU
-    # ``Step1BoldPrefetcher(backend='gpu')`` with this CPU leaf, cupy
-    # device buffers would reach the numba kernel below and fail deep
-    # in numpy's fancy-index / @ overloads with an opaque error. Surface
-    # a named TypeError at the boundary. ``type(...).__module__`` check
-    # avoids a cupy import on CPU-only systems.
+    # Backend-mismatch guard: ``precomputed_bold_runs`` is public, so a
+    # caller can hand this CPU leaf device buffers (e.g. straight out of
+    # ``read_subject_bold_gpu``). They would reach the numba kernel below
+    # and fail deep in numpy's fancy-index / @ overloads with an opaque
+    # error. Surface a named TypeError at the boundary.
+    # ``type(...).__module__`` avoids a cupy import on CPU-only systems.
     if precomputed_bold_runs is not None and len(precomputed_bold_runs) > 0:
         first = precomputed_bold_runs[0][0]
         if type(first).__module__.startswith("cupy"):
             raise TypeError(
-                "compute_profile_arrays(backend='cpu'): "
-                "precomputed_bold_runs contains device cupy arrays — "
-                "the BoldProvider's backend must match the leaf's "
-                "backend. Use backend='gpu' or convert to host numpy "
-                "first."
+                "compute_profile_arrays: precomputed_bold_runs contains "
+                "device cupy arrays — this leaf is CPU-only. Convert to "
+                "host numpy first, or use generate_subject_profiles_gpu "
+                "for the GPU path."
             )
     inputs = _load_session_inputs(
         seed_mesh=seed_mesh, targ_mesh=targ_mesh, out_dir=out_dir,
@@ -428,7 +401,4 @@ def compute_profile_arrays(seed_mesh: str,
     # exercise the same code.
     _apply_mw_zero(lh_bin_KxV, rh_bin_KxV, lh_mars, rh_mars)
 
-    # CPU path returns the unpacked fp32 arrays + ``K_unpacked=None`` to
-    # signal to the stage pipeline that the writer must still bitpack.
-    # The GPU path emits packed bytes directly and returns a real K.
-    return lh_bin_KxV, rh_bin_KxV, None
+    return lh_bin_KxV, rh_bin_KxV

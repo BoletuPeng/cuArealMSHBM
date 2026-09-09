@@ -30,6 +30,8 @@ Covered:
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -99,7 +101,6 @@ def _complete_step2() -> dict:
         "bold_cache_mode": "auto",
         "gpu_cache_safety_margin_gb": 4.0,
         "verbose": True,
-        "enable_tf32": False,
     }
 
 
@@ -118,7 +119,7 @@ def _complete_step3() -> dict:
 
 def _top_level_modeB() -> dict:
     """Campaign-spanning fields + schema_version (Mode B / gMSHBM).
-    enable_tf32 toggles live INSIDE step0/step2 blocks, not here."""
+    the enable_tf32 toggle lives INSIDE the step0 block, not here."""
     return {
         "schema_version": "2",
         "mode": "modeB_train_prior",
@@ -292,11 +293,16 @@ def test_missing_step0_enable_tf32_rejected(tmp_path: Path) -> None:
         read_pipeline_config(p)
 
 
-def test_missing_step2_enable_tf32_rejected(tmp_path: Path) -> None:
+def test_step2_enable_tf32_is_an_unknown_key(tmp_path: Path) -> None:
+    """Step 2 lost its TF32 toggle with the dense CuPy port (its GPU
+    backend makes one cuBLAS call per run); a config still carrying the
+    key is refused with a message that says so, not a bare unknown-key
+    error (every pre-fold Mode-B config on disk carries it)."""
     body = _full_v2_modeB()
-    del body["step2"]["enable_tf32"]
+    body["step2"]["enable_tf32"] = False
     p = _write_config(tmp_path, body)
-    with pytest.raises(ValueError, match=r"missing required key 'step2\.enable_tf32'"):
+    with pytest.raises(ValueError,
+                       match=r"step2\.enable_tf32 was removed.*Delete the key"):
         read_pipeline_config(p)
 
 
@@ -711,7 +717,6 @@ def test_full_v2_roundtrip_non_default(tmp_path: Path) -> None:
         "bold_cache_mode": "eager_bitpacked",
         "gpu_cache_safety_margin_gb": 6.0,
         "verbose": False,
-        "enable_tf32": True,
     }
     body["step3"] = {
         "connect_th": 12.0,
@@ -747,7 +752,7 @@ def test_full_v2_roundtrip_non_default(tmp_path: Path) -> None:
     assert s1.profile_dtype == "float32" and s1.reduction_dtype == "float32"
     assert s1.radius_mask_radius_mm == 25.0
 
-    # step2 — all 13 (including enable_tf32)
+    # step2 — all 12
     s2 = cfg.step2
     assert s2 is not None
     assert (s2.max_iter_inter, s2.max_iter_intra_em, s2.max_iter_em) == (12, 20, 150)
@@ -759,7 +764,6 @@ def test_full_v2_roundtrip_non_default(tmp_path: Path) -> None:
     assert s2.bold_cache_mode == "eager_bitpacked"
     assert s2.gpu_cache_safety_margin_gb == 6.0
     assert s2.verbose is False
-    assert s2.enable_tf32 is True
 
     # step3 — all 8
     s3 = cfg.step3
@@ -783,3 +787,135 @@ def test_knobs_cannot_construct_without_args() -> None:
         Step2Knobs()  # type: ignore[call-arg]
     with pytest.raises(TypeError):
         Step3Knobs()  # type: ignore[call-arg]
+
+
+# ─────────────────────────────────────────────────────────────────────
+# num_clusters × backend_step2='gpu' constraint
+#
+# The GPU init kernel keeps a fixed number of per-lane accumulators;
+# ``step2_em_iter_master._kernels_gpu.check_dims`` owns the ceiling. Refusing it here
+# means the run does not die in the Session ctor, i.e. after step 0/1
+# and the whole cohort's packed-BOLD decode.
+# ─────────────────────────────────────────────────────────────────────
+_SPARSE_MAX_CLUSTERS = 512
+_SPARSE_MAX_D_GRAD = 11772
+
+
+def test_the_parser_sparse_limits_match_the_kernel_constants() -> None:
+    """The parser mirrors them as literals so it stays stdlib-only."""
+    pytest.importorskip("cupy")
+    from arealmshbm.step2_em_iter_master._kernels_gpu import (
+        MAX_CLUSTERS, MAX_D_GRAD,
+    )
+    assert MAX_CLUSTERS == _SPARSE_MAX_CLUSTERS
+    assert MAX_D_GRAD == _SPARSE_MAX_D_GRAD
+
+
+def test_reading_a_gpu_config_imports_neither_cupy_nor_numba(
+        tmp_path: Path) -> None:
+    """``Pipeline.__init__`` parses JSON; the kernel stack costs ~1.7 s."""
+    body = _full_v2_modeB()
+    body["backend_step2"] = "gpu"
+    p = _write_config(tmp_path, body)
+    code = (
+        "import sys, json;"
+        "from arealmshbm.pipeline.config import read_pipeline_config;"
+        f"read_pipeline_config(r{str(p)!r});"
+        "print(json.dumps([m for m in ('cupy', 'numba') if m in sys.modules]))"
+    )
+    proc = subprocess.run([sys.executable, "-c", code],
+                          capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    assert json.loads(proc.stdout.strip().splitlines()[-1]) == []
+
+
+def test_num_clusters_over_the_sparse_limit_rejected(tmp_path: Path) -> None:
+    body = _full_v2_modeB()
+    body["backend_step2"] = "gpu"
+    body["num_clusters"] = next(v for v in (600, 700, 800, 900, 1000)
+                                if v > _SPARSE_MAX_CLUSTERS)
+    p = _write_config(tmp_path, body)
+    with pytest.raises(ValueError,
+                       match=r"backend_step2='gpu'.*num_clusters <="):
+        read_pipeline_config(p)
+
+
+def test_num_clusters_at_the_sparse_limit_accepted(tmp_path: Path) -> None:
+    body = _full_v2_modeB()
+    body["backend_step2"] = "gpu"
+    body["num_clusters"] = max(v for v in (100, 200, 300, 400, 500)
+                               if v <= _SPARSE_MAX_CLUSTERS)
+    p = _write_config(tmp_path, body)
+    assert read_pipeline_config(p).backend_step2 == "gpu"
+
+
+def test_n_grad_components_over_the_sparse_limit_rejected(
+        tmp_path: Path) -> None:
+    """``connect_u`` stages one float per component in shared memory."""
+    body = _full_v2_modeB()
+    body["backend_step2"] = "gpu"
+    body["n_grad_components"] = _SPARSE_MAX_D_GRAD + 1
+    p = _write_config(tmp_path, body)
+    with pytest.raises(ValueError,
+                       match=r"backend_step2='gpu'.*n_grad_components <="):
+        read_pipeline_config(p)
+    # At the limit, and on the CPU backend, it parses.
+    body["n_grad_components"] = _SPARSE_MAX_D_GRAD
+    assert read_pipeline_config(_write_config(tmp_path, body)) is not None
+    body["n_grad_components"] = _SPARSE_MAX_D_GRAD + 1
+    body["backend_step2"] = "cpu"
+    assert read_pipeline_config(_write_config(tmp_path, body)) is not None
+    # ``connect_u`` is gMSHBM-only, so the limit is scoped to the variant.
+    body["backend_step2"] = "gpu"
+    body["variant"] = "dMSHBM"
+    assert read_pipeline_config(_write_config(tmp_path, body)) is not None
+
+
+def test_the_sparse_cluster_limit_is_scoped_to_backend_step2(
+        tmp_path: Path) -> None:
+    """A big L on the CPU backend is untouched."""
+    body = _full_v2_modeB()
+    body["num_clusters"] = 1000
+    p = _write_config(tmp_path, body)
+    assert read_pipeline_config(p).num_clusters == 1000
+
+
+def test_backend_step2_gpu_sparse_is_not_an_alias(tmp_path: Path) -> None:
+    """``'gpu_sparse'`` was the P-layout backend's name while the dense
+    CuPy port held ``'gpu'``; it is rejected like any unknown value."""
+    body = _full_v2_modeB()
+    body["backend_step2"] = "gpu_sparse"
+    p = _write_config(tmp_path, body)
+    with pytest.raises(ValueError, match=r"backend_step2 must be one of"):
+        read_pipeline_config(p)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# w=0 × backend_step3='gpu_sparse' constraint
+#
+# w=0 is not a "prior off" switch: the dense E-step still evaluates
+# 0*log(theta)=NaN outside supp(theta), while the candidate-set backend
+# only visits supp(theta) and would silently answer differently.
+# ─────────────────────────────────────────────────────────────────────
+def test_w_zero_rejected_with_gpu_sparse(tmp_path: Path) -> None:
+    body = _full_v2_modeB()
+    body["w"] = 0
+    body["backend_step3"] = "gpu_sparse"
+    p = _write_config(tmp_path, body)
+    with pytest.raises(ValueError, match=r"gpu_sparse.*requires\s+w > 0"):
+        read_pipeline_config(p)
+
+
+def test_w_zero_accepted_on_cpu(tmp_path: Path) -> None:
+    body = _full_v2_modeB()
+    body["w"] = 0
+    p = _write_config(tmp_path, body)
+    assert read_pipeline_config(p).w == 0
+
+
+def test_w_positive_accepted_with_gpu_sparse(tmp_path: Path) -> None:
+    body = _full_v2_modeB()
+    body["backend_step3"] = "gpu_sparse"
+    p = _write_config(tmp_path, body)
+    cfg = read_pipeline_config(p)
+    assert cfg.w == 50 and cfg.backend_step3 == "gpu_sparse"

@@ -32,6 +32,7 @@ import numpy as np
 from arealmshbm.V_lambda import Session as VLambdaSession
 from arealmshbm.spatial_priors._cdln import cdln_d3_to_f32
 from arealmshbm.spatial_priors.spatial_xyz import compute_unit_sphere_xyz
+from arealmshbm.em_stop_criterion import matlab_ratio_converged
 from arealmshbm.em_stop_criterion._cdln import cdln_general_to_f32
 from arealmshbm.m_step._invad import invad
 from arealmshbm.check_connectedness.component_distance import (
@@ -774,22 +775,9 @@ class VmfClusteringSessionCUDA:
         )
         update_cost = float(integrand.astype(cp.float64).sum())
 
-        # Convergence test (single-subject). Mirror the CPU-side
-        # ``em_stop_criterion.convergence_test`` exactly: numpy-divide so
-        # ``0/0 -> NaN`` (treated as converged via the ``not (NaN > 1e-4)``
-        # idiom), ``nonzero/0 -> Inf`` (treated as NOT converged).
-        # A naive ``if cost_scalar == 0: ratio = inf`` shortcut would force
-        # non-convergence in the 0/0 case, diverging from MATLAB on
-        # degenerate-but-valid inputs (e.g., heavily masked subjects where
-        # both update_cost and prior cost remain zero).
+        # Convergence test (single-subject) — shared MATLAB rule.
         cost_scalar = float(cost_host.ravel()[0])
-        with np.errstate(divide="ignore", invalid="ignore"):
-            ratio = float(np.abs(
-                (np.float64(update_cost) - np.float64(cost_scalar))
-                / np.float64(cost_scalar)
-            ))
-        # NaN-as-converged: ``NaN > 1e-4`` is False -> ``not False`` -> True.
-        converged = not (ratio > 1e-4)
+        converged = matlab_ratio_converged(update_cost, cost_scalar)
         stop_em = 0
         cost_em: Optional[np.ndarray] = None
         if converged:

@@ -36,9 +36,11 @@ def cublas_tf32_scope() -> Iterator[None]:
     GPU ops (elementwise, reductions, transcendentals) are unaffected.
 
     Safe to use even if the scope contains no GPU work — the toggle
-    happens once on entry and once on exit. NOT thread-safe (cuBLAS
-    math mode is per-handle, and cupy uses one handle per device per
-    process — concurrent toggling from multiple threads would race).
+    happens once on entry and once on exit. cuBLAS math mode is
+    per-handle and cupy keeps one handle per (device, thread), so the
+    scope covers only the calling thread's cuBLAS work — a gemm issued
+    from another thread is unaffected, and re-entrant toggling on the
+    same thread would race.
 
     Raises if cupy isn't importable — caller's responsibility to gate
     on the GPU-backend check.

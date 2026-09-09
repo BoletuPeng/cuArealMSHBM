@@ -21,36 +21,48 @@ radius_mask) are called directly from
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """
 
-from .step0_pipeline import (
-    Step0Config,
-    Step0Pipeline,
-    Step0Inputs,
-    Step0Result,
-)
-from .step2_pipeline import (
-    Step2Config,
-    Step2Pipeline,
-    Step2Inputs,
-    Step2Result,
-)
-from .step3_pipeline import (
-    Step3Config,
-    Step3Pipeline,
-    Step3Inputs,
-    Step3Result,
-)
 
-__all__ = [
-    "Step0Config",
-    "Step0Pipeline",
-    "Step0Inputs",
-    "Step0Result",
-    "Step2Config",
-    "Step2Pipeline",
-    "Step2Inputs",
-    "Step2Result",
-    "Step3Config",
-    "Step3Pipeline",
-    "Step3Inputs",
-    "Step3Result",
-]
+# Lazy top-level re-exports (PEP 562): eager imports of the three step
+# packages cost a step-0-only process ~0.88 s of import graph it never
+# uses. The ``find_spec`` fallback in ``__getattr__`` preserves the
+# submodule spelling (``arealmshbm.data_io``) the eager imports gave.
+
+_LAZY_EXPORTS = {
+    "Step0Config": "step0_pipeline",
+    "Step0Pipeline": "step0_pipeline",
+    "Step0Inputs": "step0_pipeline",
+    "Step0Result": "step0_pipeline",
+    "Step2Config": "step2_pipeline",
+    "Step2Pipeline": "step2_pipeline",
+    "Step2Inputs": "step2_pipeline",
+    "Step2Result": "step2_pipeline",
+    "Step3Config": "step3_pipeline",
+    "Step3Pipeline": "step3_pipeline",
+    "Step3Inputs": "step3_pipeline",
+    "Step3Result": "step3_pipeline",
+}
+
+__all__ = list(_LAZY_EXPORTS)
+
+
+def __getattr__(name):
+    """Resolve a lazy step re-export, or a submodule, on first access."""
+    from importlib import import_module
+    sub = _LAZY_EXPORTS.get(name)
+    if sub is not None:
+        value = getattr(import_module(f"{__name__}.{sub}"), name)
+        globals()[name] = value
+        return value
+    if not name.startswith("_"):
+        from importlib.util import find_spec
+        try:
+            found = find_spec(f"{__name__}.{name}") is not None
+        except (ImportError, AttributeError, ValueError):
+            found = False
+        if found:
+            return import_module(f"{__name__}.{name}")
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():
+    return sorted(set(list(globals()) + __all__))

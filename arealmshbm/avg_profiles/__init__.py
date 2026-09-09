@@ -13,6 +13,12 @@ Backends (dispatched by the ``backend=`` kwarg on the supercall):
 Public API:
     avg_profiles(seed_mesh, targ_mesh, out_dir, num_sub, num_sess,
                   backend='cpu' | 'gpu')
+    avg_profiles_gpu.avg_profiles_from_packed_gpu(packed_subjects, D,
+                  targ_mesh, seed_mesh, out_dir, save=True)
+        — memory-side GPU twin: averages packed slabs the caller
+        already holds, returns device fp32 means for
+        ``generate_ini_params_gpu`` plus a background ``.npy`` write
+        handle (``result.writer.wait()``).
 
 Reads:
     <out_dir>/profiles_raw/sub<S>/sub<S>_<targ>_roi<seed>.profile.b2nd

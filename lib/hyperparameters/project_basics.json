@@ -50,7 +50,7 @@
       "default": 300,
       "source": "arealmshbm/pipeline/config.py (PipelineConfig.num_clusters)",
       "description": "L = number of cortical parcels (ROIs). Drives step1 schaefer_resolution, step2/step3 EM.",
-      "notes": "Quantized to the Schaefer-2018 Kong2022 17-network annot resolutions staged at $MSHBM_ATLAS_DIR/<targ_mesh>/label/{lh,rh}.Schaefer2018_<N>Parcels_Kong2022_17Networks_order.annot (N in {100, 200, ..., 1000}). step1_runners.resolve_group_labels raises FileNotFoundError on any other N."
+      "notes": "Quantized to the Schaefer-2018 Kong2022 17-network annot resolutions staged at $MSHBM_ATLAS_DIR/<targ_mesh>/label/{lh,rh}.Schaefer2018_<N>Parcels_Kong2022_17Networks_order.annot (N in {100, 200, ..., 1000}). step1_runners.resolve_group_labels raises FileNotFoundError on any other N. backend_step2='gpu' caps L at 512 (init_hard_labels keeps 16 per-lane accumulators over a 32-lane warp), so only 100-500 of these values are usable there; the parser rejects the rest."
     },
     {
       "key": "beta_scalar",
@@ -74,7 +74,7 @@
       "default": 50,
       "source": "arealmshbm/pipeline/config.py (PipelineConfig.w)",
       "description": "Group spatial prior log(theta) weight (step3 EM).",
-      "notes": "w=0 disables the spatial prior term."
+      "notes": "w=0 is not a prior-off switch: the dense backends still evaluate 0*log(theta)=NaN outside supp(theta), and backend_step3='gpu_sparse' rejects it."
     },
     {
       "key": "c",

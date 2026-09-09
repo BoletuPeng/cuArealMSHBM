@@ -8,9 +8,9 @@ Public API:
                             path; single-pass fused kernel that assembles,
                             cleans, and reduces in one (N, L) sweep.
     matlab_ratio_converged — shared MATLAB-faithful ratio convergence
-                            helper. Also called by ``intra_em``.
-    convergence_test      — small Python helper for the convergence
-                            threshold (also used by the GPU path).
+                            helper. Also called by ``intra_em`` and by
+                            the ``gpu_full`` / ``gpu_sparse`` EM bodies.
+    convergence_test      — CPU stop_em / cost_em bookkeeping around it.
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """
@@ -27,27 +27,19 @@ from ._cdln import cdln_general_to_f32
 
 def matlab_ratio_converged(update_cost: float, cost: float,
                             threshold: float = 1e-4) -> bool:
-    """``not (|update_cost - cost| / |cost| > threshold)``, with MATLAB's
-    NaN/Inf branch semantics.
+    """``not (|update_cost - cost| / |cost| > threshold)`` in IEEE fp64.
 
-    * ``0 / 0``      -> NaN — treated as converged because
-                        ``not (NaN > threshold)`` is True.
-    * ``nonzero / 0`` -> Inf — not converged.
-    * else            -> standard ratio.
+    MATLAB's branch semantics fall straight out of the arithmetic:
+    ``0/0`` and any NaN operand give NaN, and ``not (NaN > threshold)``
+    is True (converged); ``nonzero/0`` gives Inf — not converged.
 
-    Hardcoded threshold mirrors MATLAB's epsilon (1e-4). Used by both
-    the inner EM convergence test and the outer intra_em loop —
-    extracted here so the two sites can't drift if MATLAB's rule ever
-    changes.
-
-    The CPU path uses plain Python arithmetic (no numpy division) so no
-    ``np.errstate`` is needed; the GPU path (vmf_clustering_gpu.py) uses
-    numpy float64 division and keeps its own errstate guard.
+    Default threshold mirrors MATLAB's epsilon (1e-4). Single site for
+    the rule: the CPU inner EM test, the outer ``intra_em`` loop, and
+    the ``gpu_full`` / ``gpu_sparse`` EM bodies all call it.
     """
-    if cost == 0.0:
-        ratio = float("nan") if update_cost == 0.0 else float("inf")
-    else:
-        ratio = abs((update_cost - cost) / cost)
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        ratio = float(np.abs((np.float64(update_cost) - np.float64(cost))
+                             / np.float64(cost)))
     return not (ratio > threshold)   # NaN > threshold is False -> True
 
 

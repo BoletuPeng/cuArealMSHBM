@@ -3,9 +3,14 @@
 Supercall for the step-1 vMF init-parameter leaf.
 
 CPU path: numba kernels in :mod:`._kernels` called directly.
-Dispatch on ``backend='gpu'`` defers to :mod:`.ini_params_gpu` (cuBLAS
-fp64 dgemm + RawKernel row-demean + CuPy scatter one-hot; invAd
-stays CPU). cupy is imported lazily — the CPU path never touches it.
+Dispatch on ``backend='gpu'`` defers to :mod:`.ini_params_gpu`
+(RawKernel row-demean/L2 + CSR-ordered fp64 groupsum + fused row-dot
+epsilon reduction — no GEMM, no dense one-hot; invAd stays CPU). cupy
+is imported lazily — the CPU path never touches it.
+
+``group.mat`` writing goes through :mod:`._group_mat_writer`, shared
+by both backends, so either can hand the write to a background thread
+(``save_async=True``, joined via ``result.writer.wait()``).
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """
@@ -14,12 +19,11 @@ from __future__ import annotations
 
 import os
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
 from typing import Optional
 
 import numpy as np
-import scipy.io as sio
 
+from ._group_mat_writer import IniParamsResult, write_group_mat
 from ._invad import invAd
 from ._kernels import (
     _zero_mw_and_detect_nonzero_kernel,
@@ -128,7 +132,10 @@ def generate_ini_params(
     backend: str = "cpu",
     precomputed_lh_avg: Optional[np.ndarray] = None,
     precomputed_rh_avg: Optional[np.ndarray] = None,
-) -> dict:
+    precomputed_lh_avg_dev=None,
+    precomputed_rh_avg_dev=None,
+    save_async: bool = False,
+) -> IniParamsResult:
     """vMF initial parameters from a group-level parcellation.
 
     Parameters
@@ -148,9 +155,20 @@ def generate_ini_params(
         uses the arrays directly. The unified pipeline driver passes
         the just-computed ``AvgProfilesResult.lh_avg`` / ``rh_avg``
         here so step1 subgraph 3 reads from memory, not disk.
+    precomputed_lh_avg_dev, precomputed_rh_avg_dev : device (cupy)
+        ``(V_h, D)`` arrays — ``AvgProfilesResult.lh_avg_dev`` /
+        ``rh_avg_dev`` from the GPU avg-profiles supercall. GPU backend
+        only; the concat + fp64 widen then happen on device and the
+        avg profiles never touch host memory on the critical path.
+    save_async : hand the ``group.mat`` write to a background thread
+        and return immediately. The handle lands on ``result.writer``
+        and the caller MUST call ``result.writer.wait()``.
 
-    Returns dict with keys ``mtc``, ``epsil``, ``lambda``, ``lh_labels``,
-    ``rh_labels``.
+    Returns
+    -------
+    :class:`IniParamsResult` — a ``dict`` with keys ``mtc``, ``epsil``,
+    ``lambda``, ``lh_labels``, ``rh_labels``, carrying the (optional)
+    background-write handle on ``.writer``.
     """
     if backend == "gpu":
         from .ini_params_gpu import generate_ini_params_gpu
@@ -161,9 +179,18 @@ def generate_ini_params(
             save=save,
             precomputed_lh_avg=precomputed_lh_avg,
             precomputed_rh_avg=precomputed_rh_avg,
+            precomputed_lh_avg_dev=precomputed_lh_avg_dev,
+            precomputed_rh_avg_dev=precomputed_rh_avg_dev,
+            save_async=save_async,
         )
     if backend != "cpu":
         raise ValueError(f"generate_ini_params: unknown backend {backend!r}")
+    if precomputed_lh_avg_dev is not None or precomputed_rh_avg_dev is not None:
+        raise ValueError(
+            "generate_ini_params: precomputed_*_avg_dev are device (cupy) "
+            "buffers and are only accepted by backend='gpu'. Pass "
+            "precomputed_{lh,rh}_avg (host arrays) on the CPU backend."
+        )
     lh_labels = np.asarray(lh_labels, dtype=np.int64).ravel()
     rh_labels = np.asarray(rh_labels, dtype=np.int64).ravel()
     n_lh = lh_labels.size
@@ -238,17 +265,17 @@ def generate_ini_params(
     has_label = keep_labels > 0
     lam[np.flatnonzero(has_label), keep_labels[has_label] - 1] = 1
 
-    out = {
+    out = IniParamsResult({
         "mtc": mtc.astype(np.float64, copy=False),
         "epsil": np.array([[epsil]], dtype=np.float64),
         "lambda": lam,
         "lh_labels": lh_labels.reshape(-1, 1),
         "rh_labels": rh_labels_offset.reshape(-1, 1),
-    }
+    })
 
     if save:
-        out_path = os.path.join(out_dir, "group", "group.mat")
-        Path(os.path.dirname(out_path)).mkdir(parents=True, exist_ok=True)
-        sio.savemat(out_path, out, do_compression=True, format="5")
+        out.writer = write_group_mat(
+            out_dir, out, compress=True, background=save_async,
+        )
 
     return out

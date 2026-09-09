@@ -18,8 +18,19 @@ Stages:
                             ``intra_subject_var_loop`` + ``intra_em_cost_step2``.
     4. save_params        — Params_Final.mat.
 
+Backends (``Step2Config.backend``):
+
+    'cpu' — numba master + host outer-EM leaves. The numerical
+            reference.
+    'gpu' — the P-layout / bit-packed CuPy backend. Its stages are
+            ``load_inputs_sparse`` → ``initialize_params_sparse`` →
+            ``_run_em_sparse``, selected as a set in :meth:`run`
+            because stage 1 returns a different dataclass
+            (``Step2SparseInputs``). Contract:
+            ``docs/step2_sparse_design.md``.
+
 Public API:
-    Step2Inputs   — bundled outputs of load_inputs.
+    Step2Inputs   — bundled outputs of load_inputs (CPU backend).
     Step2Result   — bundled outputs of one run().
     Step2Pipeline — lifecycle.
 
@@ -36,10 +47,9 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import numpy as np
-import scipy.io as sio
 
 from arealmshbm.pipeline._progress import COHORT_SUB_ID, ProgressEmitter
 
@@ -56,19 +66,20 @@ from arealmshbm.step2_init import (
     build_step2_boundary_mask,
     compose_init_state,
 )
-from arealmshbm.step2_em_outer import (
-    intra_subject_var_loop,
-    inter_subject_var,
-    intra_em_cost_step2,
-    reset_s_psi_from_mtc_SLD,
-)
-# Note: ``reset_s_t_nu_from_mtc_STLD`` is no longer called directly here —
-# both Session classes wrap it as ``reset_s_t_nu_from_mtc()`` so the GPU
-# path can do a device-side broadcast instead of a host write.
-from arealmshbm.step2_em_iter_master import Step2EmIterSession
-
+# ``step2_em_outer`` and ``step2_em_iter_master`` are imported LAZILY,
+# inside the CPU path's ``run_em`` — importing ``step2_em_outer``
+# eagerly costs ~0.2 s of numba work at import time
+# (``em_stop_criterion._cdln`` declares explicit ``float64(...)``
+# signatures, so its @njit kernels compile/cache-load at import rather
+# than at first call), and the ``gpu`` backend never calls a single one
+# of them — L16/L17/L18 and both resets run on-device there.
+# Note: ``reset_s_t_nu_from_mtc_STLD`` is not called directly here at all —
+# the CPU Session wraps it as ``reset_s_t_nu_from_mtc()``.
 from .config import Step2Config
-from .vmf_clustering_batch import vmf_clustering_batch
+from .vmf_clustering_batch import em_body_sparse, vmf_clustering_batch
+
+if TYPE_CHECKING:  # pragma: no cover — typing only, no runtime import
+    from arealmshbm.step2_io.sparse_inputs import Step2SparseInputs
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -115,11 +126,33 @@ class Step2Inputs:
 # ─────────────────────────────────────────────────────────────────────
 @dataclass
 class Step2Result:
+    """Bundled outputs of one ``Step2Pipeline.run()``.
+
+    ``timings`` keys, CPU backend: ``load_inputs`` (+ ``.mesh`` /
+    ``.cohort`` / ``.profiles`` / ``.gradients`` / ``.group_mtc`` /
+    ``.boundary``), ``initialize_params`` (+ ``.compose``),
+    ``session_ctor``, ``em_total``, ``run_em``, ``save``, ``total``.
+    The ``gpu`` backend adds ``init_device`` and
+    ``closure_total`` (and forwards the loader's own per-item keys
+    under the same ``load_inputs.<item>`` prefix, plus Session timings
+    under ``session.<name>``); it has no ``initialize_params.compose``
+    (there is no host compose). The loader's own ``total`` key is NOT
+    forwarded — there is no ``load_inputs.total``; that number is
+    ``load_inputs`` itself, measured by the pipeline around the call.
+
+    ``em_iters_total`` is the number of inner EM iterations actually run
+    across the whole ``run()`` — Σ over every EM-body call of that call's
+    ``em_iters``, i.e. the number of ``run_iter`` calls on either
+    backend. It is the right
+    denominator for a per-EM-iteration mean of ``timings['em_total']``
+    (``len(intra_em_iters_per_inter)`` counts EM *bodies*, not iterations).
+    """
     Params_final_path: Path
     inter_iters: int
     intra_em_iters_per_inter: List[int]
     final_cost: float
     timings: Dict[str, float] = field(default_factory=dict)
+    em_iters_total: int = 0
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -223,18 +256,10 @@ class Step2Pipeline:
         # Session ctor can size scratch buffers without re-touching disk.
         t_profiles = time.perf_counter()
         N = int(n_lh + n_rh)
-        # Loader-level cache mode (CPU-only optimization):
-        #   * backend='gpu' — loader stays 'stream'; the GPU Session
-        #     calls ``load_packed_into`` once per subject and manages its
-        #     own device-side packed cache. Loader caching would just
-        #     duplicate bytes on host that the device already holds.
-        #   * backend='cpu' — translate cfg.bold_cache_mode into the
-        #     loader's cache_mode. 'auto' / 'eager_bitpacked' both map
-        #     to the bitpacked host cache (the only loader cache mode);
-        #     'stream' re-reads packed bytes from disk per call.
-        if cfg.backend == "cpu" and cfg.bold_cache_mode in (
-            "auto", "eager_bitpacked"
-        ):
+        # Loader-level cache mode: 'auto' / 'eager_bitpacked' both map
+        # to the bitpacked host cache (the only loader cache mode);
+        # 'stream' re-reads packed bytes from disk per call.
+        if cfg.bold_cache_mode in ("auto", "eager_bitpacked"):
             loader_cache_mode = "eager_bitpacked"
         else:
             loader_cache_mode = "stream"
@@ -248,7 +273,7 @@ class Step2Pipeline:
             cache_mode=loader_cache_mode,
         )
         N_peeked, T_peeked, D_peeked = bold_loader.dims()
-        if cfg.backend == "cpu" and cfg.verbose:
+        if cfg.verbose:
             self._log(
                 f"  CPU bold_loader cache_mode={loader_cache_mode!r} "
                 f"(requested cfg.bold_cache_mode={cfg.bold_cache_mode!r})"
@@ -389,6 +414,20 @@ class Step2Pipeline:
 
     # ── stage 3 — outer EM loop ──
     def run_em(self, Params: Dict[str, Any], inputs: Step2Inputs) -> Step2Result:
+        # CPU path only. The 'gpu' backend runs ``_run_em_sparse``
+        # instead — see :meth:`run`.
+        #
+        # Lazy leaf imports: keeping them here (rather than at module
+        # scope) is what makes a GPU-backend process skip the ~0.2 s
+        # eager-numba ``em_stop_criterion._cdln`` import chain that
+        # ``step2_em_outer`` drags in.
+        from arealmshbm.step2_em_outer import (
+            intra_subject_var_loop,
+            inter_subject_var,
+            intra_em_cost_step2,
+            reset_s_psi_from_mtc_SLD,
+        )
+
         cfg = self.cfg
         dim = inputs.dim
         L = cfg.num_clusters
@@ -400,29 +439,16 @@ class Step2Pipeline:
         intra_em_per_inter: List[int] = []
         t_run = time.perf_counter()
         em_wall_accum = 0.0
+        em_iters_total = 0
 
         # ─── Session lifecycle ───────────────────────────────────────────
         # Build the Session ONCE per run_em. BOLD/grad/boundary mask are
         # static across all intra/inter iters; only s_psi/sigma change
         # between intra-EM iters (refreshed via ``sess.refresh_s_psi_sigma``
         # from within vmf_clustering_batch).
-        #
-        # Backend dispatch — both Session classes implement the same
-        # duck-typed API (upload_initial_state / cache_mtc /
-        # reset_s_t_nu_from_mtc / refresh_s_psi_sigma / run_iter /
-        # sync_to_host). The pipeline doesn't branch on backend below.
-        if cfg.backend == "gpu":
-            from arealmshbm.step2_em_iter_master import Step2EmIterSessionCUDA
-            # GPU-only kwargs: bold_cache_mode + safety margin.
-            gpu_kwargs = dict(
-                bold_cache_mode=cfg.bold_cache_mode,
-                bold_cache_safety_margin_gb=cfg.gpu_cache_safety_margin_gb,
-            )
-            sess_cls = Step2EmIterSessionCUDA
-        else:
-            gpu_kwargs = {}
-            sess_cls = Step2EmIterSession
-        sess = sess_cls(
+        from arealmshbm.step2_em_iter_master import Step2EmIterSession
+        t_ctor = time.perf_counter()
+        sess = Step2EmIterSession(
             bold_loader=inputs.bold_loader,
             grad_loader=inputs.grad_loader if cfg.mode == "gMSHBM" else None,
             num_sub=cfg.num_sub,
@@ -438,34 +464,22 @@ class Step2Pipeline:
             n_lh=inputs.n_lh,
             eps_m_step=cfg.epsilon,
             max_iter_m=cfg.max_iter_m,
-            **gpu_kwargs,
         )
-        if cfg.backend == "gpu" and cfg.verbose:
-            mode_resolved = getattr(sess, "_bold_cache_mode", "unknown")
-            self._log(
-                f"  GPU BOLD cache mode: requested={cfg.bold_cache_mode!r} "
-                f"resolved={mode_resolved!r}"
-            )
-        self.timings["session_ctor"] = time.perf_counter() - t_run
+        self.timings["session_ctor"] = time.perf_counter() - t_ctor
 
         # ─── Upload initial Params state into the Session ────────────────
-        # CPU: aliases Params['s_lambda'/'theta'/'s_t_nu'] to Session-owned
+        # Aliases Params['s_lambda'/'theta'/'s_t_nu'] to Session-owned
         # scratch (zero-copy fast path; the alternative is 90 ms / iter of
         # memcpy).
-        # GPU: H2Ds the same fields once. After this call the canonical
-        # state for s_lambda / theta lives device-resident; Params arrays
-        # are stale until sync_to_host fires at the seam of
-        # vmf_clustering_batch.
         #
-        # CAUTION — on the CPU path, Params['s_lambda' / 'theta' / 's_t_nu']
+        # CAUTION — Params['s_lambda' / 'theta' / 's_t_nu']
         # ARE views into Session-owned scratch after this call. Mid-run
         # inspection / checkpointing must ``.copy()`` first; the next
         # ``sess.run_iter`` overwrites them in place.
         sess.upload_initial_state(Params)
 
         # Pre-compute mtc_LD once for the reset kernels (host (L, D)
-        # fp32 C-contig). Both Session classes cache this internally —
-        # CPU keeps a host reference, GPU H2Ds to a device buffer.
+        # fp32 C-contig). The Session keeps a host reference.
         mtc_LD = np.ascontiguousarray(inputs.mtc.astype(np.float32).T)
         sess.cache_mtc(mtc_LD)
 
@@ -484,9 +498,8 @@ class Step2Pipeline:
             )
 
             # Reset sigma + s_psi each inter iter (MATLAB lines 212-213).
-            # Both are host operations — Params['sigma'] and Params['s_psi']
-            # are host arrays on both backends (the Session H2Ds them at
-            # the start of the next vmf_clustering_batch via
+            # Both are host operations (the Session picks them up at the
+            # start of the next vmf_clustering_batch via
             # refresh_s_psi_sigma). Keep this reset and the vmf_clustering_batch
             # call adjacent — inserting any consumer of sess._sigma_L
             # between them would read the stale pre-reset value.
@@ -506,15 +519,13 @@ class Step2Pipeline:
                 )
 
                 # Reset kappa + s_t_nu each intra iter (MATLAB lines 220-221).
-                # kappa is host-only (read scalar-by-scalar by run_iter).
-                # s_t_nu reset is delegated to the Session so the GPU
-                # path can do a device-side broadcast instead of a
-                # host write + (defunct) implicit re-upload.
+                # kappa is host-only (read scalar-by-scalar by run_iter);
+                # the s_t_nu reset is the Session's (it owns the buffer).
                 Params["kappa"][...] = Params["ini_val"]
                 sess.reset_s_t_nu_from_mtc()
 
                 t_em = time.perf_counter()
-                vmf_clustering_batch(
+                batch = vmf_clustering_batch(
                     Params,
                     sess=sess,
                     max_iter_em=cfg.max_iter_em,
@@ -522,6 +533,7 @@ class Step2Pipeline:
                     verbose=cfg.verbose,
                 )
                 em_wall_accum += (time.perf_counter() - t_em)
+                em_iters_total += int(batch.em_iters)
 
                 # intra_subject_var_loop — updates s_psi + sigma
                 s_psi_new, sigma_new, _flag_psi = intra_subject_var_loop(
@@ -582,14 +594,12 @@ class Step2Pipeline:
         self.timings["run_em"] = time.perf_counter() - t_run
 
         # Final save (sequential nulls s_lambda/s_psi/s_t_nu to keep file small).
-        # theta is read by _save_params and lives device-resident on the
-        # GPU path — sync it back into Params before save. CPU no-op
-        # (already aliased).
-        sess.sync_to_host(Params, fields=("theta",))
         Params["cost_inter"] = cost_inter
         Params_save = {k: v for k, v in Params.items() if k not in ("s_lambda", "s_psi", "s_t_nu")}
         final_path = Path(self.cfg.out_dir) / "Params_Final.mat"
+        t_save = time.perf_counter()
         self._save_params(Params_save, final_path)
+        self.timings["save"] = time.perf_counter() - t_save
 
         return Step2Result(
             Params_final_path=final_path,
@@ -597,6 +607,7 @@ class Step2Pipeline:
             intra_em_iters_per_inter=intra_em_per_inter,
             final_cost=float(cost_inter),
             timings=self.timings,
+            em_iters_total=em_iters_total,
         )
 
     # ── stage 4 — save_params helper ──
@@ -606,28 +617,277 @@ class Step2Pipeline:
     # ``.mat`` save time.
     @staticmethod
     def _save_params(Params: Dict[str, Any], path: Path) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        # Internal → external layout: the save path strips per-subject
-        # keys (s_lambda, s_psi, s_t_nu) to keep Params_Final.mat small
-        # (MATLAB GT does the same), so the only key that needs the
-        # internal→external transpose is ``mu`` ((L, D) → (D, L)).
-        out: Dict[str, Any] = {}
-        for k, v in Params.items():
-            if isinstance(v, np.ndarray):
-                arr = v
-                if k == "mu" and arr.ndim == 2:
-                    arr = np.ascontiguousarray(arr.T)
-                if arr.dtype.kind == "f":
-                    out[k] = arr.astype(np.float64, copy=False)
-                else:
-                    out[k] = arr
-            elif isinstance(v, (int, float, str)):
-                out[k] = v
-            elif isinstance(v, list):
-                out[k] = np.asarray(v)
-            else:
-                out[k] = v
-        sio.savemat(path, {"Params": out}, do_compression=True, format="5")
+        from ._save import save_params_final
+        save_params_final(Params, path)
+
+    # ─────────────────────────────────────────────────────────────────
+    # GPU ('gpu') backend — stages 1-3
+    #
+    # Same four stages as the CPU path, but every stage speaks the
+    # P-layout contract in docs/step2_sparse_design.md §4/§5 instead of
+    # the dense (N, L) one:
+    #
+    #   load_inputs_sparse       → Step2SparseInputs  (§5)
+    #   initialize_params_sparse → host bookkeeping only
+    #   _run_em_sparse           → Step2SparseSession  (§4)
+    #
+    # There is no ``Step2Inputs``, no host ``boundary_mask``, no
+    # ``compose_init_state`` and no host outer-EM leaf on this path —
+    # ``s_lambda`` / ``theta`` / ``s_psi`` / ``s_t_nu`` / ``mu`` never
+    # exist as host arrays until ``export_params()`` at save time.
+    # ─────────────────────────────────────────────────────────────────
+    def load_inputs_sparse(self) -> "Step2SparseInputs":
+        """Stage 1, GPU backend — see ``step2_io.load_step2_sparse_inputs``."""
+        cfg = self.cfg
+        t0 = time.perf_counter()
+        self._log(
+            f"[step2] load_inputs (sparse)  mode={cfg.mode}  S={cfg.num_sub}  "
+            f"T={cfg.num_session}  L={cfg.num_clusters}"
+        )
+        # Lazy: the loader pulls blosc2 / scipy.sparse and must not be on
+        # the CPU path's import graph.
+        from arealmshbm.step2_io import load_step2_sparse_inputs
+
+        inputs = load_step2_sparse_inputs(cfg)
+        self.timings["load_inputs"] = time.perf_counter() - t0
+        # Per-item breakdown, same ``load_inputs.<item>`` key style the
+        # CPU path uses (mesh / cohort / profiles / gradients /
+        # group_mtc / boundary), forwarded verbatim from the loader.
+        for k, v in (inputs.timings or {}).items():
+            if k == "total":            # already reported as ``load_inputs``
+                continue
+            self.timings[f"load_inputs.{k}"] = float(v)
+        self._log(
+            f"  P={inputs.layout.P} of N*L={inputs.N * inputs.layout.L} "
+            f"({100.0 * inputs.layout.P / max(1, inputs.N * inputs.layout.L):.2f}%)  "
+            f"(N, T, D) = ({inputs.N}, {inputs.T}, {inputs.D})  "
+            f"D_grad={inputs.D_grad}  "
+            f"packed_host={'yes' if inputs.packed_host is not None else 'no'}"
+        )
+        self._log(
+            f"  load_inputs done in {self.timings['load_inputs']:.2f}s"
+        )
+        return inputs
+
+    def initialize_params_sparse(
+        self, inputs: "Step2SparseInputs",
+    ) -> Dict[str, Any]:
+        """Stage 2, GPU backend — host bookkeeping only.
+
+        Everything the CPU ``initialize_params`` materialises on host
+        (``mu`` / ``s_psi`` / ``s_t_nu`` from ``mtc``, ``s_lambda`` /
+        ``theta`` from ``compose_init_state``) is built on device by
+        ``Step2SparseSession.initialize_state()`` instead. What stays
+        host-side is the scalar ``ini_val`` and the bookkeeping keys the
+        outer loop and the save path read (``iter_inter``, ``Record``).
+        """
+        cfg = self.cfg
+        t0 = time.perf_counter()
+        ini_val = float(initialize_concentration(inputs.dim))
+        self._log(f"  ini_val (vMF init concentration) = {ini_val:.2f}")
+        Params: Dict[str, Any] = {
+            "ini_val": ini_val,
+            "iter_inter": 0,
+            "Record": [],
+        }
+        self.timings["initialize_params"] = time.perf_counter() - t0
+        return Params
+
+    def _run_em_sparse(
+        self, Params: Dict[str, Any], inputs: "Step2SparseInputs",
+    ) -> Step2Result:
+        """Stage 3, GPU backend — the outer/intra/EM control flow.
+
+        Structurally identical to :meth:`run_em`: same loop bounds, same
+        log lines, same progress emits, same ``Record`` and convergence
+        arithmetic. The differences are all on the Session side —
+
+        * the host resets (``Params['sigma'][...] = ini_val`` +
+          ``reset_s_psi_from_mtc_SLD``; ``Params['kappa'][...] = ini_val``
+          + ``sess.reset_s_t_nu_from_mtc()``) become
+          ``sess.reset_inter()`` / ``sess.reset_intra()``;
+        * ``vmf_clustering_batch`` becomes ``em_body_sparse`` (identical
+          convergence semantics, no ``Params`` round trip);
+        * ``intra_subject_var_loop`` (L17) + ``intra_em_cost_step2`` (L16)
+          become ``sess.intra_closure()``, which returns the same scalar;
+        * ``inter_subject_var`` (L18) becomes ``sess.inter_closure()``;
+        * the final host state comes from one ``sess.export_params()``.
+        """
+        cfg = self.cfg
+        dim = inputs.dim
+        L = cfg.num_clusters
+
+        stop_inter = False
+        cost_inter = 0.0
+        intra_em_per_inter: List[int] = []
+        t_run = time.perf_counter()
+        em_wall_accum = 0.0
+        closure_wall_accum = 0.0
+        em_iters_total = 0
+
+        # Lazy import — a CPU run must never touch cupy.
+        from arealmshbm.step2_em_iter_master import (
+            Step2SparseSession, warmup_step2_gpu,
+        )
+
+        # NVRTC compile + cuBLAS's process-wide module load, off the EM
+        # path. A no-op once the driver's prewarm daemon has run; the
+        # per-step API and the profiling harnesses do not prewarm, and
+        # would otherwise charge ~150 ms to the first ``run_iter``.
+        warmup_step2_gpu()
+
+        t_ctor = time.perf_counter()
+        sess = Step2SparseSession(
+            inputs,
+            mode=cfg.mode,
+            num_clusters=L,
+            dim=dim,
+            ini_val=Params["ini_val"],
+            beta_internal=cfg.beta_internal,
+            eps_m_step=cfg.epsilon,
+            max_iter_m=cfg.max_iter_m,
+            eps_intra_var=cfg.epsilon,
+            max_iter_intra_var=cfg.max_iter_intra_var,
+            bold_cache_mode=cfg.bold_cache_mode,
+            bold_cache_safety_margin_gb=cfg.gpu_cache_safety_margin_gb,
+        )
+        self.timings["session_ctor"] = time.perf_counter() - t_ctor
+        if cfg.verbose:
+            mode_resolved = getattr(sess, "bold_cache_mode", None)
+            if mode_resolved is None:
+                mode_resolved = getattr(sess, "_bold_cache_mode", "unknown")
+            self._log(
+                f"  GPU BOLD cache mode: requested={cfg.bold_cache_mode!r} "
+                f"resolved={mode_resolved!r}"
+            )
+
+        # Device-side init: K1 (hard labels + compose) + log_theta +
+        # the first active-support build. Replaces the CPU path's
+        # host ``compose_init_state`` + ``upload_initial_state`` +
+        # ``cache_mtc``.
+        t_init_dev = time.perf_counter()
+        sess.initialize_state()
+        self.timings["init_device"] = time.perf_counter() - t_init_dev
+
+        while not stop_inter:
+            Params["iter_inter"] = Params["iter_inter"] + 1
+            self._log(f"\n=== [step2] Inter iter {Params['iter_inter']}/{cfg.max_iter_inter} ({cfg.mode}) ===")
+            self.progress.emit_iter(
+                "step2",
+                iter_inter=Params["iter_inter"],
+                max_inter=cfg.max_iter_inter,
+            )
+
+            # Reset sigma + s_psi each inter iter (MATLAB lines 212-213),
+            # on device. Same ordering hazard as the dense path: keep
+            # this adjacent to the EM body — anything reading the
+            # Session's sigma in between would see the pre-reset value.
+            sess.reset_inter()
+
+            cost_intra_em = 0.0
+            for iter_intra_em in range(1, cfg.max_iter_intra_em + 1):
+                Params["iter_intra"] = iter_intra_em
+                self._log(f"  Intra-EM iter {iter_intra_em} ...")
+                self.progress.emit_iter(
+                    "step2",
+                    iter_inter=Params["iter_inter"],
+                    max_inter=cfg.max_iter_inter,
+                    iter_intra=iter_intra_em,
+                    max_intra=cfg.max_iter_intra_em,
+                )
+
+                # Reset kappa + s_t_nu each intra iter (MATLAB 220-221).
+                sess.reset_intra()
+
+                t_em = time.perf_counter()
+                batch = em_body_sparse(
+                    sess,
+                    max_iter_em=cfg.max_iter_em,
+                    em_convergence_eps=cfg.em_convergence_eps,
+                    verbose=cfg.verbose,
+                )
+                em_wall_accum += (time.perf_counter() - t_em)
+                em_iters_total += int(batch.em_iters)
+                Params["cost_em"] = batch.cost_S
+
+                # L17 (intra_subject_var_loop) + L16 (intra_em_cost_step2),
+                # both on device, one host scalar out.
+                t_cl = time.perf_counter()
+                update_cost = float(sess.intra_closure())
+                closure_wall_accum += (time.perf_counter() - t_cl)
+                Params["cost_intra"] = update_cost
+
+                # Convergence: |cost_new - cost_prev| / cost_prev < eps
+                if cost_intra_em != 0.0:
+                    rel = abs(abs(update_cost - cost_intra_em) / cost_intra_em)
+                    if rel <= cfg.intra_em_convergence_eps:
+                        self._log(f"  intra-EM converged at iter {iter_intra_em} (rel-diff {rel:.2e})")
+                        break
+                cost_intra_em = update_cost
+
+            intra_em_per_inter.append(iter_intra_em)
+
+            # L18 (inter_subject_var) — mu + epsil, on device.
+            t_cl = time.perf_counter()
+            sess.inter_closure()
+            closure_wall_accum += (time.perf_counter() - t_cl)
+
+            update_cost_inter = Params["cost_intra"]
+            Params["Record"].append(float(update_cost_inter))
+            self._log(f"  inter cost={float(update_cost_inter):+.4e}")
+
+            # Outer convergence
+            if cost_inter != 0.0:
+                rel_outer = abs(abs(update_cost_inter - cost_inter) / cost_inter)
+                if rel_outer <= cfg.inter_convergence_eps:
+                    self._log(f"  inter converged (rel-diff {rel_outer:.2e})")
+                    stop_inter = True
+            if Params["iter_inter"] >= cfg.max_iter_inter:
+                self._log(f"  reached max_iter_inter={cfg.max_iter_inter}; stopping")
+                stop_inter = True
+            cost_inter = update_cost_inter
+
+        self.timings["em_total"] = em_wall_accum
+        self.timings["closure_total"] = closure_wall_accum
+        self.timings["run_em"] = time.perf_counter() - t_run
+
+        # One D2H for the whole saved state. ``s_lambda`` / ``s_psi`` /
+        # ``s_t_nu`` are never exported (the CPU path strips exactly
+        # those three keys).
+        exported = sess.export_params()
+        # Handed to the writer as-is: ``_save.save_params_final`` owns the
+        # densify policy.
+        theta = exported["theta"]          # scipy csc_matrix (N, L) fp64
+        Params["sigma"] = exported["sigma"]
+        Params["epsil"] = exported["epsil"]
+        Params["kappa"] = exported["kappa"]
+        Params["mu"] = exported["mu"]
+        Params["cost_em"] = exported["cost_em"]
+        Params["theta"] = theta
+        Params["cost_inter"] = cost_inter
+        Params_save = {k: v for k, v in Params.items() if k not in ("s_lambda", "s_psi", "s_t_nu")}
+        final_path = Path(self.cfg.out_dir) / "Params_Final.mat"
+        t_save = time.perf_counter()
+        self._save_params(Params_save, final_path)
+        self.timings["save"] = time.perf_counter() - t_save
+
+        sess_timings = getattr(sess, "timings", None)
+        if sess_timings:
+            # Forwarded VERBATIM under ``session.<name>``: four host
+            # wall entries in SECONDS (``session_ctor``,
+            # ``initialize_state``, ``intra_closure``, ``inter_closure``),
+            # each cumulative over every call in the run.
+            for k, v in sess_timings.items():
+                self.timings[f"session.{k}"] = float(v)
+
+        return Step2Result(
+            Params_final_path=final_path,
+            inter_iters=Params["iter_inter"],
+            intra_em_iters_per_inter=intra_em_per_inter,
+            final_cost=float(cost_inter),
+            timings=self.timings,
+            em_iters_total=em_iters_total,
+        )
 
     # ── public ──
     def run(self) -> Step2Result:
@@ -647,9 +907,21 @@ class Step2Pipeline:
         # themselves if they want the terminal event.
         self.progress.emit_state("step2", COHORT_SUB_ID, "running")
         try:
-            inputs = self.load_inputs()
-            Params = self.initialize_params(inputs)
-            result = self.run_em(Params, inputs)
+            # Backend dispatch lives HERE, not below load_inputs: the
+            # GPU backend's stage-1 output is a different dataclass
+            # (Step2SparseInputs — no bold_loader, no boundary_mask), so
+            # the three stages must be selected as a set. Splitting the
+            # dispatch would hand a Step2SparseInputs to the CPU
+            # ``run_em`` and fail with an ``AttributeError`` inside this
+            # ``try``, i.e. as a confusing "failed" progress event.
+            if self.cfg.backend == "gpu":
+                inputs_sparse = self.load_inputs_sparse()
+                Params = self.initialize_params_sparse(inputs_sparse)
+                result = self._run_em_sparse(Params, inputs_sparse)
+            else:
+                inputs = self.load_inputs()
+                Params = self.initialize_params(inputs)
+                result = self.run_em(Params, inputs)
         except BaseException as e:
             self.progress.emit_state(
                 "step2", COHORT_SUB_ID, "failed",

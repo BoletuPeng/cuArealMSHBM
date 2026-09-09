@@ -106,43 +106,27 @@ __all__ = [
 
 
 def _import_gpu():
-    """Lazy import of the CuPy-backed Session + kernels.
+    """Lazy import of the CuPy Session + kernels (the P-layout backend).
 
     Kept off the module-level import path so ``import
     arealmshbm.step2_em_iter_master`` works on CPU-only machines
     where ``import cupy`` would fail.
     """
-    from ._kernels_gpu import (
-        em_iter_master_kernel_streaming_cupy,
-        warmup_step2_gpu,
-    )
-    from .session_gpu import Step2EmIterSessionCUDA
-    return (
-        em_iter_master_kernel_streaming_cupy,
-        warmup_step2_gpu,
-        Step2EmIterSessionCUDA,
-    )
+    from ._kernels_gpu import warmup_step2_gpu
+    from .session_gpu import Step2SparseSession
+    return warmup_step2_gpu, Step2SparseSession
 
 
 def __getattr__(name):
     """PEP 562 lazy attribute access for GPU symbols.
 
-    ``from arealmshbm.step2_em_iter_master import Step2EmIterSessionCUDA``
+    ``from arealmshbm.step2_em_iter_master import Step2SparseSession``
     triggers a cupy import; on a CPU-only host the user sees the cupy
     ImportError, which is the correct failure mode.
     """
-    if name in {
-        "em_iter_master_kernel_streaming_cupy",
-        "warmup_step2_gpu",
-        "Step2EmIterSessionCUDA",
-    }:
-        eim_cupy, warm, sess_cuda = _import_gpu()
-        mapping = {
-            "em_iter_master_kernel_streaming_cupy": eim_cupy,
-            "warmup_step2_gpu": warm,
-            "Step2EmIterSessionCUDA": sess_cuda,
-        }
-        return mapping[name]
+    if name in {"warmup_step2_gpu", "Step2SparseSession"}:
+        warm, sess = _import_gpu()
+        return {"warmup_step2_gpu": warm, "Step2SparseSession": sess}[name]
     raise AttributeError(
         f"module 'arealmshbm.step2_em_iter_master' has no attribute {name!r}"
     )

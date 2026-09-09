@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import logging
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -49,6 +50,8 @@ from ._progress import COHORT_SUB_ID, ProgressEmitter, build_plan_entries
 from .config import PipelineConfig, read_pipeline_config
 from .inputs import BoldInputs, check_bold_files_exist, read_bold_inputs
 from .layout import ProjectLayout
+
+_log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -117,6 +120,35 @@ class Pipeline:
                 f"pipeline_config.json: mode='modeB_train_prior' requires "
                 f">= 2 subjects (got {self.inputs.num_subjects}). Mode B's "
                 f"coupled EM needs a cohort, not a single subject."
+            )
+        # Mode A never runs step 2, so a leftover backend_step2 there is
+        # inert and must not be rejected.
+        if (not self.config.is_mode_a
+                and self.config.backend_step2 == "gpu"):
+            self._require_fsaverage3_seed("step2", "gpu", "'cpu'")
+        # Step 3 runs in both modes.
+        if self.config.backend_step3 == "gpu_sparse":
+            self._require_fsaverage3_seed("step3", "gpu_sparse",
+                                          "'gpu_full' or 'cpu'")
+
+    def _require_fsaverage3_seed(self, step: str, backend: str,
+                                 alternatives: str) -> None:
+        """Reject a P-layout GPU backend (step 2 ``'gpu'``, step 3
+        ``'gpu_sparse'``) on a seed mesh it cannot serve.
+
+        Both bake a ``ceil(D/8) <= 256`` limit that only
+        ``seed_mesh='fsaverage3'`` satisfies. ``seed_mesh`` lives in
+        bold_inputs.json, so ``read_pipeline_config`` cannot see it and
+        the leaf-side rules (``Step2Config.__post_init__``, the step-3
+        gpu_sparse session ctor) fire only after steps 0-1 (step 3: 0-2)
+        have already burned minutes of wall time.
+        """
+        if self.inputs.seed_mesh != "fsaverage3":
+            raise ValueError(
+                f"pipeline_config.json: backend_{step}={backend!r} "
+                f"requires bold_inputs.json seed_mesh='fsaverage3'; "
+                f"got {self.inputs.seed_mesh!r}. Use "
+                f"backend_{step}={alternatives}."
             )
 
     def _prior_includes_beta(self) -> bool:
@@ -268,22 +300,9 @@ class Pipeline:
         # BOLD in flight. Fine.
         lookahead = 4
 
-        # Issue #55: ``Step0BoldPrefetcher(backend='gpu')`` is
-        # functionally complete (nvCOMP Deflate decode + on-device
-        # concat_hemis_drop_medial, bit-equal to CPU — pinned by
-        # ``arealmshbm/pipeline/tests/test_bold_prefetcher_gpu.py``).
-        # The production driver still pins it to 'cpu' because under
-        # cupy's legacy default stream the GPU decode would serialize
-        # with subgraph A's compute on the same stream — i.e. add to
-        # (not hide under) total wall. A real perf win needs per-
-        # worker non-blocking streams; until that follow-up lands,
-        # leave the cheap-and-overlapped CPU IO as the production
-        # default. The class-level backend kwarg stays available for
-        # benchmarking and future work.
         with Step0BoldPrefetcher(
             medial_mask=seed_inputs.medial_mask,
             n_lh=seed_inputs.n_lh, n_rh=seed_inputs.n_rh,
-            backend="cpu",
         ) as prefetcher:
             for k in range(min(lookahead, len(subjects))):
                 prefetcher.prime_subject(
@@ -324,13 +343,22 @@ class Pipeline:
         flow (avg profile arrays threaded subgraph 2 → 3 in memory),
         and the cohort.json write at the end.
 
+        GPU backend: the subgraphs are chained in memory / on device
+        (``packed_sink`` → ``packed_subjects`` → ``lh_avg_dev``) and
+        every disk write runs on a background thread joined once at
+        the end (:func:`step1_runners.join_step1_writers`); on CPU
+        that background writer carries the group.mat write alone. The
+        one-time GPU costs are prewarmed on a daemon thread that
+        :meth:`run` starts before step 0. Holding every subject's
+        packed slab until avg_profiles costs ~72 MB/subject at
+        fsaverage6 with 6 sessions.
+
         Returns the bundle of artifacts the cohort writer needs to
         emit ``cohort.json``.
         """
         from .step1_runners import (
-            resolve_group_labels,
-            run_avg_profiles, run_generate_profiles,
-            run_ini_params, run_radius_mask,
+            join_step1_writers, resolve_group_labels, run_avg_profiles,
+            run_generate_profiles, run_ini_params, run_radius_mask,
         )
 
         subjects = self.inputs.subject_ids()
@@ -339,11 +367,23 @@ class Pipeline:
         seed = self.inputs.seed_mesh
         backend = self.config.backend_step1
         k1 = self.config.step1
+        is_gpu = backend == "gpu"
+
+        # Resolve group labels once for both ini_params + radius_mask
+        # (hot Schaefer .annot parse).
+        lh_labels, rh_labels = resolve_group_labels(
+            targ_mesh=targ,
+            schaefer_resolution=str(self.config.num_clusters),
+        )
 
         # Subgraph 1 — per-subject profile arrays → bitpacked .b2nd.
         # The stage pipeline emits per-subject ``step1`` state events
         # internally; the driver injects ``self._progress`` via the
-        # runner's keyword arg.
+        # runner's keyword arg. On GPU the packed bytes stay in memory
+        # for subgraph 2 and the single-subject .b2nd write is joined
+        # at the end of the step.
+        packed_sink: Optional[Dict[str, Any]] = {} if is_gpu else None
+        write_handles: Optional[list] = [] if is_gpu else None
         profile_b2nd_paths = run_generate_profiles(
             project_dir=self.layout.project_dir,
             subjects=subjects,
@@ -355,83 +395,136 @@ class Pipeline:
             backend=backend,
             verbose=True,
             progress=self._progress,
+            packed_sink=packed_sink,
+            write_handles=write_handles,
         )
 
-        # Subgraph 2 — cohort-average across subjects/sessions. Returns
-        # both on-disk paths (cache) and in-memory ``lh_avg``/``rh_avg``
-        # arrays, which subgraph 3 consumes directly.
-        self._progress.emit_state("step1_avg", COHORT_SUB_ID, "running")
+        # Subgraphs 2-4 run under one try/finally so a failure in any of
+        # them still joins the background writers: an abandoned handle's
+        # file would otherwise land on disk after the run reported
+        # failure, and step 1 treats disk as a cache the next run reads.
+        avg_res = None
+        ini_res = None
+        joined = False
         try:
-            avg_res = run_avg_profiles(
-                project_dir=self.layout.project_dir,
-                num_sub=len(subjects),
-                num_sess=len(sessions),
-                seed_mesh=seed,
-                targ_mesh=targ,
-                backend=backend,
-            )
-        except BaseException as e:
-            self._progress.emit_state(
-                "step1_avg", COHORT_SUB_ID, "failed",
-                error=f"{type(e).__name__}: {e}")
-            raise
-        self._progress.emit_state("step1_avg", COHORT_SUB_ID, "done")
+            # Subgraph 2 — cohort-average across subjects/sessions.
+            # Returns both on-disk paths (cache) and in-memory
+            # ``lh_avg``/``rh_avg`` arrays, which subgraph 3 consumes
+            # directly.
+            self._progress.emit_state("step1_avg", COHORT_SUB_ID, "running")
+            try:
+                if packed_sink:
+                    packed_subjects = [packed_sink[str(s)][0] for s in subjects]
+                    D_unpacked = packed_sink[str(subjects[0])][1]
+                else:
+                    packed_subjects, D_unpacked = None, None
+                avg_res = run_avg_profiles(
+                    project_dir=self.layout.project_dir,
+                    num_sub=len(subjects),
+                    num_sess=len(sessions),
+                    seed_mesh=seed,
+                    targ_mesh=targ,
+                    backend=backend,
+                    packed_subjects=packed_subjects,
+                    D=D_unpacked,
+                )
+            except BaseException as e:
+                self._progress.emit_state(
+                    "step1_avg", COHORT_SUB_ID, "failed",
+                    error=f"{type(e).__name__}: {e}")
+                raise
+            self._progress.emit_state("step1_avg", COHORT_SUB_ID, "done")
 
-        # Resolve group labels once for both ini_params + radius_mask
-        # (hot Schaefer .annot parse).
-        lh_labels, rh_labels = resolve_group_labels(
-            targ_mesh=targ,
-            schaefer_resolution=str(self.config.num_clusters),
-        )
+            # Subgraph 3 — initialization prior (μ, ε). Consumes the avg
+            # arrays from memory (device arrays on GPU) — no .npy re-read
+            # between subgraphs 2 and 3.
+            self._progress.emit_state("step1_ini", COHORT_SUB_ID, "running")
+            try:
+                ini_res = run_ini_params(
+                    project_dir=self.layout.project_dir,
+                    seed_mesh=seed,
+                    targ_mesh=targ,
+                    lh_labels=lh_labels,
+                    rh_labels=rh_labels,
+                    profile_dtype=np.dtype(k1.profile_dtype),
+                    reduction_dtype=np.dtype(k1.reduction_dtype),
+                    backend=backend,
+                    precomputed_lh_avg=avg_res.lh_avg,
+                    precomputed_rh_avg=avg_res.rh_avg,
+                    precomputed_lh_avg_dev=avg_res.lh_avg_dev,
+                    precomputed_rh_avg_dev=avg_res.rh_avg_dev,
+                    save_async=True,
+                )
+            except BaseException as e:
+                self._progress.emit_state(
+                    "step1_ini", COHORT_SUB_ID, "failed",
+                    error=f"{type(e).__name__}: {e}")
+                raise
+            self._progress.emit_state("step1_ini", COHORT_SUB_ID, "done")
 
-        # Subgraph 3 — initialization prior (μ, ε). Consumes the avg
-        # arrays from memory directly — no .npy re-read between
-        # subgraphs 2 and 3.
-        self._progress.emit_state("step1_ini", COHORT_SUB_ID, "running")
-        try:
-            group_mat_path, epsil = run_ini_params(
-                project_dir=self.layout.project_dir,
-                seed_mesh=seed,
-                targ_mesh=targ,
-                lh_labels=lh_labels,
-                rh_labels=rh_labels,
-                profile_dtype=np.dtype(k1.profile_dtype),
-                reduction_dtype=np.dtype(k1.reduction_dtype),
-                backend=backend,
-                precomputed_lh_avg=avg_res.lh_avg,
-                precomputed_rh_avg=avg_res.rh_avg,
-            )
-        except BaseException as e:
-            self._progress.emit_state(
-                "step1_ini", COHORT_SUB_ID, "failed",
-                error=f"{type(e).__name__}: {e}")
-            raise
-        self._progress.emit_state("step1_ini", COHORT_SUB_ID, "done")
+            # Subgraph 4 — spatial radius mask.
+            self._progress.emit_state("step1_mask", COHORT_SUB_ID, "running")
+            try:
+                spatial_mask_path = run_radius_mask(
+                    project_dir=self.layout.project_dir,
+                    targ_mesh=targ,
+                    lh_labels=lh_labels,
+                    rh_labels=rh_labels,
+                    radius_mm=k1.radius_mask_radius_mm,
+                    backend=backend,
+                )
+            except BaseException as e:
+                self._progress.emit_state(
+                    "step1_mask", COHORT_SUB_ID, "failed",
+                    error=f"{type(e).__name__}: {e}")
+                raise
+            self._progress.emit_state("step1_mask", COHORT_SUB_ID, "done")
 
-        # Subgraph 4 — spatial radius mask.
-        self._progress.emit_state("step1_mask", COHORT_SUB_ID, "running")
-        try:
-            spatial_mask_path = run_radius_mask(
-                project_dir=self.layout.project_dir,
-                targ_mesh=targ,
-                lh_labels=lh_labels,
-                rh_labels=rh_labels,
-                radius_mm=k1.radius_mask_radius_mm,
-                backend=backend,
-            )
-        except BaseException as e:
-            self._progress.emit_state(
-                "step1_mask", COHORT_SUB_ID, "failed",
-                error=f"{type(e).__name__}: {e}")
-            raise
-        self._progress.emit_state("step1_mask", COHORT_SUB_ID, "done")
+            # Join every background write before cohort.json names the files.
+            joined = True
+            join_step1_writers(write_handles, avg_res, ini_res,
+                               progress=self._progress)
+        finally:
+            if not joined:
+                try:
+                    join_step1_writers(write_handles, avg_res, ini_res,
+                                       progress=self._progress)
+                except BaseException:      # noqa: BLE001 — never mask
+                    pass                   # the failure being propagated
+        avg_paths = (avg_res.lh_path, avg_res.rh_path)
+        # Both names hold the same per-subject slabs (the single-subject
+        # slab is a view on the pooled pinned block) — drop both so the
+        # pinned pool can reclaim them in the epilogue below.
+        packed_sink = packed_subjects = None
+        write_handles = None
+        if is_gpu:
+            # Hand back step 1's device AND pinned host memory before
+            # step 2 starts: the ingest staging block and the D2H pool
+            # are module globals (~600 MB at fsaverage6/6 sessions) that
+            # would otherwise stay resident for the rest of the process.
+            try:
+                import cupy as cp
+                from arealmshbm.data_io.gifti_bold_gpu import (
+                    release_staging_buffer,
+                )
+                from arealmshbm.generate_profiles.profiles_subject_gpu import (
+                    release_pinned_staging,
+                )
+                del avg_res
+                release_pinned_staging()
+                release_staging_buffer()
+                cp.get_default_memory_pool().free_all_blocks()
+                cp.get_default_pinned_memory_pool().free_all_blocks()
+            except Exception:
+                _log.debug("step1 GPU epilogue: pool release failed",
+                           exc_info=True)
 
         return {
             "profile_b2nd_paths": profile_b2nd_paths,
-            "avg_profile_paths": (avg_res.lh_path, avg_res.rh_path),
-            "group_mat_path": group_mat_path,
+            "avg_profile_paths": avg_paths,
+            "group_mat_path": ini_res.group_mat_path,
             "spatial_mask_path": spatial_mask_path,
-            "epsil": epsil,
+            "epsil": ini_res.epsil,
         }
 
     def _write_cohort(self, step1_outputs: Dict[str, Any]) -> Path:
@@ -450,41 +543,16 @@ class Pipeline:
             avg_profile_paths=step1_outputs["avg_profile_paths"],
         )
 
-    def _run_step2_train_prior_maybe_tf32(self) -> Path:
-        """Driver wrapper around step2 that toggles cuBLAS TF32 math
-        mode for the duration of the step (and only this step) when
-        ``config.step2.enable_tf32`` is True and step2 runs on GPU.
-
-        Other steps see the prior math mode restored on exit (default
-        strict fp32 unless ``NVIDIA_TF32_OVERRIDE=1`` is also set in
-        the environment, in which case the prior mode IS the TF32 mode
-        — restoring it is still a no-op).
-
-        Mode A never reaches this method (step2 is not in its flow);
-        Mode B's parser guarantees ``self.config.step2`` is non-None
-        by the time the driver dispatches here.
-        """
-        assert self.config.step2 is not None, (
-            "step2 block missing — driver invariant violated"
-        )
-        if (self.config.step2.enable_tf32
-                and self.config.backend_step2 == "gpu"):
-            from ._cublas_math_mode import cublas_tf32_scope
-            with cublas_tf32_scope():
-                return self._run_step2_train_prior()
-        return self._run_step2_train_prior()
-
     def _run_step2_train_prior(self) -> Path:
         """Step 2: coupled EM across the cohort, produces Params_Final.mat
         at ``priors/<variant>/beta<X>/Params_Final.mat``."""
         from arealmshbm.step2_pipeline import Step2Config, Step2Pipeline
 
-        # ``**k2_kwargs`` splats every Step2Knobs algorithm field into
-        # Step2Config via the field-name 1:1 mapping pinned by
+        # ``**k2_kwargs`` splats every Step2Knobs field into Step2Config
+        # via the field-name 1:1 mapping pinned by
         # test_knobs_field_match.test_step2_knobs_field_names_match_step2config
-        # — same pattern as step0. ``enable_tf32`` is the one exception:
-        # it's consumed by the driver's tf32_scope wrapper (above), not
-        # by Step2Config itself, so it's popped from the splat.
+        # — same pattern as step0, minus step0's driver-consumed
+        # ``enable_tf32`` (step 2 has no TF32 scope).
         #
         # k2 is guaranteed non-None here: this method is only invoked from
         # ``run()`` on the Mode B branch, and the parser requires the
@@ -495,7 +563,6 @@ class Pipeline:
             "— parser invariant violated"
         )
         k2_kwargs = asdict(k2)
-        k2_kwargs.pop("enable_tf32")
         cfg = Step2Config(
             project_dir=self.layout.project_dir,
             num_sub=self.inputs.num_subjects,
@@ -572,7 +639,9 @@ class Pipeline:
         from arealmshbm.step3_pipeline import Step3Config, Step3Pipeline
 
         subjects = list(self.inputs.subjects)
-        is_gpu = self.config.backend_step3 in ("gpu_elambda", "gpu_full")
+        is_gpu = self.config.backend_step3 in (
+            "gpu_elambda", "gpu_full", "gpu_sparse",
+        )
 
         # ``**asdict(k3)`` splats every Step3Knobs field into Step3Config
         # via the field-name 1:1 mapping pinned by
@@ -710,6 +779,34 @@ class Pipeline:
             self._stage_step1_bold_lists()
             timings["stage_bold_lists"] = time.perf_counter() - t
 
+            current_phase = "prewarm"
+            # Step 2's GPU backend compiles one RawModule at first
+            # use. Kick that NVRTC compile onto a daemon thread now so it
+            # overlaps step 0 + step 1 instead of landing inside step 2's
+            # first EM iter. Compile plus a 32x32 gemm that pays cuBLAS's
+            # process-wide module load — no pinned buffers, because the
+            # pools get drained right after step 0 and anything allocated
+            # here would be reclaimed before step 2 runs (see the
+            # step2_runners docstring).
+            # Mode A never runs step 2.
+            if (not self.config.is_mode_a
+                    and self.config.backend_step2 == "gpu"):
+                from .step2_runners import prewarm_step2_gpu
+                prewarm_step2_gpu(background=True)
+
+            # Step 1's one-time GPU costs (RawKernel NVRTC compiles,
+            # the cuBLAS handle, the nvCOMP load, pinned staging) are
+            # paid on a daemon thread that overlaps step 0. The leaf's
+            # prewarm is lock-guarded and idempotent, so the call step 1
+            # makes itself later just waits for this one.
+            if self.config.backend_step1 == "gpu":
+                from .step1_runners import (
+                    bold_pairs_for_prewarm, prewarm_step1_gpu,
+                )
+                prewarm_step1_gpu(bold_pairs_for_prewarm(
+                    self.layout.project_dir,
+                    self.inputs.subject_ids(), self.inputs.session_ids()))
+
             # Step 0: gradients per subject. Returns the in-memory dict
             # ``{sub_id: gradient_mat}`` that step3 will consume directly,
             # skipping the disk re-read.
@@ -742,7 +839,7 @@ class Pipeline:
                 timings["prior_check"] = time.perf_counter() - t
             else:
                 current_phase = "step2"
-                prior_dst = self._run_step2_train_prior_maybe_tf32()
+                prior_dst = self._run_step2_train_prior()
                 timings["step2"] = time.perf_counter() - t
 
             # Step 3: per-subject parcellation. Consumes step0's gradients
@@ -758,6 +855,16 @@ class Pipeline:
             failure = e
             raise
         finally:
+            # A prewarm thread must not outlive the interpreter's cupy
+            # teardown; a run that never reached step 1 can still have
+            # one in flight.
+            if self.config.backend_step1 == "gpu":
+                from .step1_runners import join_step1_prewarm
+                join_step1_prewarm()
+            if (not self.config.is_mode_a
+                    and self.config.backend_step2 == "gpu"):
+                from .step2_runners import join_step2_prewarm
+                join_step2_prewarm()
             timings["total"] = time.perf_counter() - t_total
             result = PipelineRunResult(
                 project_dir=str(self.layout.project_dir),

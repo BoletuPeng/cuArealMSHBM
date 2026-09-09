@@ -5,8 +5,9 @@ outer EM loop in :class:`vmf_clustering.VmfClusteringSession`.
 
 Public API:
     EMStopSession         — caches per-call scratch.
-    matlab_ratio_converged — shared MATLAB-faithful ratio convergence helper
-                             (also used by the outer ``intra_em`` loop).
+    matlab_ratio_converged — shared MATLAB-faithful ratio convergence helper.
+                             Also called by ``intra_em`` and by the
+                             ``gpu_full`` / ``gpu_sparse`` EM bodies.
     cdln_general_to_f32   — generic-d log-vMF normalization via Debye
                              expansion; used here and by ``intra_em_cost``.
     warmup                — pre-compile every numba kernel. Idempotent.

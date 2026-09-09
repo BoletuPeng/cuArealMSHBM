@@ -175,7 +175,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--subject", default="sub-001")
     p.add_argument("--backends", nargs="*",
                    default=["cpu", "gpu_full"],
-                   choices=["cpu", "gpu_elambda", "gpu_full"])
+                   choices=["cpu", "gpu_elambda", "gpu_full", "gpu_sparse"])
     p.add_argument("--project-root", default=str(_DEFAULT_PROJECT_ROOT))
     p.add_argument("--mesh", default="fsaverage6")
     p.add_argument("--w", type=float, default=50.0)

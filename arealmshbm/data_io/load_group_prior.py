@@ -26,6 +26,20 @@ from typing import Dict
 import numpy as np
 
 
+def _densify(x):
+    """MATLAB-sparse field → dense ndarray; dense fields pass through.
+
+    ``Params.theta`` / ``Params.mu`` may have been written as MATLAB
+    sparse arrays by some writer (a MATLAB-side ``sparse()``, say — the
+    in-tree step-2 writer always densifies), in which case ``scipy.io.loadmat``
+    hands this reader a ``csc_array``/``csc_matrix`` and
+    ``np.ascontiguousarray`` on one of those raises ``ValueError:
+    setting an array element with a sequence``. Mirrors
+    ``load_spatial_mask._to_dense``.
+    """
+    return x.toarray() if hasattr(x, "toarray") else x
+
+
 def load_group_prior(prior_path: str | Path) -> Dict[str, np.ndarray]:
     """Read ``Params_Final.mat`` and return the four Mode-A fields.
 
@@ -50,8 +64,8 @@ def load_group_prior(prior_path: str | Path) -> Dict[str, np.ndarray]:
         m = loadmat(p, squeeze_me=False)
         params = m["Params"]
         # Older v7 files come back as a structured ndarray; access via field names.
-        mu     = np.ascontiguousarray(params["mu"][0, 0],    dtype=np.float32)
-        theta  = np.ascontiguousarray(params["theta"][0, 0], dtype=np.float32)
+        mu     = np.ascontiguousarray(_densify(params["mu"][0, 0]),    dtype=np.float32)
+        theta  = np.ascontiguousarray(_densify(params["theta"][0, 0]), dtype=np.float32)
         epsil  = np.asarray(params["epsil"][0, 0]).reshape(1, -1).astype(np.float32)
         sigma  = np.asarray(params["sigma"][0, 0]).reshape(1, -1).astype(np.float32)
     except (NotImplementedError, ValueError):

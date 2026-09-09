@@ -12,10 +12,12 @@ zero parcels whose distance is too small (``truncate_kernel``).
 Backends (dispatched by the ``backend=`` kwarg on the supercall):
     cpu — numba per-parcel Dijkstra-with-binary-heap, ``prange`` over
           parcels / sources.
-    gpu — batched pull-based Bellman-Ford on a (V, K) device distance
-          matrix (one BF iter = one RawKernel pass over V*K cells,
-          loop until ``changed`` flag is 0). Classify / truncate stay
-          CPU (small, heavy control flow). cupy imported lazily.
+    gpu — frontier delta-stepping SSSP (32 sources per CTA) for the
+          central-sulcus distances, batched pull-based Bellman-Ford on
+          a (V, L_h) device matrix for the bounded radius mask.
+          Classify / truncate stay CPU (small, heavy control flow).
+          cupy imported lazily. Requires V <= 90080, so fsaverage6 /
+          fsaverage5 only — fsaverage is CPU-only for this leaf.
 
 Public API:
     generate_radius_mask(lh_labels, rh_labels, mesh, radius, out_dir, …,

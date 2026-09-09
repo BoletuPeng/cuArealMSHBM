@@ -163,7 +163,7 @@ def read_bold_inputs(path: Path | str) -> BoldInputs:
                 # the actual file extension is just ``.gii`` —
                 # ``.surf.gii`` (geometry) / ``.shape.gii`` (single-frame)
                 # also pass the suffix check; they fail the content
-                # contract instead at :func:`_parse_gifti_chunks`
+                # contract instead at :func:`_scan_gifti_spans`
                 # because their DataArray shape isn't a per-vertex time
                 # series.
                 if p.suffix.lower() != ".gii":

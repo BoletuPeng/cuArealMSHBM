@@ -11,12 +11,13 @@
       "values": [
         "cpu",
         "gpu_elambda",
-        "gpu_full"
+        "gpu_full",
+        "gpu_sparse"
       ],
       "default": "cpu",
       "source": "arealmshbm/pipeline/config.py (PipelineConfig.backend_step3)",
       "description": "step3 backend.",
-      "notes": "gpu_full recommended; uses fused unpack+normalize for bitpacked BOLD."
+      "notes": "gpu_full recommended default GPU backend (fused unpack+normalize for bitpacked BOLD). gpu_sparse: opt-in candidate-set EM on the theta support, ~10x faster than gpu_full, gMSHBM/dMSHBM only, requires bold_inputs.json seed_mesh='fsaverage3' (the packed-BOLD kernels cap ceil(D/8) at 256); validated against the stock-MATLAB reference on the 10-subject YS cohort (see docs/step3_sparse_design.md)."
     },
     {
       "key": "step3.connect_th",

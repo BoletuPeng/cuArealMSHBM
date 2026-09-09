@@ -74,7 +74,7 @@ PipelineVariant = Literal["gMSHBM", "cMSHBM", "dMSHBM"]
 _VALID_MODES = ("modeA_single", "modeA_batch", "modeB_train_prior")
 _VALID_VARIANTS = ("gMSHBM", "cMSHBM", "dMSHBM")
 _VALID_BACKENDS_STEP012 = ("cpu", "gpu")
-_VALID_BACKENDS_STEP3 = ("cpu", "gpu_elambda", "gpu_full")
+_VALID_BACKENDS_STEP3 = ("cpu", "gpu_elambda", "gpu_full", "gpu_sparse")
 _VALID_NUM_CLUSTERS = (100, 200, 300, 400, 500, 600, 700, 800, 900, 1000)
 _VALID_EMB_FORMATS = ("npy", "mat", "both")
 _VALID_DTYPES = ("float32", "float64")
@@ -150,15 +150,7 @@ class Step1Knobs:
 
 @dataclass(frozen=True)
 class Step2Knobs:
-    """Step 2 internal knobs (mirror Step2Config algorithm fields).
-
-    ``enable_tf32`` is the step-scoped cuBLAS TF32 toggle (relocated
-    from top-level ``enable_tf32_step2`` to this block in 2026-06).
-    Because the entire block is forbidden in Mode A configs, the
-    "Mode A user writes enable_tf32_step2: true silently does nothing"
-    confusion is gone by construction. Has effect only when
-    ``backend_step2 == 'gpu'``.
-    """
+    """Step 2 internal knobs (mirror Step2Config algorithm fields)."""
     max_iter_inter: int
     max_iter_intra_em: int
     max_iter_em: int
@@ -171,7 +163,6 @@ class Step2Knobs:
     bold_cache_mode: Literal["auto", "eager_bitpacked", "stream"]
     gpu_cache_safety_margin_gb: float
     verbose: bool
-    enable_tf32: bool
 
 
 @dataclass(frozen=True)
@@ -224,11 +215,9 @@ class PipelineConfig:
     # Per-step internal knob bundles. Required by mode:
     #   Mode A — step0 + step1 + step3 (step2 is None)
     #   Mode B — step0 + step1 + step2 + step3 (all non-None)
-    # cuBLAS TF32 toggles live INSIDE the relevant step block
-    # (``step0.enable_tf32`` and ``step2.enable_tf32``) — they used to
-    # be top-level until 2026-06, but the relocation lets Mode A
-    # configs naturally not carry ``enable_tf32_step2`` and lines the
-    # field up with the catalog file that owns its docs (step{N}.json).
+    # The cuBLAS TF32 toggle lives INSIDE the step0 block
+    # (``step0.enable_tf32``; top-level until 2026-06). Step 2 has none:
+    # its GPU backend makes one cuBLAS call per run.
     step0: Step0Knobs
     step1: Step1Knobs
     step2: Optional[Step2Knobs]
@@ -249,7 +238,7 @@ _STEP3_KEYS = frozenset(Step3Knobs.__dataclass_fields__.keys())
 
 # Campaign-spanning top-level keys, present in every mode. step{N}
 # block names are added per mode via _MODE_REQUIRED_BLOCKS. The
-# enable_tf32 toggles live INSIDE step0 / step2 blocks (relocated
+# ``enable_tf32`` toggle lives INSIDE the step0 block (relocated
 # 2026-06), not at top level.
 _TOP_LEVEL_BASE_KEYS = frozenset({
     "schema_version", "mode", "variant", "num_clusters", "beta_scalar",
@@ -457,6 +446,12 @@ def _parse_step2(raw: Dict[str, Any]) -> Step2Knobs:
             f"pipeline_config.json: step2 must be an object "
             f"(got {type(raw).__name__})"
         )
+    if "enable_tf32" in raw:
+        raise ValueError(
+            "pipeline_config.json: step2.enable_tf32 was removed with the "
+            "dense CuPy step-2 port (2026-09); the 'gpu' backend has no "
+            "TF32 mode. Delete the key (step0.enable_tf32 stays)."
+        )
     _check_unknown_keys(raw, _STEP2_KEYS, "step2")
     return Step2Knobs(
         max_iter_inter=_need_in(raw, "step2", "max_iter_inter", int),
@@ -476,7 +471,6 @@ def _parse_step2(raw: Dict[str, Any]) -> Step2Knobs:
         gpu_cache_safety_margin_gb=_need_in(
             raw, "step2", "gpu_cache_safety_margin_gb", float),
         verbose=_need_in(raw, "step2", "verbose", bool),
-        enable_tf32=_need_in(raw, "step2", "enable_tf32", bool),
     )
 
 
@@ -647,9 +641,10 @@ def read_pipeline_config(path: Path | str) -> PipelineConfig:
             "like _comment / _notes / _todo; drop those before migrating), "
             "(iii) is mode-aware about which step blocks must be present "
             "(Mode A configs MUST NOT contain a step2 block; Mode B configs "
-            "MUST contain all four), and (iv) moves the cuBLAS TF32 toggles "
-            "from top-level ``enable_tf32_step{0,2}`` into the matching step "
-            "block as ``step0.enable_tf32`` / ``step2.enable_tf32``."
+            "MUST contain all four), and (iv) moves the cuBLAS TF32 toggle "
+            "from top-level ``enable_tf32_step0`` into the step0 block as "
+            "``step0.enable_tf32`` (``enable_tf32_step2`` has no v2 "
+            "equivalent: step 2's GPU backend has no TF32 mode)."
         )
     if sv != "2":
         raise ValueError(
@@ -709,6 +704,49 @@ def read_pipeline_config(path: Path | str) -> PipelineConfig:
         raise NotImplementedError(
             "pipeline_config.json: cMSHBM is not wired for step2 (Mode B). "
             "Use gMSHBM or dMSHBM for Mode B."
+        )
+
+    if backend_step2 == "gpu" and "step2" in required_blocks:
+        # Two static kernel limits, failed here rather than after step 0/1
+        # and the cohort BOLD decode. The literals mirror
+        # ``step2_em_iter_master._kernels_gpu``'s MAX_CLUSTERS / MAX_D_GRAD
+        # (this parser
+        # is stdlib-only; importing the kernel module would pull numba +
+        # cupy into ``Pipeline.__init__``). ``test_config.py`` pins the
+        # equality. The parser cannot see ``seed_mesh`` — the driver checks
+        # the third limit, ceil(D/8) <= 256, off bold_inputs.json.
+        _SPARSE_MAX_CLUSTERS = 512      # 32 * INIT_MAXJ
+        _SPARSE_MAX_D_GRAD = 11772      # (49152 - connect_u static) // 4
+        if num_clusters > _SPARSE_MAX_CLUSTERS:
+            raise ValueError(
+                f"pipeline_config.json: backend_step2='gpu' "
+                f"supports num_clusters <= {_SPARSE_MAX_CLUSTERS}; got "
+                f"{num_clusters}. Use backend_step2='cpu'."
+            )
+        # dMSHBM never launches ``connect_u``, so the shared-memory cap
+        # only binds the spatial variant.
+        if variant == "gMSHBM" and n_grad_components > _SPARSE_MAX_D_GRAD:
+            raise ValueError(
+                f"pipeline_config.json: backend_step2='gpu' "
+                f"supports n_grad_components <= {_SPARSE_MAX_D_GRAD} "
+                f"(``connect_u`` stages one float per component in shared "
+                f"memory); got {n_grad_components}. Use "
+                f"backend_step2='cpu'."
+            )
+
+    if variant == "cMSHBM" and backend_step3 == "gpu_sparse":
+        raise ValueError(
+            "pipeline_config.json: backend_step3='gpu_sparse' does not "
+            "implement cMSHBM's pre-E-step isolated-vertex removal. Use "
+            "'gpu_full' or 'cpu' for cMSHBM."
+        )
+
+    if w == 0 and backend_step3 == "gpu_sparse":
+        raise ValueError(
+            "pipeline_config.json: backend_step3='gpu_sparse' requires "
+            "w > 0. The candidate-set E-step only visits supp(theta), so "
+            "it matches the dense E-step only while the w*log(theta) term "
+            "is active; use 'gpu_full' or 'cpu' for w=0."
         )
 
     # Step blocks: parse only those the mode requires. step2 is the

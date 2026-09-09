@@ -55,8 +55,9 @@ class Step3Config:
                   1, num_clusters)``). Keep both representations so a
                   future GUI binds to the user-facing scalar without
                   losing the MATLAB-equivalent internal weight.
-    backend : 'cpu' | 'gpu_elambda' | 'gpu_full'. See
+    backend : 'cpu' | 'gpu_elambda' | 'gpu_full' | 'gpu_sparse'. See
               :class:`arealmshbm.vmf_clustering.VmfClusteringSession`.
+              'gpu_sparse' is gMSHBM/dMSHBM only.
     connect_th : connectedness threshold for the distributed-parcel test.
     epsilon : convergence tolerance shared across the four nested loops.
     max_iter_intra_em : outer loop cap (MATLAB hardcodes 50).
@@ -148,10 +149,11 @@ class Step3Config:
             raise ValueError(
                 f"Step3Config: subid must be >= 1 (got {self.subid})"
             )
-        if self.backend not in ("cpu", "gpu_elambda", "gpu_full"):
+        if self.backend not in ("cpu", "gpu_elambda", "gpu_full", "gpu_sparse"):
             raise ValueError(
                 f"Step3Config: backend must be one of "
-                f"'cpu' / 'gpu_elambda' / 'gpu_full' (got {self.backend!r})"
+                f"'cpu' / 'gpu_elambda' / 'gpu_full' / 'gpu_sparse' "
+                f"(got {self.backend!r})"
             )
         if self.pipeline_type not in VALID_PIPELINE_TYPES:
             raise ValueError(
@@ -161,6 +163,15 @@ class Step3Config:
         # Resolve VariantSpec early — every default-derivation below
         # branches on it.
         self._variant = VariantSpec.from_pipeline_type(self.pipeline_type)
+        if self.backend == "gpu_sparse" and (
+            self.pipeline_type == "cMSHBM"
+            or self._variant.pre_predicate_remove_isolated
+        ):
+            raise ValueError(
+                "Step3Config: backend='gpu_sparse' does not implement the "
+                "cMSHBM pre-E-step isolated-vertex removal; use 'gpu_full' "
+                f"or 'cpu' for pipeline_type={self.pipeline_type!r}"
+            )
         if self.mesh not in _SUPPORTED_MESHES:
             raise ValueError(
                 f"Step3Config: mesh must be one of {sorted(_SUPPORTED_MESHES)} "
@@ -168,8 +179,11 @@ class Step3Config:
             )
         # Numeric guards. The hot path doesn't validate these; a negative
         # epsilon or zero iter cap would silently produce wrong / never-
-        # terminating runs. ``w/c/beta_scalar`` are non-negative weights
-        # (0 disables the corresponding prior term — meaningful, kept).
+        # terminating runs. ``w/c/beta_scalar`` are non-negative weights.
+        # Note ``w=0`` does NOT switch the group prior off: the dense
+        # E-step still evaluates 0*log(theta) = NaN outside supp(theta)
+        # (MATLAB behaves the same), so it is rejected on gpu_sparse
+        # rather than silently producing a support-restricted answer.
         if self.epsilon <= 0.0:
             raise ValueError(
                 f"Step3Config: epsilon must be positive (got {self.epsilon})"
@@ -190,6 +204,13 @@ class Step3Config:
             )
         if self.w < 0.0:
             raise ValueError(f"Step3Config: w must be >= 0 (got {self.w})")
+        if self.w == 0.0 and self.backend == "gpu_sparse":
+            raise ValueError(
+                "Step3Config: backend='gpu_sparse' requires w > 0. The "
+                "candidate-set E-step only visits supp(theta), so it "
+                "matches the dense E-step only while the w*log(theta) "
+                "term is active; use 'gpu_full' or 'cpu' for w=0."
+            )
         if self.c < 0.0:
             raise ValueError(f"Step3Config: c must be >= 0 (got {self.c})")
         if self.beta_scalar < 0.0:

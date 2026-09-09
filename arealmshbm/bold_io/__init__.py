@@ -12,10 +12,6 @@ Public API:
     concat_hemis_drop_medial    — vstack lh + rh, replace NaN with 0
                                   (per hemi, matching MATLAB ordering),
                                   then drop rows flagged as medial wall.
-    concat_hemis_drop_medial_gpu — cupy device-side mirror with
-                                  bit-equal semantics. Lives in
-                                  ``bold_io_gpu`` so cupy stays a soft
-                                  dependency on the CPU import.
 
 Precision policy:
     Storage and arithmetic are fp32 throughout; this matches MATLAB's
@@ -31,12 +27,6 @@ Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """
 
 from .bold_io import read_surface_bold, concat_hemis_drop_medial
-
-# Note: ``concat_hemis_drop_medial_gpu`` is intentionally NOT imported at
-# package load — its module imports cupy at call time, but the symbol
-# lives in this package so callers can ``from arealmshbm.bold_io.bold_io_gpu
-# import concat_hemis_drop_medial_gpu`` only when actually on the GPU
-# path. CPU-only environments never touch it.
 
 __all__ = [
     "read_surface_bold",

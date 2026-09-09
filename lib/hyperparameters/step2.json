@@ -14,17 +14,8 @@
       ],
       "default": "cpu",
       "source": "arealmshbm/pipeline/config.py (PipelineConfig.backend_step2)",
-      "description": "step2 backend.",
-      "notes": "GPU is 13-16x faster but bound by VRAM (s_lambda buffer ~19.7 GB at S=200/L=300)."
-    },
-    {
-      "key": "step2.enable_tf32",
-      "type": "boolean",
-      "default": false,
-      "source": "arealmshbm/pipeline/config.py (Step2Knobs.enable_tf32)",
-      "conditional": "backend_step2 == 'gpu'",
-      "description": "Opt-in TF32 cuBLAS sgemm math mode for step2.",
-      "notes": "~15% step2 em_total speedup, rel-drift ~1e-4 on cost. Relocated from top-level ``enable_tf32_step2`` into the step2 block in 2026-06. Mode A configs no longer carry this field at all (the entire step2 block is forbidden in Mode A), so the previous Mode-A-writes-true-silently-does-nothing footgun is gone by construction."
+      "description": "step2 backend. 'cpu' is the numba master kernel, the numerical reference. 'gpu' is the P-layout / bit-packed CuPy backend (Step2SparseSession): BOLD stays bit-packed on device, EM state is carried on the P = nnz(boundary_mask) support instead of the dense (N, L) grid, and the outer-EM closure leaves (L16/L17/L18) run on-device too.",
+      "notes": "'gpu' contract: docs/step2_sparse_design.md; ~130x faster than 'cpu' at S=10 (4.1 s vs 538 s) and run-to-run deterministic. It requires a seed mesh with ceil(D/8) <= 256, i.e. seed_mesh 'fsaverage3' in bold_inputs.json, num_clusters <= 512 (init_hard_labels' per-lane accumulator ceiling) and n_grad_components <= 11772 (connect_u's shared memory); larger configurations run on 'cpu'. Its VRAM is bounded by the per-subject gradient and the (S, T, L, D) fp32 s_t_nu / X_dot_sl pair plus the packed BOLD cache (which streams when it does not fit), not by a dense (S, N, L) s_lambda. Params_Final.mat is unchanged on every backend: dense fp64 theta, compressed. The dense CuPy port that held 'gpu' until 2026-09 (fp32 flush-to-zero E-step, nondeterministic) was removed; 'gpu_sparse', the name this backend shipped under beside it, is rejected."
     },
     {
       "key": "step2.max_iter_inter",
@@ -117,9 +108,8 @@
       ],
       "default": "auto",
       "source": "arealmshbm/step2_pipeline/config.py (Step2Config.bold_cache_mode)",
-      "conditional": "backend_step2 == 'gpu'",
-      "description": "How per-subject BOLD reaches the GPU.",
-      "notes": "auto picks eager_bitpacked when it fits, else stream. eager_bitpacked stores (S, N, T, ⌈D/8⌉) uint8 on device (1 bit/cell, ~14.5 GB at S=200/T=6/fsa6). The legacy unpacked-uint8 'eager' mode was removed 2026-06 — bitpacked subsumes it on every axis."
+      "description": "How the per-subject BOLD is held (device cache on the gpu backend, host cache on cpu).",
+      "notes": "auto picks eager_bitpacked when the (S, T, N, ⌈D/8⌉) uint8 packed cache (1 bit/cell, ~72 MB per subject at T=6/fsa6) plus the resident device state fits in free device memory minus gpu_cache_safety_margin_gb, else stream (Step2SparseSession._resolve_cache_mode; 'stream' costs 2 host->device visits per subject per EM iteration). On backend_step2='cpu' the same knob picks the loader's host-side bit-packed cache ('auto' / 'eager_bitpacked') or per-call disk decode ('stream'). The legacy unpacked-uint8 'eager' mode was removed 2026-06."
     },
     {
       "key": "step2.gpu_cache_safety_margin_gb",
@@ -130,7 +120,7 @@
       "default": 4.0,
       "source": "arealmshbm/step2_pipeline/config.py (Step2Config.gpu_cache_safety_margin_gb)",
       "conditional": "backend_step2 == 'gpu' AND bold_cache_mode == 'auto'",
-      "description": "GPU memory safety margin (covers sgemm scratch / softmax / etc.)."
+      "description": "Headroom added to the GPU sizing rule when bold_cache_mode='auto' decides whether the packed BOLD cache fits."
     },
     {
       "key": "step2.verbose",

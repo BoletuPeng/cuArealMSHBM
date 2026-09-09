@@ -20,6 +20,39 @@ consume. One on-disk format: **bitpacked uint8**.
   roughly neutral but LZ4 still picks up the long runs at medial wall
   / sparse-active regions that survive packing.
 
+## Writing: one shot or one session at a time
+
+Two writers, one format. `write_subject_profile_tnd(path, arr_tnd)`
+takes the whole unpacked binary `(T, N, D)` subject and packs it
+(the CPU stage pipeline's writer); `SubjectProfileStreamWriter(path,
+T=, N=, D_unpacked=)` takes already-packed `(N, ⌈D/8⌉)` slabs a
+**session** at a time — `write_session(t, slab)` compresses exactly
+chunk `t`, `close()` finalises (the GPU leaf's writer, and the way
+to write packed bytes verbatim). Because the chunk shape has always been
+one session, the two produce the same payload: same `chunks`, same
+auto-computed `blocks`, same LZ4-5 + bitshuffle `cparams`, same three
+vlmeta keys. Readers cannot tell them apart, and there is no
+`format_version` bump — nothing the tag pins has changed.
+
+`format_version` is stamped **last**, by `close()`, after every session
+chunk has been written (`D_unpacked` / `bit_order` are stamped up
+front). Since `format_version` is exactly what `_open_and_verify` gates
+on, a frame whose `close()` never ran — the process died mid-subject —
+is *rejected* by the readers rather than served with zero-filled
+sessions. `abort()` (which the context manager calls on an exception)
+removes the partial file outright.
+
+Chunk `t` is written by index, not appended, so sessions may be
+finished out of order; `close()` refuses, and removes the file, if any
+session was never written.
+
+The streaming writer exists so step 1's fused GPU path can hide the
+compression: each session's packed slab is D2H'd into its final place
+in the pinned whole-subject block the moment its pack kernel is issued
+and handed (with a CUDA event) to a single writer thread, so the
+compression of session `t` overlaps the compute of `t + 1` and the join
+at the end owes one chunk instead of the whole subject.
+
 ## Reading
 
 | API                                          | Returns                          | Notes |
@@ -45,11 +78,9 @@ The .b2nd format is the **sole** on-disk BOLD source — every consumer
 discovers it via `cohort.json` and reads it directly. No legacy
 nii.gz fallback.
 
-Step2's `SubjectProfileLoader.load_packed_into(s, out_packed)` populates
-the device-resident bitpacked cache directly from disk (zero fp32
-round-trip). `Step2EmIterSessionCUDA` uses it to populate the device
-cache once per pipeline (~0.16 s session_ctor on the S=3 reference
-cohort).
+Step 2's `gpu` backend reads the packed bytes straight into its device
+cache (`step2_io/sparse_inputs.py`, `bold_reader`); the `cpu` backend's
+`SubjectProfileLoader` widens them through the fused numba kernel.
 
 Step3's `fetch_data` always returns `(N, T, ⌈D/8⌉) uint8` plus
 `D_unpacked`; each backend's :class:`VmfClusteringSession` runs its
@@ -88,9 +119,14 @@ and order-independent.
 
 ## End-to-end correctness
 
-Bit-exact `Params_Final.mat` (mu / epsil / sigma / kappa / theta all
-`max-abs-diff = 0.0`) across the GPU and CPU paths — the bit-packed
-representation is information-preserving for binary input.
+The bit-packed representation is information-preserving for binary
+input: the CPU backend's fused widen kernel reproduces an fp32
+unpack-then-normalise bit for bit (proof above), so `Params_Final.mat`
+does not depend on which representation reached the kernel; the step-2
+`gpu` backend consumes the packed bytes directly, and its numerics
+contract against the CPU reference is
+[`step2_sparse_design.md`](step2_sparse_design.md) §7/§9 (not bit-exact
+across backends).
 
 ## Disk size + wall
 
@@ -99,10 +135,10 @@ Reference cohort (S=3 fsa6 T=2 D=1175):
 | metric                                     | bitpacked .b2nd |
 |--------------------------------------------|----------------:|
 | total .b2nd size (3 subjects)              | 48.4 MB         |
-| step2 GPU `session_ctor`                   | ~0.17 s         |
-| step2 GPU `total` (1 inter/1 intra/3 em)   | ~7 s            |
 | step2 CPU `total`                          | ~20 s           |
 
-For S=200 cohorts the session_ctor savings scale linearly. Step 3
+Step 2's `gpu` backend walls (0.32-0.36 s at S=1, 16 s for the 40-subject
+cohort) are in [`step2_flow_and_subgraphs.md`](step2_flow_and_subgraphs.md)
+§ Wall. Step 3
 single-subject (sub-001 / fsa6 / T=6 / L=300) on the `gpu_full` backend
 runs in ~4.13 s total / ~0.12 s fetch_data / ~0.16 s session_init.

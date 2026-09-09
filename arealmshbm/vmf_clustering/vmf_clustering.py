@@ -67,7 +67,7 @@ from .e_step_lambda import ELambdaSession
 
 # Backend selection (constructor parameter — see VmfClusteringSession docstring).
 # Validated values for ``backend=``:
-_VALID_BACKENDS = ("cpu", "gpu_elambda", "gpu_full")
+_VALID_BACKENDS = ("cpu", "gpu_elambda", "gpu_full", "gpu_sparse")
 
 
 def _validate_backend(backend: str) -> str:
@@ -252,6 +252,12 @@ class VmfClusteringSession:
         # Python skips this class's ``__init__`` — the GPU class's own
         # ``__init__`` (already invoked inside the call below) is the only
         # initializer that runs. Same external API, drop-in replacement.
+        if cls is VmfClusteringSession and backend == "gpu_sparse":
+            raise ValueError(
+                "backend='gpu_sparse' is constructed by Step3Pipeline from "
+                "sparse inputs (vmf_clustering_gpu_sparse."
+                "VmfClusteringSessionSparseCUDA), not via VmfClusteringSession"
+            )
         if cls is VmfClusteringSession and backend == "gpu_full":
             from .vmf_clustering_gpu import VmfClusteringSessionCUDA
             # The GPU class doesn't accept ``backend`` itself.
