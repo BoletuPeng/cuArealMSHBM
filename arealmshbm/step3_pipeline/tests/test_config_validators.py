@@ -43,3 +43,24 @@ def test_cMSHBM_min_size_positive_accepted() -> None:
     assert cfg5.cMSHBM_isolated_component_min_size == 5
     cfg8 = Step3Config(**_base_kwargs(cMSHBM_isolated_component_min_size=8))
     assert cfg8.cMSHBM_isolated_component_min_size == 8
+
+
+# ─────────────────────────────────────────────────────────────────────
+# w=0 × backend='gpu_sparse'
+#
+# w=0 is not a "prior off" switch: the dense E-step still evaluates
+# 0*log(theta)=NaN outside supp(theta), while the candidate-set backend
+# only visits supp(theta) and would silently answer differently.
+# ─────────────────────────────────────────────────────────────────────
+def test_w_zero_rejected_with_gpu_sparse() -> None:
+    with pytest.raises(ValueError, match=r"gpu_sparse.*requires\s+w > 0"):
+        Step3Config(**_base_kwargs(w=0.0, backend="gpu_sparse"))
+
+
+def test_w_zero_accepted_on_cpu() -> None:
+    assert Step3Config(**_base_kwargs(w=0.0, backend="cpu")).w == 0.0
+
+
+def test_w_positive_accepted_with_gpu_sparse() -> None:
+    cfg = Step3Config(**_base_kwargs(w=50.0, backend="gpu_sparse"))
+    assert cfg.w == 50.0 and cfg.backend == "gpu_sparse"

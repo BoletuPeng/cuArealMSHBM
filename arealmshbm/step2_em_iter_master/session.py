@@ -29,7 +29,7 @@ Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """
 from __future__ import annotations
 
-from typing import Dict, Iterable, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 
@@ -60,11 +60,8 @@ def _validate_session_ctor_args(
     s_psi: np.ndarray,
     sigma: np.ndarray,
 ) -> None:
-    """Shared up-front validation between :class:`Step2EmIterSession` (CPU)
-    and :class:`Step2EmIterSessionCUDA` (GPU). Both backends accept the same
-    ctor contract — only what they DO with the validated state differs
-    (host scratch vs device cache). Raises on the first mismatch; never
-    mutates inputs.
+    """Up-front validation of the :class:`Step2EmIterSession` ctor
+    contract. Raises on the first mismatch; never mutates inputs.
 
     ``cls_name`` threads the calling class's name into the cMSHBM
     NotImplementedError message — preserved from the per-class ctors so
@@ -150,10 +147,7 @@ def _validate_initial_state_params(Params: Dict[str, np.ndarray],
                                     S: int, T: int, N: int, L: int, D: int,
                                     ) -> None:
     """Validate Params['s_t_nu'/'s_lambda'/'theta'] against the master
-    kernel's shape + dtype contract. Shared between :class:`Step2EmIterSession`
-    (CPU) and :class:`Step2EmIterSessionCUDA` (GPU); both backends impose
-    identical bit-for-bit ingress requirements — only the downstream
-    "where the buffer lands" differs.
+    kernel's shape + dtype contract.
 
     C-contiguity is intentionally NOT validated here: the caller
     (``upload_initial_state``) np.copyto's into a Session-owned scratch
@@ -217,9 +211,9 @@ class Step2EmIterSession:
     Per ``run_iter`` work (called once per outer EM iter):
       * Verify that Params["s_t_nu"/"s_lambda"/"theta"] still ARE the
         Session-owned buffers (alias invariant established by
-        :meth:`upload_initial_state`; both production via
-        ``vmf_clustering_batch`` and the CPU↔GPU parity test in
-        ``test_numerical_match_gpu.py`` honour this contract).
+        :meth:`upload_initial_state`; production via
+        ``vmf_clustering_batch`` and ``test_alias_invariant.py`` pin
+        this contract).
       * Invoke the master kernel — operates on the Session-owned
         buffers directly.
 
@@ -422,9 +416,8 @@ class Step2EmIterSession:
         self._mtc_LD_cached: Optional[np.ndarray] = None
 
     # ─────────────────────────────────────────────────────────────────
-    # Unified API — methods that the pipeline calls on either Session.
-    # The GPU mirror (Step2EmIterSessionCUDA) implements the same names;
-    # both classes are duck-typed by ``Step2Pipeline.run_em``.
+    # Session API — the methods ``Step2Pipeline.run_em`` and
+    # ``vmf_clustering_batch`` call.
     # ─────────────────────────────────────────────────────────────────
     def upload_initial_state(self, Params: Dict[str, np.ndarray]) -> None:
         """Stage initial Params into Session-owned scratch + rebind aliases.
@@ -472,30 +465,6 @@ class Step2EmIterSession:
         from arealmshbm.step2_em_outer import reset_s_t_nu_from_mtc_STLD
         reset_s_t_nu_from_mtc_STLD(self._s_t_nu_A_STLD, self._mtc_LD_cached)
 
-    def sync_to_host(
-        self,
-        Params: Dict[str, np.ndarray],
-        fields: Optional[Iterable[str]] = None,
-    ) -> None:
-        """No-op on CPU: ``Params`` arrays are aliased to Session buffers.
-
-        Present for API parity with :class:`Step2EmIterSessionCUDA`. The
-        GPU mirror does D2H copies here.
-        """
-        # The only host-side update needed here is cost_em (the CPU
-        # vmf_clustering_batch already sets it directly, but allow
-        # callers to request it explicitly for symmetry).
-        if fields is None:
-            return
-        for f in fields:
-            if f == "cost_em":
-                Params["cost_em"] = self._cost_S.copy()
-            # s_t_nu / s_lambda / theta — already aliased; no-op.
-            # kappa — already updated in run_iter; no-op.
-
-    # ─────────────────────────────────────────────────────────────────
-    # Cross-call refresh — reused Session across intra-EM iters.
-    # ─────────────────────────────────────────────────────────────────
     def refresh_s_psi_sigma(self, s_psi: np.ndarray, sigma: np.ndarray) -> None:
         """Re-stage ``s_psi`` ((S, L, D) internal layout) and ``sigma``."""
         if s_psi.shape != (self.S, self.L, self.D):

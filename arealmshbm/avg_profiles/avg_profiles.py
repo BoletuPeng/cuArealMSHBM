@@ -24,10 +24,15 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import numpy as np
+
+from arealmshbm.data_io._background_write import (
+    BackgroundWriteHandle, submit_background_write,
+)
 
 
 @dataclass(frozen=True)
@@ -37,11 +42,28 @@ class AvgProfilesResult:
     Carries both the on-disk artifact paths (cache) and the in-memory
     arrays — so the next subgraph (``generate_ini_params``) can consume
     the fp32 means directly instead of re-reading the .npy files.
+
+    ``lh_avg_dev`` / ``rh_avg_dev`` are the device-resident fp32
+    ``(V_h, D)`` accumulators (cupy arrays) when the memory-side GPU
+    supercall (``avg_profiles_from_packed_gpu``) produced this result
+    — ``generate_ini_params_gpu`` consumes them via
+    ``precomputed_{lh,rh}_avg_dev`` so the fp32 means never round trip
+    through host memory. They are ``None`` on the CPU path AND on the
+    disk-reading ``avg_profiles_gpu`` path, which has no device-side
+    consumer and drops them so the pool can reclaim ~385 MB.
+
+    ``writer`` is the background ``.npy`` write handle (``None`` when
+    ``save=False`` or the write ran synchronously); ``writer.wait()``
+    returns ``(lh_path, rh_path)`` and callers MUST call it before the
+    process exits.
     """
     lh_path: Path
     rh_path: Path
     lh_avg: np.ndarray   # (V_lh, D) fp32 C-contig
     rh_avg: np.ndarray   # (V_rh, D) fp32 C-contig
+    lh_avg_dev: Optional[Any] = None   # (V_lh, D) fp32 cupy, GPU path only
+    rh_avg_dev: Optional[Any] = None   # (V_rh, D) fp32 cupy, GPU path only
+    writer: Optional[BackgroundWriteHandle] = None
 
 from arealmshbm.data_io.load_avg_mesh import load_avg_mesh
 from arealmshbm.data_io.profile_io import (
@@ -155,6 +177,28 @@ def _save_avg_npy_pair(
         f_lh.result()
         f_rh.result()
     return lh_out, rh_out
+
+
+def _start_avg_npy_pair_async(
+    out_dir: Path, targ_mesh: str, seed_mesh: str,
+    lh_acc: np.ndarray, rh_acc: np.ndarray,
+) -> BackgroundWriteHandle:
+    """Kick off the ``.npy`` pair write on two background threads and
+    return immediately with a join handle (``wait()`` -> the pair).
+
+    Byte-for-byte the same files as :func:`_save_avg_npy_pair` — the
+    same ``np.save`` call, just off the caller's thread (``np.save``
+    releases the GIL in ``tofile``, so the caller is not slowed). The
+    caller must not mutate ``lh_acc`` / ``rh_acc`` until ``wait()``
+    returns.
+    """
+    lh_out, rh_out = _avg_paths(out_dir, targ_mesh, seed_mesh)
+    return submit_background_write(
+        (lh_out, rh_out),
+        f"avg_profiles .npy pair ({lh_out.name} / {rh_out.name})",
+        partial(np.save, lh_out, lh_acc, allow_pickle=False),
+        partial(np.save, rh_out, rh_acc, allow_pickle=False),
+    )
 
 
 def avg_profiles(

@@ -21,10 +21,9 @@ The one explicit-exception name divergence is documented in
 ``test_step1_radius_mask_radius_mm_maps_to_run_radius_mask`` (catalog
 uses the longer name; runner uses ``radius_mm``).
 
-The ``enable_tf32`` knobs in Step0Knobs / Step2Knobs are consumed by
-the driver's tf32_scope wrapper (NOT by Step{N}Config), so they are
-excluded from the Knobs↔leaf-Config comparison via
-``_NON_LEAF_CONFIG_FIELDS`` below.
+The ``enable_tf32`` knob in Step0Knobs is consumed by the driver's
+tf32_scope wrapper (NOT by Step0Config), so it is excluded from the
+Knobs↔leaf-Config comparison via ``_NON_LEAF_CONFIG_FIELDS`` below.
 """
 from __future__ import annotations
 

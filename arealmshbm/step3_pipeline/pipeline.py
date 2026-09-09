@@ -33,7 +33,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import numpy as np
 
@@ -50,10 +50,18 @@ from arealmshbm.initialize_params import initialize_params
 from arealmshbm.pipeline_setup import build_pipeline_setup
 from arealmshbm.intra_em import intra_subject_var, intra_em_cost
 from arealmshbm.em_stop_criterion import matlab_ratio_converged
-from arealmshbm.vmf_clustering import VmfClusteringSession
+# NOTE (import placement): ``arealmshbm.vmf_clustering`` imports
+# ``arealmshbm.step3_pipeline.variant`` at module scope, so a module-scope
+# import here closes a cycle that breaks ``import arealmshbm.vmf_clustering``
+# in a fresh interpreter. The name is only needed inside ``build_session``;
+# keep it function-local (annotations are strings via ``from __future__``).
 from arealmshbm.postprocessing import remove_isolated_surface_components
 
 from .config import Step3Config
+
+if TYPE_CHECKING:  # annotations only — see the import-placement note above
+    from arealmshbm.vmf_clustering import VmfClusteringSession
+    from .sparse_inputs import Step3SparseCohort
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -78,6 +86,10 @@ class Step3Inputs:
     ini_val: float
     Params: Dict[str, Any]
     setting_params: Dict[str, Any]
+
+
+def _is_sparse_inputs(obj) -> bool:
+    return type(obj).__name__ == "Step3SparseInputs"
 
 
 @dataclass
@@ -119,7 +131,8 @@ class Step3Pipeline:
 
     def __init__(self, cfg: Step3Config,
                  *,
-                 precomputed_gradient_mat: Optional[np.ndarray] = None):
+                 precomputed_gradient_mat: Optional[np.ndarray] = None,
+                 sparse_cohort: Optional["Step3SparseCohort"] = None):
         """
         Parameters
         ----------
@@ -131,19 +144,33 @@ class Step3Pipeline:
             ``Step0Result.lh_emb_up``/``rh_emb_up`` (concatenated) here
             so step3 reads gradients from memory instead of re-reading
             the .npy step0 just wrote. Validated by fetch_data.
+        sparse_cohort : Step3SparseCohort, optional
+            ``gpu_sparse`` only. The group prior + spatial masks +
+            candidate layout, already loaded for this cohort. The step3
+            stage pipeline loads one for its whole subject list and
+            passes it to every subject, so those cohort constants are
+            read once instead of once per subject; the arrays are
+            shared read-only. Validated against ``cfg`` by
+            ``Step3SparseCohort.check``.
         """
         if not isinstance(cfg, Step3Config):
             raise TypeError(
                 f"Step3Pipeline: cfg must be a Step3Config (got {type(cfg).__name__})"
             )
+        if sparse_cohort is not None and cfg.backend != "gpu_sparse":
+            raise ValueError(
+                "Step3Pipeline: sparse_cohort is only meaningful on "
+                f"backend='gpu_sparse' (got backend={cfg.backend!r})"
+            )
         self.cfg = cfg
         self._precomputed_gradient_mat: Optional[np.ndarray] = (
             precomputed_gradient_mat
         )
+        self._sparse_cohort = sparse_cohort
 
         # Lazy state.
         self._inputs: Optional[Step3Inputs] = None
-        self._session: Optional[VmfClusteringSession] = None
+        self._session: Optional["VmfClusteringSession"] = None
 
         # Per-stage timings, populated as run() proceeds.
         self.timings: Dict[str, Any] = {}
@@ -162,9 +189,12 @@ class Step3Pipeline:
         """
         # Drop large Python references first so the underlying cupy /
         # numpy buffers become unreferenced before we ask the pool to
-        # free.
+        # free. The sparse cohort object is shared with the other
+        # subjects of this run — dropping the reference is all this
+        # Pipeline may do with it.
         self._session = None
         self._inputs = None
+        self._sparse_cohort = None
         # Free cupy memory pools if cupy is loaded. Importing inside
         # the function (not at module top) keeps the CPU-only path
         # cupy-free.
@@ -209,9 +239,16 @@ class Step3Pipeline:
                 "load_inputs() ran or set_inputs() was already called); "
                 "build a new Step3Pipeline instead of reusing one."
             )
-        if not isinstance(inputs, Step3Inputs):
+        if self.cfg.backend == "gpu_sparse":
+            ok = isinstance(inputs, Step3Inputs) or _is_sparse_inputs(inputs)
+            expected = "Step3Inputs / Step3SparseInputs"
+        else:
+            # A Step3SparseInputs must never enter a dense pipeline.
+            ok = isinstance(inputs, Step3Inputs)
+            expected = "Step3Inputs"
+        if not ok:
             raise TypeError(
-                f"set_inputs: expected Step3Inputs, got {type(inputs).__name__}"
+                f"set_inputs: expected {expected}, got {type(inputs).__name__}"
             )
         self._inputs = inputs
         self.timings.setdefault("load_total", 0.0)
@@ -227,6 +264,17 @@ class Step3Pipeline:
             return self._inputs
 
         cfg = self.cfg
+        if cfg.backend == "gpu_sparse":
+            from .sparse_inputs import load_step3_sparse_inputs
+            t0 = time.perf_counter()
+            sp_inputs = load_step3_sparse_inputs(
+                cfg, precomputed_gradient_mat=self._precomputed_gradient_mat,
+                cohort=self._sparse_cohort,
+            )
+            self.timings.update(sp_inputs.timings)
+            self.timings["load_total"] = time.perf_counter() - t0
+            self._inputs = sp_inputs
+            return sp_inputs
         t_load_total = time.perf_counter()
 
         t0 = time.perf_counter()
@@ -363,7 +411,7 @@ class Step3Pipeline:
 
     # ── Stage 2: build EM Session ──
     def build_session(self, inputs: Optional[Step3Inputs] = None
-                      ) -> VmfClusteringSession:
+                      ) -> "VmfClusteringSession":
         """Construct the inner :class:`VmfClusteringSession`.
 
         Idempotent — caches on the Pipeline.
@@ -374,6 +422,17 @@ class Step3Pipeline:
             inputs = self.load_inputs()
 
         cfg = self.cfg
+        if cfg.backend == "gpu_sparse":
+            t0 = time.perf_counter()
+            sess = self._build_sparse_session(inputs)
+            self.timings["session_init"] = time.perf_counter() - t0
+            self._session = sess
+            return sess
+
+        # Function-local, and after the gpu_sparse early return: see the
+        # import-placement note at the top of the module.
+        from arealmshbm.vmf_clustering import VmfClusteringSession
+
         sp = inputs.setting_params
 
         t0 = time.perf_counter()
@@ -426,6 +485,63 @@ class Step3Pipeline:
         self._session = sess
         return sess
 
+    # ── gpu_sparse: Session construction + device-resident outer loop ──
+    def _build_sparse_session(self, inputs):
+        """Construct :class:`VmfClusteringSessionSparseCUDA` from
+        :class:`Step3SparseInputs` (see ``step3_pipeline/sparse_inputs``)."""
+        from arealmshbm.vmf_clustering.vmf_clustering_gpu_sparse import (
+            VmfClusteringSessionSparseCUDA,
+        )
+        cfg = self.cfg
+        sp = inputs.setting_params
+        if cfg.variant.use_check_connectedness:
+            lh_sphere_arg = inputs.lh_sphere
+            rh_sphere_arg = inputs.rh_sphere
+            sphere_xyz_arg = inputs.sphere_xyz_bilateral
+        else:
+            lh_sphere_arg = rh_sphere_arg = sphere_xyz_arg = None
+        mw_rows = np.concatenate([
+            np.asarray(inputs.mw_lh_idx, dtype=np.int64),
+            np.asarray(inputs.mw_rh_idx, dtype=np.int64) + inputs.layout.n_lh,
+        ]).astype(np.int32)
+        return VmfClusteringSessionSparseCUDA(
+            layout=inputs.layout,
+            packed_TND=inputs.packed_TND,
+            D_unpacked=int(inputs.D),
+            mw_rows=mw_rows,
+            mu=inputs.mu, epsil=inputs.epsil, sigma=inputs.sigma,
+            grad_data=inputs.gradient_mat,
+            sphere_xyz=sphere_xyz_arg,
+            lh_sphere_mesh=lh_sphere_arg, rh_sphere_mesh=rh_sphere_arg,
+            dim=int(sp["dim"]), num_clusters=int(sp["num_clusters"]),
+            num_session=int(sp["num_session"]),
+            w=float(sp["w"]), c=float(sp["c"]), beta=sp["beta"],
+            ini_val=float(inputs.ini_val),
+            connect_th=float(sp["connect_th"]), epsilon=float(sp["epsilon"]),
+            max_iter_em=int(cfg.max_iter_em), max_iter_lambda=int(cfg.max_iter_lambda),
+            max_iter_m=int(cfg.max_iter_m), max_iter_comp=int(cfg.max_iter_comp),
+            variant_spec=cfg.variant,
+        )
+
+    def _run_sparse(self, time_stages: bool) -> Step3Result:
+        cfg = self.cfg
+        inputs = self.load_inputs()
+        sess = self.build_session(inputs)
+        t_em_total = time.perf_counter()
+        Params, info = sess.run_intra_em(
+            max_iter_intra_em=int(cfg.max_iter_intra_em), time_stages=time_stages,
+        )
+        self.timings["em_total"] = time.perf_counter() - t_em_total
+        self.timings["per_iter_intra_em"] = info["per_iter_intra_em"]
+        self.timings["per_stage_em"] = info["per_stage_em"]
+        lh_labels, rh_labels = sess.labels_host()
+        return Step3Result(
+            Params=Params, lh_labels=lh_labels, rh_labels=rh_labels,
+            out_path=None, record=info["record"],
+            iter_intra_em=int(info["iter_intra_em"]),
+            timings=dict(self.timings),
+        )
+
     # ── Stage 3: run intra_em outer loop ──
     def run(self, time_stages: bool = True) -> Step3Result:
         """Execute the full pipeline: load + build + intra_em loop.
@@ -442,6 +558,8 @@ class Step3Pipeline:
         Step3Result : Params dict at convergence + derived labels.
         """
         cfg = self.cfg
+        if cfg.backend == "gpu_sparse":
+            return self._run_sparse(time_stages)
         inputs = self.load_inputs()
         sess = self.build_session(inputs)
 
@@ -602,6 +720,12 @@ class Step3Pipeline:
                 rh_labels_override=rh_clean,
             )
         else:
+            # ``result.lh_labels`` / ``rh_labels`` are the argmax of the
+            # same ``s_lambda`` :meth:`run` returned, so passing them
+            # through only skips a second (N, L) argmax on the dense
+            # backends. On gpu_sparse the override is REQUIRED:
+            # ``Params["s_lambda"]`` there aliases a reusable pinned
+            # host buffer that a later call may overwrite.
             out_path = save_parcellation(
                 s_lambda=result.Params["s_lambda"],
                 out_dir=cfg.out_dir,
@@ -610,6 +734,8 @@ class Step3Pipeline:
                 c=cfg.c,
                 beta=beta_for_filename,
                 out_path=out_path,
+                lh_labels_override=result.lh_labels,
+                rh_labels_override=result.rh_labels,
             )
         result.out_path = Path(out_path)
         return Path(out_path)

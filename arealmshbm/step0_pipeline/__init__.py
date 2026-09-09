@@ -28,17 +28,41 @@ Production path (gpu backend; cpu also available)::
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """
 
-from .config import Step0Config
-from .pipeline import (
-    Step0Pipeline,
-    Step0Inputs,
-    Step0Result,
-)
+
+# Lazy public re-exports (PEP 562): ``.pipeline`` pulls the whole step-0
+# leaf set (numba, scipy.sparse, ~0.74 s cold) and ``.config`` imports
+# cupy, so deferring both keeps importing this package cheap for a
+# caller that only wants a submodule. Other submodules resolve via
+# ``__getattr__``'s find_spec.
+
+_LAZY_EXPORTS = {
+    "Step0Config": "config",
+    "Step0Pipeline": "pipeline",
+    "Step0Inputs": "pipeline",
+    "Step0Result": "pipeline",
+}
+
+__all__ = list(_LAZY_EXPORTS)
 
 
-__all__ = [
-    "Step0Config",
-    "Step0Pipeline",
-    "Step0Inputs",
-    "Step0Result",
-]
+def __getattr__(name):
+    """Resolve a lazy step-0 re-export, or a submodule, on first access."""
+    from importlib import import_module
+    sub = _LAZY_EXPORTS.get(name)
+    if sub is not None:
+        value = getattr(import_module(f"{__name__}.{sub}"), name)
+        globals()[name] = value
+        return value
+    if not name.startswith("_"):
+        from importlib.util import find_spec
+        try:
+            found = find_spec(f"{__name__}.{name}") is not None
+        except (ImportError, AttributeError, ValueError):
+            found = False
+        if found:
+            return import_module(f"{__name__}.{name}")
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():
+    return sorted(set(list(globals()) + __all__))

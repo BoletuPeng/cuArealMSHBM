@@ -1,27 +1,24 @@
 """graph_distance_gpu.py
 
-GPU implementation of :func:`gradient_geodesic_distance`. Mirrors the
-CPU API in ``graph_distance.py`` — same signature, same precision
-contract, same output shape — but the all-pairs SSSP is replaced by
-batched pull-based Bellman-Ford on the (N, N) distance matrix.
+GPU implementation of :func:`gradient_geodesic_distance` — same
+signature, precision contract and output shape as the CPU function.
 
-See ``_kernels_gpu.py`` for kernel-level documentation of:
+The solver is the per-source Δ-stepping SSSP in
+:mod:`._kernels_gpu`. It replaced a batched pull-based
+Bellman-Ford in 2026-09: both reach the same fixed point of
+``d[u] = min_v fl(d[v] + w(v, u))`` and were bit-identical, so the
+older one was dropped rather than kept as a knob — hence the two rows
+in the timing table of ``docs/step0_flow_and_subgraphs.md``.
 
-  * The ``D[v, s]`` layout invariant (coalesced warp reads over s).
-  * Pre-fused edge weights with +inf sentinel for absent slots
-    (eliminates the per-iter `if slot == 0` branch in the hot loop).
-  * Bank-conflict-free broadcast access to per-block shared neighbor
-    + weight cache.
-  * Templated M for full unroll of the slot loop.
+Every entry point returns ``D[dest, source]``; a per-source SSSP fills
+``D[source, dest]`` and fp32 addition is not reassociative, so the
+transpose pass is not optional.
 
-Two entry points:
-
-  * :func:`gradient_geodesic_distance_gpu` — numpy in, numpy out;
-    drop-in replacement for the CPU function.
-  * :func:`gradient_geodesic_distance_gpu_device` — device-array in,
-    device-array out; lets the step-0 pipeline keep the (N, N) fp32
-    distance matrix on-device for the subgraph C ``diffusion_map``
-    that immediately consumes it (saves a ~670 MB D2H per hemi).
+The preconditions are hard — there is nothing to fall back to, so each
+one raises ``ValueError``: valence ``M <= EDGE_SLOTS``, ``N <= MAX_N``
+(the kernel's static shared-memory budget), neighbour slots inside the
+1-indexed range ``[0, N]``, a symmetric neighbour table, and
+non-negative non-NaN weights.
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """
@@ -48,91 +45,131 @@ def _shape_check(verts, vertex_nbors, grad_data) -> int:
     return N
 
 
+def _delta_for(grad_data_d, delta_mult: float) -> float:
+    """Validate ``grad_data_d`` and return the Δ-stepping bucket width.
+
+    A negative or NaN weight is rejected here: the kernel orders
+    distances by their uint32 bit pattern and terminates only on strict
+    decreases. Δ never changes the result, only the bucketing, so an
+    approximate mean suffices (1.0 if the field is all zero).
+    """
+    import cupy as cp
+
+    stats = cp.stack([grad_data_d.min(), grad_data_d.mean()]).get()
+    g_min, mean_w = float(stats[0]), float(stats[1])
+    if not (g_min >= 0.0):     # also catches NaN
+        raise ValueError(
+            "graph_distance_gpu: the solver requires non-negative "
+            f"grad_data (edge weights); got min(grad_data) = {g_min!r}. "
+            "Negative weights invert the kernel's uint32 distance "
+            "ordering and remove its termination guarantee."
+        )
+    delta = delta_mult * mean_w
+    return delta if delta > 0.0 else 1.0
+
+
+def _check_topology(vertex_nbors_d, N: int, M: int) -> None:
+    """Enforce the solver's hard topology preconditions: valence, the
+    shared-memory bound on ``N`` (applied by the module build the probe
+    triggers), slot range and symmetry -- the last two from one probe
+    launch over the neighbour table.
+    """
+    from ._kernels_gpu import EDGE_SLOTS, probe_topology_cupy
+
+    if M > EDGE_SLOTS:
+        raise ValueError(
+            f"graph_distance_gpu: valence M={M} exceeds the packed edge "
+            f"table's EDGE_SLOTS={EDGE_SLOTS}."
+        )
+    flags = probe_topology_cupy(vertex_nbors_d, N, M)
+    if flags & 2:
+        raise ValueError(
+            f"graph_distance_gpu: vertex_nbors has a slot outside the "
+            f"valid 1-indexed range [0, {N}] (0 = empty slot); the "
+            "solver would read out of bounds."
+        )
+    if flags & 1:
+        raise ValueError(
+            "graph_distance_gpu: vertex_nbors is not a symmetric relation. "
+            "The kernel pushes v -> nbors[v], so an asymmetric table would "
+            "solve the transposed graph."
+        )
+
+
+def _gpu_device_delta(vertex_nbors_d, grad_data_d, *, cap: int):
+    """Δ-stepping solve over the gradient-weighted topology; returns
+    the normalized ``(N, N)`` fp32 ``D[dest, source]`` matrix."""
+    import cupy as cp
+    from ._kernels_gpu import (
+        DEFAULT_BLOCKS_PER_SM,
+        DEFAULT_DELTA_MULT,
+        DEFAULT_TPB,
+        build_edge_table_cupy,
+        get_delta_module,
+        sm_count,
+    )
+
+    N, M = int(vertex_nbors_d.shape[0]), int(vertex_nbors_d.shape[1])
+    mod = get_delta_module(N, M, tpb=DEFAULT_TPB, cap=cap)
+    k_sssp = mod.get_function("sssp_delta_rows")
+    k_tr = mod.get_function("transpose_scale")
+
+    grid = (DEFAULT_BLOCKS_PER_SM * sm_count(),)
+    block = (DEFAULT_TPB,)
+    n_tiles = (N + 31) // 32
+
+    work = cp.empty((N, N), dtype=cp.float32)
+    gmax_d = cp.empty(1, dtype=cp.uint32)
+
+    try:
+        delta = _delta_for(grad_data_d, DEFAULT_DELTA_MULT)
+        tab = build_edge_table_cupy(vertex_nbors_d, grad_data_d, N, M, mod)
+        gmax_d.fill(0)
+        k_sssp(grid, block,
+               (work, tab, cp.int32(N), cp.int32(N),
+                cp.float32(delta), gmax_d))
+        del tab
+        # gmax_d holds max|dist| as a raw fp32 bit pattern; distances
+        # are non-negative, so the uint ordering matches the float.
+        g_max = float(gmax_d.get().view(np.float32)[0])
+        if not np.isfinite(g_max):
+            raise RuntimeError(
+                "graph_distance_gpu: disconnected mesh — at least one "
+                "source-target pair is unreachable on the gradient-"
+                "weighted graph. The CBIG step-0 caller assumes a "
+                "connected icosphere; check vertex_nbors."
+            )
+        # Normalisation: fp64 reciprocal of the max rounded once to
+        # fp32, then one fp32 multiply.
+        inv = cp.float32(1.0 / g_max) if g_max > 0.0 else cp.float32(1.0)
+        D = cp.empty((N, N), dtype=cp.float32)
+        k_tr((n_tiles, n_tiles), (32, 8), (work, D, cp.int32(N), inv))
+    finally:
+        del work
+    return D
+
+
 def gradient_geodesic_distance_gpu_device(vertex_nbors_d,
-                                            grad_data_d,
-                                            *,
-                                            max_iters: Optional[int] = None,
-                                            ):
+                                          grad_data_d,
+                                          *,
+                                          cap: Optional[int] = None,
+                                          ):
     """Device-resident variant: ``vertex_nbors_d`` and ``grad_data_d``
     are already on the GPU; returns the normalized ``(N, N)`` fp32
     distance matrix as a ``cupy.ndarray`` (also on device).
 
     The unified pipeline driver uses this path so the (N, N) matrix
     flows straight into the GPU diffusion_map's ``exp(-D / D.max())``
-    transform without a host round-trip.
+    transform without a host round-trip. The topology preconditions are
+    checked before the solve. ``cap`` sizes the Δ solver's compacted
+    frontier worklist; overflowing it is result-neutral, so it is a
+    throughput knob only (default ``_kernels_gpu.DEFAULT_CAP``).
     """
-    import cupy as cp
-    from ._kernels_gpu import (
-        _BF_BLOCK_S,
-        MAX_ITERS,
-        get_bf_iter_kernel,
-        init_distance_cupy,
-        precompute_edge_weights_cupy,
-    )
-
     N, M = int(vertex_nbors_d.shape[0]), int(vertex_nbors_d.shape[1])
-    if max_iters is None:
-        max_iters = MAX_ITERS
-
-    # 1. Precompute (g_v + g_u) / 2 — small (N × M × 4 B); +inf
-    #    sentinel for absent slots so the iter kernel needs no
-    #    per-slot branch on validity.
-    edge_weights_d = precompute_edge_weights_cupy(
-        vertex_nbors_d, grad_data_d, N, M
-    )
-
-    # 2. Initialize D[v, s] = (v == s ? 0 : +inf). Single-buffer BF —
-    #    the Gauss-Seidel kernel reads + writes the same array, halving
-    #    iteration count vs Jacobi double-buffer on icosphere graphs.
-    D = init_distance_cupy(N)
-
-    # 3. Bellman-Ford loop (in-place / Gauss-Seidel).
-    bf_kernel = get_bf_iter_kernel(M)
-    changed_flag = cp.zeros(1, dtype=cp.int32)
-    grid_x = (N + _BF_BLOCK_S - 1) // _BF_BLOCK_S
-    grid_y = N
-    grid = (grid_x, grid_y)
-    block = (_BF_BLOCK_S,)
-
-    # ``changed_flag.get()`` per-iter syncs at ~50 µs — cheap. We could
-    # batch it (sync every K iters and pay K-1 wasted iters at most),
-    # but at ~3-5 ms/iter the sync is well under 2 % overhead and
-    # batching makes the convergence-iter-count reporting fuzzier.
-    iters_done = 0
-    for it in range(max_iters):
-        changed_flag.fill(0)
-        bf_kernel(grid, block,
-                  (D, vertex_nbors_d, edge_weights_d,
-                   np.int32(N), changed_flag))
-        if int(changed_flag.get()) == 0:
-            iters_done = it + 1
-            break
-    else:
-        raise RuntimeError(
-            f"graph_distance_gpu: BF did not converge within "
-            f"max_iters={max_iters}. The icosphere graph diameter is "
-            f"empirically ~30-50; non-convergence suggests a "
-            f"disconnected mesh or a topology bug upstream."
-        )
-
-    # 4. Connectivity guard — if any cell is still +inf the mesh was
-    #    disconnected. cupy's max() promotes to fp64 for the result
-    #    scalar; we only need the finite check.
-    g_max = cp.abs(D).max()
-    if not cp.isfinite(g_max):
-        raise RuntimeError(
-            "graph_distance_gpu: disconnected mesh — at least one "
-            "source-target pair is unreachable on the gradient-weighted "
-            "graph. The CBIG step-0 caller assumes a connected "
-            "icosphere; check vertex_nbors."
-        )
-
-    # 5. Normalize in place.
-    if float(g_max) > 0.0:
-        inv = cp.float32(1.0 / float(g_max))
-        D *= inv
-
-    return D
+    _check_topology(vertex_nbors_d, N, M)
+    from ._kernels_gpu import DEFAULT_CAP
+    return _gpu_device_delta(vertex_nbors_d, grad_data_d,
+                             cap=DEFAULT_CAP if cap is None else int(cap))
 
 
 def gradient_geodesic_distance_gpu(verts: np.ndarray,
@@ -153,7 +190,7 @@ def gradient_geodesic_distance_gpu(verts: np.ndarray,
     """
     import cupy as cp
 
-    N = _shape_check(verts, vertex_nbors, grad_data)
+    _shape_check(verts, vertex_nbors, grad_data)
     # ``cp.asarray`` handles the numpy → device copy + dtype cast; the
     # CBIG vertex_nbors / grad_data are already C-contig on the host so
     # the result is contiguous without a separate ascontiguousarray pass.
@@ -162,7 +199,4 @@ def gradient_geodesic_distance_gpu(verts: np.ndarray,
 
     D_d = gradient_geodesic_distance_gpu_device(vn_d, gd_d)
 
-    # D2H copy. At fsa6 (N=12962) this is ~670 MB → ~150 ms on PCIe 5.0
-    # (the dominant cost of the host-return variant). The device-resident
-    # variant above skips this.
     return cp.asnumpy(D_d)

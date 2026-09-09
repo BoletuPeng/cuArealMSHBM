@@ -81,11 +81,6 @@ class SubjectProfileLoader:
         ``(N, T, D)`` fp32 ndarray). Lets the caller hold one scratch
         slot and re-use it across all S subject visits.
 
-    load_packed_into(s, out_packed) -> None
-        Reads packed bytes ``(N, T, ⌈D/8⌉) uint8`` directly from the
-        bitpacked .b2nd. Used by the GPU eager-bitpacked cache build —
-        zero fp32 round-trip.
-
     dims() -> (N, T, D)
         Peeks subject 1 to learn the dims (one chunk decode).
 
@@ -348,31 +343,6 @@ class SubjectProfileLoader:
         packed = self._read_packed_from_b2nd(s, N, T, D)
         # Dict assignment on distinct keys is GIL-atomic in CPython.
         self._packed_cache[s] = packed
-
-    # ── public: load packed bytes for one subject (GPU cache build) ──
-    def load_packed_into(self, s: int, out_packed: np.ndarray) -> None:
-        """Fill ``out_packed`` ((N, T, ⌈D/8⌉) uint8) with subject
-        ``s``'s bit-packed BOLD via direct disk read.
-
-        Used by :class:`Step2EmIterSessionCUDA` to populate the device
-        bitpacked cache in one disk read (no fp32 host round-trip).
-        """
-        if out_packed.dtype != np.uint8:
-            raise ValueError(f"out_packed must be uint8; got {out_packed.dtype}")
-        if not out_packed.flags["C_CONTIGUOUS"]:
-            raise ValueError("out_packed must be C-contiguous")
-        N, T, D = self.dims()
-        D_bytes = (D + 7) // 8
-        if out_packed.shape != (N, T, D_bytes):
-            raise ValueError(
-                f"out_packed shape {out_packed.shape} != ({N}, {T}, {D_bytes})"
-            )
-        pview = open_subject_profile_packed_tnd(self._b2nd_paths[s - 1])
-        try:
-            for t in range(T):
-                out_packed[:, t, :] = np.asarray(pview[t])
-        finally:
-            del pview
 
     # ── b2nd streaming path (bitpacked → fp32 fused) ──
     def _load_into_b2nd(self, s: int, out: np.ndarray,

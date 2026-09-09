@@ -120,9 +120,13 @@ def save_parcellation(s_lambda: np.ndarray,
                changes.
     lh_labels_override / rh_labels_override : if both are provided,
                skip the :func:`derive_labels` call on ``s_lambda`` and
-               write these directly. Used by cMSHBM where the labels
+               write these directly. cMSHBM must use it (its labels
                undergo :func:`remove_isolated_surface_components`
-               post-processing AFTER argmax.
+               post-processing AFTER argmax), and so must the step-3
+               ``gpu_sparse`` backend (its ``s_lambda`` aliases a
+               reusable pinned host buffer). Every other variant /
+               backend also passes it, to skip a redundant second
+               (N, L) argmax over the same ``s_lambda``.
 
     Returns
     -------

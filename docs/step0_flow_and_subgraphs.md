@@ -190,9 +190,77 @@ documented inline under [`## Subgraph B GPU port`](#subgraph-b-gpu-port).
 
 Sub-B used to be the largest GPU-wall single leaf (1.72 s, 30 % of the
 old GPU per-sub wall) because the CPU numba prange Dijkstra ran on
-both backends — no GPU port. Replaced in this fork with a
-[**batched pull-based Bellman-Ford**](../arealmshbm/graph_distance/_kernels_gpu.py)
-on the full (N, N) fp32 distance matrix:
+both backends — no GPU port. The GPU solver is a per-source
+**Δ-stepping SSSP**
+([`_kernels_gpu.py`](../arealmshbm/graph_distance/_kernels_gpu.py)):
+one CTA per source, the distance row kept L2-resident, the frontier a
+pair of shared-memory bitmasks drained through a compacted int32
+worklist, and the transpose + normalisation fused into one 32x32 tiled
+pass. It replaced a batched pull-based Bellman-Ford in 2026-09 — same
+fixed point, bit-identical output, the wall below; that solver is
+history (end of this section), not a knob.
+
+* **Hard preconditions**, each a `ValueError` out of
+  `graph_distance_gpu.py` — there is nothing to fall back to: valence
+  `M <= EDGE_SLOTS` (8, the packed edge table's slot count),
+  `N <= MAX_N` (188352: the two frontier bitmasks must fit the 48 KiB
+  static shared-memory budget — above fsaverage7, so no supported mesh
+  reaches it), and a symmetric neighbour table (the kernel pushes
+  `v -> nbors[v]`, so an asymmetric one would solve the transposed
+  graph). Slots outside the 1-indexed range `[0, N]` and negative / NaN
+  weights are refused up front too: the kernel orders distances by
+  their uint32 bit pattern and terminates only on strict decreases.
+  The worklist was int16 (`N < 32768`) while the Bellman-Ford fallback
+  covered larger meshes; it was widened when that fallback went, so
+  `downsample < 1.26` (N ≥ 32768 on fsaverage6, down to the catalog's
+  1.0) solves on the GPU like on the CPU: 38 registers either way,
+  36.7 → 36.6 ms per hemisphere at N=12962, and bit-identical to the
+  transcribed Bellman-Ford oracle at N=33642 (the `downsample=1.25`
+  icosphere; 0.41 s vs the oracle's 3.57 s).
+* **Bit-stable and deterministic.** `min` / `atomicMin` are order-free,
+  so the fixed point of `d[u] = min_v fl(d[v] + w(v, u))` does not
+  depend on the relaxation schedule — run-to-run identical, and
+  identical to the retired Bellman-Ford. Pinned at the production shape
+  (N=12962, valence 6) by
+  `graph_distance/tests/test_gpu_delta_correctness.py`, which keeps a
+  transcribed copy of that solver as its oracle. Δ only decides how
+  relaxations are bucketed, never their fixed point, so the throughput
+  knobs (`delta_mult`, `blocks_per_sm`, `threads`, `cap`) are all
+  bit-neutral.
+* **Cross-leaf fusion.** Sub-B's GPU output stays device-resident;
+  subgraph-C's ``compute_diffusion_map_gpu_repaired`` consumes the
+  device ``cp.ndarray`` directly, skipping a 670 MB D2H per hemi
+  (and the matching H2D inside diffmap that the host-numpy path
+  would otherwise pay). Worth another ~150 ms/hemi of round-trip that
+  shows up as a subgraph-C reduction (1.02 s → 0.95 s), not as a
+  sub-B leaf cost.
+
+Measured on sub-001 (6 sessions, fsaverage6, RTX 5090), whole subgraph
+B including the icosphere build and the two host-side sphere
+interpolations:
+
+| | subgraph B wall |
+|---|---:|
+| pull-BF (retired 2026-09) | 0.77 s |
+| Δ-stepping | **0.14 s** |
+
+The residual is host-side `make_icosphere` + `linear_interpolate_sphere`,
+not the solver. End-to-end step-0 GPU wall on the same subject:
+3.49 s -> 2.16 s.
+
+The CPU/GPU sub-B output comparison on real upstream-A inputs lands
+at ``max-abs-diff ≈ 1e-2`` — that delta is the well-known step-0
+RNG / Lanczos algorithm-class drift in subgraph A's gradient
+production, propagated through into sub-B's input ``grad_data``,
+not a regression in the GPU solver. On synthetic inputs (same
+grad_data fed to both backends) sub-B's CPU/GPU max-abs-diff is
+**7.7e-7** — bit-equivalent to fp32 ULP. The final ``emb_up``
+top-7 ``|cos|`` between Python CPU and Python GPU stays at **1.0000**
+(well above the historical reference bar of 0.96).
+
+#### History — batched pull-based Bellman-Ford (2026-05 → 2026-09)
+
+The first GPU port of sub-B, on the full (N, N) fp32 distance matrix:
 
 * **Layout invariant.** Store ``D[v, s]`` (destination outer, source
   inner). A warp of 32 threads with shared ``v`` and consecutive ``s``
@@ -210,11 +278,6 @@ on the full (N, N) fp32 distance matrix:
   monotone, so stale reads are upper-bound candidates that never
   produce wrong answers). Drops iteration count from 131 (Jacobi
   double-buffer) to 114 — saves both compute and memory traffic.
-* **Cross-leaf fusion.** Sub-B's GPU output stays device-resident;
-  subgraph-C's ``compute_diffusion_map_gpu_repaired`` consumes the
-  device ``cp.ndarray`` directly, skipping a 670 MB D2H per hemi
-  (and the matching H2D inside diffmap that the host-numpy path
-  would otherwise pay).
 
 Per-leaf measurement at fsa6 (N=12962, M=6), both hemis:
 
@@ -222,24 +285,11 @@ Per-leaf measurement at fsa6 (N=12962, M=6), both hemis:
 |---|---:|---:|---:|
 | sub-B (both hemis) | 1.70 s | **0.78 s** | **2.2×** |
 
-The GPU kernel is bandwidth-bound at ~2.6 ms/iter (theoretical floor
-~2 ms/iter for the (N, N) × 7 fp32 read pattern), so further wins
-require either fp16 storage (precision risk on the ~100-hop diameter)
-or algorithmic change (Δ-stepping, frontier tracking). The
-device-resident hand-off to subgraph C is the bigger win at this
-scale — it shaves another ~150 ms/hemi of round-trip that doesn't
-show up as a sub-B leaf cost but as a subgraph-C reduction (1.02 s
-→ 0.95 s).
-
-The CPU/GPU sub-B output comparison on real upstream-A inputs lands
-at ``max-abs-diff ≈ 1e-2`` — that delta is the well-known step-0
-RNG / Lanczos algorithm-class drift in subgraph A's gradient
-production, propagated through into sub-B's input ``grad_data``,
-not a regression in the BF kernel. On synthetic inputs (same
-grad_data fed to both backends) sub-B's CPU/GPU max-abs-diff is
-**7.7e-7** — bit-equivalent to fp32 ULP. The final ``emb_up``
-top-7 ``|cos|`` between Python CPU and Python GPU stays at **1.0000**
-(well above the historical reference bar of 0.96).
+That kernel was bandwidth-bound at ~2.6 ms/iter (theoretical floor
+~2 ms/iter for the (N, N) × 7 fp32 read pattern), so the next win had
+to be algorithmic — Δ-stepping. Its CUDA is deleted from the tree; a
+transcribed copy survives as the oracle in
+`graph_distance/tests/test_gpu_delta_correctness.py`.
 
 ### fc_similarity fused demean+norm
 
@@ -321,6 +371,36 @@ python -m arealmshbm.pipeline projects/<name>
 
 Per-step wall timing is recorded in the driver's per-run JSON log
 under `<project>/logs/`.
+
+## Not merged (2026-09)
+
+A full step-0 GPU rewrite exists on an internal development branch
+and is **not** in this tree. What was cherry-picked from it is the bit-exact subset: the
+Δ-stepping SSSP above, the reworked `fc_similarity` demean/norm
+kernels (bit-identical buffers and magnitudes at the production
+shape), and the nogil CPU GIFTI reader. The rest was left out.
+
+Measured on that branch: single-subject warm step-0 wall
+**3.22 s → 0.30 s**; on the 10-subject YS cohort step 0 went
+**32.8 s → 9.2 s**. Downstream agreement with the MATLAB GT was
+**gMSHBM 95.09 %** against a 95.13 % baseline, with cMSHBM and dMSHBM
+label sets identical; 1871 step-3 label vertices moved across the 10
+subjects. That is inside the same-code run-to-run band measured on
+2026-09-04 (1 536–2 614 vertices between two runs of identical code),
+so the label delta alone does not distinguish the rewrite from
+jitter — the blockers are structural:
+
+* **Assets are not caches.** The rewrite needs an inputs-cache v2 plus
+  a `step0_down` bundle written at runtime under
+  `arealmshbm/data/precomputed/`. This tree's rule is that everything
+  under that path is a shipped asset the installer stages, never a
+  cache the pipeline fills in (see `arealmshbm/data/README.md`), so the
+  rewrite would have to ship both bundles as assets first.
+* **Subgraph A is not bit-exact.** Its fused stage-A path and the
+  block-Krylov subgraph-C solver both move values at the ULP level
+  (about 90 % of FC cells), so no per-kernel oracle against the
+  current tree exists. Everything merged from the branch is bit-exact
+  against what it replaced.
 
 ## RNG / orientation tolerances
 

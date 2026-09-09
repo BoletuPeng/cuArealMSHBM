@@ -3,11 +3,12 @@
 Supercall for the radius_mask supergraph.
 
 CPU path: numba kernels in :mod:`._kernels` called directly.
-Dispatch on ``backend='gpu'`` defers to :mod:`.radius_mask_gpu` —
-batched pull-based Bellman-Ford on a (V, K) distance matrix per
-problem family (parcels for the radius mask, source verts for the
-central-sulcus mean). cupy is imported lazily — the CPU path never
-touches it.
+Dispatch on ``backend='gpu'`` defers to :mod:`.radius_mask_gpu` — a
+frontier delta-stepping SSSP for the central-sulcus family and a
+batched pull-based Bellman-Ford on a (V, L_h) distance matrix for the
+bounded radius mask. cupy is imported lazily — the CPU path never
+touches it. Both backends produce byte-for-byte the same decoded
+masks.
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """
@@ -19,10 +20,10 @@ from typing import Optional
 
 import numpy as np
 import scipy.io as sio
-import scipy.sparse as sp
 
 from ..data_io.load_avg_mesh import load_avg_mesh
-from ._common import _build_mesh_csr, _coerce_labels, _read_aparc
+from ._common import (_build_mesh_csr, _coerce_labels, _mask_to_csc,
+                      _read_aparc)
 from ._kernels import (
     add_spatial_constraint_kernel,
     central_sulcus_kernel,
@@ -41,7 +42,8 @@ def _run_hemi(hemi: str, mesh_d: dict, labels: np.ndarray,
         print(f"==> {hemi} ...")
 
     t = time.perf_counter()
-    indptr, indices, weights = _build_mesh_csr(mesh_d["vertices"], mesh_d["faces"])
+    indptr, indices, weights = _build_mesh_csr(
+        mesh_d["vertices"], mesh_d["faces"], mesh_d["vertexNbors"])
     timings[f"build_csr_{hemi}_s"] = time.perf_counter() - t
 
     parcel_offs, parcel_inds = build_parcel_csr_kernel(labels, L_h)
@@ -108,7 +110,12 @@ def generate_radius_mask(lh_labels: np.ndarray,
     ----------
     lh_labels, rh_labels : (V,) int — per-hemi parcel labels, 1..L
                            with 0 = medial wall.
-    mesh    : 'fsaverage6' / 'fsaverage5' / 'fsaverage'.
+    mesh    : 'fsaverage6' / 'fsaverage5' / 'fsaverage'. ``backend='gpu'``
+              additionally requires V <= 90080 (the SSSP frontier
+              bitmask is static shared memory — see
+              :func:`_kernels_gpu._sssp_module`), so **fsaverage
+              (V=163842) is CPU-only**; fsaverage6 / fsaverage5 are
+              fine on both.
     radius  : float or string mm (e.g. 30 or '30').
     out_dir : path; output written to
               ``<out_dir>/spatial_mask/spatial_mask_<mesh>.mat``.
@@ -150,8 +157,8 @@ def generate_radius_mask(lh_labels: np.ndarray,
                        timings, verbose)
 
     # MATLAB stores boundary as double sparse; mirror that for read-compat.
-    lh_sparse = sp.csc_matrix(lh_out.astype(np.float64))
-    rh_sparse = sp.csc_matrix(rh_out.astype(np.float64))
+    lh_sparse = _mask_to_csc(lh_out)
+    rh_sparse = _mask_to_csc(rh_out)
 
     out_dir = Path(out_dir)
     out_subdir = out_dir / "spatial_mask"

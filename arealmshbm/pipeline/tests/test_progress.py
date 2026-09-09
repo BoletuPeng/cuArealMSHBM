@@ -653,7 +653,9 @@ def test_step2_run_emits_running_but_not_done(tmp_path: Path) -> None:
     em = ProgressEmitter(tmp_path)
     pipe.progress = em
     pipe.timings = {}
-    pipe.cfg = SimpleNamespace(verbose=False)
+    # ``backend`` is read by run()'s stage dispatch — 'cpu' keeps the
+    # dense triple (the three methods stubbed below).
+    pipe.cfg = SimpleNamespace(verbose=False, backend="cpu")
 
     # Stub the three internal methods so run() succeeds trivially.
     pipe.load_inputs = lambda: object()

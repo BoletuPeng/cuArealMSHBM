@@ -28,7 +28,11 @@ At steady state, while one EM worker crunches subject K's intra_em
 loop, the LOAD thread is reading subject K+M's BOLD + building its
 ``VmfClusteringSession`` (H2D on stream L), other EM workers are
 running subjects K-1, K-2, … on their own streams, and stage SAVE is
-writing subject K-M-1's parcellation .mat.
+writing subject K-M-1's parcellation .mat. On ``gpu_sparse``, stage
+LOAD reads the cohort constants (group prior, spatial masks,
+candidate layout) once before the subject loop and shares that
+``Step3SparseCohort`` read-only with every subject, so each subject's
+LOAD is only its BOLD + gradient.
 
 EM concurrency
 --------------
@@ -242,7 +246,7 @@ class Step3StagePipeline:
         # Pipeline parallelism only helps when EM is on GPU. Caller
         # should gate this, but keep the flag here for clarity inside
         # the stage threads.
-        self.is_gpu = backend in ("gpu_elambda", "gpu_full")
+        self.is_gpu = backend in ("gpu_elambda", "gpu_full", "gpu_sparse")
         # On CPU backend, parallel EM workers would fight for the
         # same numba threadpool — pin to 1.
         self.em_concurrency = em_concurrency if self.is_gpu else 1
@@ -351,6 +355,25 @@ class Step3StagePipeline:
     # ─────────────────────────────────────────────────────────────────
     def _stage_LOAD(self, qLE: queue.Queue, stream) -> None:
         ctx = stream if stream is not None else nullcontext()
+        # gpu_sparse: the group prior, the spatial masks and the
+        # candidate layout are cohort constants (~110 ms of reads per
+        # subject on this stage, which gates that backend). Load them
+        # once here and share them read-only; every subject's
+        # ``Step3SparseCohort.check(cfg)`` still guards a
+        # heterogeneous config list. A failure here is attached to
+        # every subject so each one still reaches qDone and ``run()``
+        # re-raises instead of hanging.
+        cohort = None
+        cohort_failure: Optional[BaseException] = None
+        if self.backend == "gpu_sparse":
+            try:
+                from arealmshbm.step3_pipeline.sparse_inputs import (
+                    load_step3_sparse_cohort,
+                )
+                cohort = load_step3_sparse_cohort(self.configs[0])
+            except BaseException as e:
+                cohort_failure = e
+                traceback.print_exc()
         try:
             for sub_idx, sub_id in enumerate(self.subject_ids):
                 cfg = self.configs[sub_idx]
@@ -362,9 +385,14 @@ class Step3StagePipeline:
                 # any disk I/O so the frontend shows "now working on
                 # X" the instant the worker picks the subject up.
                 self.progress.emit_state("step3", sub_id, "running")
+                if cohort_failure is not None:
+                    work.failure = cohort_failure
+                    qLE.put(work)
+                    continue
                 try:
                     pipe = Step3Pipeline(
                         cfg, precomputed_gradient_mat=grad,
+                        sparse_cohort=cohort,
                     )
                     # Stash the pipe handle on the work item BEFORE
                     # the H2D / setup work below, so that if

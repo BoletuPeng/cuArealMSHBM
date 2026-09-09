@@ -53,13 +53,17 @@ def _read_b2nd_series_packed(b2nd_path: Path,
     The MW-zero pass mirrors MATLAB's CBIG_ArealMSHBM step-3 reader
     (``series(medial_mask, :) = 0;`` right after ``CBIG_MSHBM_read_fmri``,
     before demean+normalize) — it is the algorithm's MW-zero-before-
-    normalize step, not a defensive guard. Bitpacked .b2nd files
-    happen to also be zero at MW on disk because the step1 binarize
-    writer zeros MW on the fp32 source before packing, so this pass
-    is a no-op in practice, but
-    the algorithm convention is stated at the reader for parity with
-    MATLAB and so the downstream's "MW is zero" assumption is
-    explicit, not implicit.
+    normalize step, not a defensive guard, and it is stated here at
+    the reader for MATLAB parity. Files written by the current step-1
+    binarize writer already satisfy it — ``_apply_mw_zero`` /
+    ``binarize_mwzero_pack_cupy`` zero MW on the source before packing
+    (clamp landed 2026-05-18) — so on those the pass is a no-op.
+    Stores packed before that clamp are **not** MW-zero and the pass
+    is load-bearing there: an internal sub-001 dev store written
+    2026-05-17 has 1 098 864 of 6 153 714 MW bytes non-zero,
+    measured 2026-09-07. The
+    ``gpu_sparse`` backend does not come through here and zeros MW on
+    device instead.
 
     Returns ``(packed_NTD_bytes, D_unpacked)``. Raises ``ValueError``
     on shape mismatch.

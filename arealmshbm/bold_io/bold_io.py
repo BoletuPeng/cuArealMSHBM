@@ -123,8 +123,7 @@ def concat_hemis_drop_medial(
         ``np.nan_to_num(copy=False)`` writes through that view. The
         prefetcher / step-0 worker passes fresh per-session buffers
         so this is safe today; callers reusing buffers across calls
-        must clone first. (Same gotcha in
-        :func:`bold_io.bold_io_gpu.concat_hemis_drop_medial_gpu`.)
+        must clone first.
     medial_mask : (2 * N_hemi,) array-like, truthy=medial
         1 means medial wall (drop), 0 means cortex (keep). Accepts uint8,
         bool, int — anything truthy. Reshape-safe: ``(2*N_hemi, 1)`` is

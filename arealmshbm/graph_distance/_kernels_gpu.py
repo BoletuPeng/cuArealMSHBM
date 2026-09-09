@@ -1,64 +1,25 @@
 """_kernels_gpu.py
 
-GPU kernels for ``gradient_geodesic_distance``. Replaces the CPU
-numba ``_all_pairs_dijkstra`` (N source-parallel binary-heap SSSPs)
-with a **batched pull-based Bellman-Ford** on the full (N, N) distance
-matrix.
+Per-source Δ-stepping SSSP for ``gradient_geodesic_distance`` — one CTA
+per source, distance rows in L2-resident global memory, the frontier as
+a pair of shared-memory bitmasks drained through a compacted int32
+worklist. The GPU solver since 2026-09, when it replaced a bit-identical
+batched pull-based Bellman-Ford. Run-to-run deterministic: ``min`` and
+``atomicMin`` are order-free, so the fixed point of
+``d[u] = min_v fl(d[v] + w(v, u))`` does not depend on the relaxation
+schedule.
 
-Why BF instead of Dijkstra on GPU
-----------------------------------
-Dijkstra's heap is inherently serial per source. To make it
-GPU-friendly you'd need either (a) one block per source with a
-shared-mem heap (poor occupancy at N=12962 sources, complex), or
-(b) Δ-stepping (lots of bucket bookkeeping, marginal win on dense
-small graphs). Pull-based BF on a (V, V) layout matches the GPU
-strength directly: per (v, s) cell we do an M-bounded relax + min,
-no heap, no priority queue, fully data-parallel. The cost is
-``diameter+1`` iterations vs Dijkstra's N pops, but the constant
-factors flip — each BF iter is one coalesced kernel launch.
+Preconditions are hard limits, all rejected with ``ValueError`` by
+:mod:`.graph_distance_gpu`: non-negative non-NaN weights (distances
+compare as uint32 bit patterns, and the round loop terminates only on
+strict decreases), a symmetric neighbour table (this kernel pushes
+``v -> nbors[v]``), ``M <= EDGE_SLOTS`` and ``N <= MAX_N`` (the static
+shared-memory budget). Rows come out source-major, so ``transpose_scale`` is mandatory: the published
+matrix is ``D[dest, source]`` and fp32 addition is not reassociative.
 
-Layout invariant
-----------------
-``dist`` is stored as ``D[v, s]`` (destination outer, source inner)
-in row-major fp32. A warp of 32 threads with consecutive ``s`` and
-shared ``v`` therefore reads ``D[u, s..s+31]`` for any neighbor row
-``u`` as **one** 128 B coalesced transaction.
-
-The CBIG / numpy API hands us ``vertex_nbors[N, M] int32`` 1-indexed
-(0 = absent slot) and ``grad_data[N] fp32``. We pre-fuse those into
-``edge_weights[N, M] fp32`` once via ``precompute_edge_weights_kernel``
-so the iter kernel does one global read per (slot, v) instead of two
-(g_v + g_u). Pre-fusion buffer is small (N × M × 4 = ~311 KB at
-fsa6) and stays L2-resident across all BF iters.
-
-Bank-conflict-free shared mem
------------------------------
-Per block we cache the (M = 6) ``vertex_nbors`` and ``edge_weights``
-rows for the block's one destination ``v`` into 48 B of shared mem.
-The hot loop reads ``s_nbors[slot]`` / ``s_weights[slot]`` where all
-256 threads in the block see the same ``slot`` simultaneously —
-that's the **broadcast pattern**, which CUDA serves from one bank in
-a single cycle (no conflict). If we instead indexed by ``threadIdx.x``
-we'd hit a 6-way conflict (32 threads × 6 banks); broadcast is the
-right shape.
-
-Convergence detection
----------------------
-Single ``int32`` device flag, ``atomicOr``'d to 1 whenever a thread
-strictly improves its cell. Host syncs once per iter (D2H of 4 B —
-negligible). We cap at ``MAX_ITERS`` as a safety net (icosphere graph
-diameter is ~30-50 hops empirically; the cap is set well above this).
-
-Precision contract
-------------------
-Bit-identical to the CPU Dijkstra output on connected meshes: SSSP
-final distances are uniquely determined by the input graph (the
-shortest-path value is independent of relaxation order modulo
-fp32 ties). Both algorithms compute
-``d[v*] = d[u*] + (g_u* + g_v) * 0.5f`` for the optimal predecessor
-``u*``; the bit sequence of that final FMA is the same. The
-normalization step is a single-precision reduce + scale and matches
-the CPU's _row_max / _scale_inplace within reduction-order ULP.
+Every access to a distance row must keep the ``.cg`` cache operator:
+``atomicMin`` executes at L2 without updating L1, so a plain load could
+serve a stale row value.
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """
@@ -67,243 +28,411 @@ from __future__ import annotations
 import cupy as cp
 
 
-# Block dim along ``s`` axis. 256 = 8 warps; matches the radius_mask
-# BF kernel cadence and is well within RTX-class SM register budgets
-# (this kernel's register footprint is tiny — ~10 regs/thread).
-_BF_BLOCK_S = 256
+# Slots reserved per vertex in the packed edge table. 8 × 8 B = 64 B is
+# one L2 line, so a vertex's whole adjacency is 2 sectors / 3 LDG.128.
+EDGE_SLOTS = 8
 
-# Safety cap on BF iterations. icosphere(12962) graph diameter is
-# empirically ~30-50; we cap at 300 to leave headroom for future
-# higher-resolution meshes without silently truncating convergence.
-# In practice the loop exits via ``changed_flag == 0`` well before
-# this; the cap only protects against a topologically-disconnected
-# input that the connectivity guard didn't catch upstream.
-MAX_ITERS = 300
+# Throughput-only knobs; none of them can move a bit of the result.
+# BLOCKS_PER_SM is a deliberate under-fill of the occupancy the shared
+# memory would allow: it is the largest grid whose live set of distance
+# rows still fits in L2.
+DEFAULT_TPB = 64
+DEFAULT_CAP = 512
+DEFAULT_BLOCKS_PER_SM = 16
+DEFAULT_DELTA_MULT = 3.0
 
-
-# ─────────────────────────────────────────────────────────────────────
-# Kernel 1 — precompute edge weights ``(g_v + g_u) / 2``.
-#
-# Run once before the BF loop. One thread per (v, slot); writes
-# weights[v, slot] = (grad_data[v] + grad_data[vertex_nbors[v, slot]-1]) * 0.5f
-# Absent slots (vertex_nbors==0) get sentinel +inf so the iter kernel's
-# `cand < best` comparison naturally never fires on them — saves a
-# per-slot branch in the hot loop.
-# ─────────────────────────────────────────────────────────────────────
-_precompute_edge_weights_kernel = cp.RawKernel(r"""
-extern "C" __global__
-void precompute_edge_weights(
-        const int*   __restrict__ vertex_nbors,  // (N, M) int32, 1-indexed; 0=absent
-        const float* __restrict__ grad_data,     // (N,) fp32
-        float*       __restrict__ edge_weights,  // (N, M) fp32 out
-        int N, int M) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    const int total = N * M;
-    if (idx >= total) return;
-    const int v = idx / M;
-    const int slot = idx - v * M;
-    const int u1 = vertex_nbors[idx];
-    if (u1 == 0) {
-        // +inf sentinel: cand = D[u, s] + INF > D[v, s] always, so the
-        // min-reduction in the iter kernel ignores this slot without a
-        // separate `== 0` branch in the hot path.
-        edge_weights[idx] = __int_as_float(0x7f800000);
-        return;
-    }
-    const int u = u1 - 1;  // 1-idx → 0-idx
-    edge_weights[idx] = (grad_data[v] + grad_data[u]) * 0.5f;
-}
-""", "precompute_edge_weights")
+# Static shared memory per CTA (kernel 2): two NW-word frontier
+# bitmasks, the int32 worklist and 16 B of bookkeeping. The 48 KiB
+# static limit therefore bounds N; MAX_N is that bound at DEFAULT_CAP
+# (188352, above fsaverage7's 163842, so no supported mesh reaches it)
+# and :func:`get_delta_module` refuses the actual (N, cap) pair. The
+# worklist was int16 -- N < 32768 -- while a Bellman-Ford fallback
+# existed for larger meshes; widened when that fallback was removed
+# (2026-09): bit-neutral, same register count, same wall.
+_SMEM_STATIC_LIMIT = 48 * 1024
 
 
-# ─────────────────────────────────────────────────────────────────────
-# Kernel 2 — initialize the (N, N) distance matrix.
-#
-# D[v, s] = 0 if v == s, else +inf. Fused init keeps the orchestration
-# Python-side as just ``init_distance_matrix(D, N)``.
-# ─────────────────────────────────────────────────────────────────────
-_init_distance_kernel = cp.RawKernel(r"""
-extern "C" __global__
-void init_distance_matrix(float* __restrict__ D, int N) {
-    // Linear thread index over the (N*N) matrix; each thread writes
-    // exactly one cell. At N=12962 that's ~168M threads — well within
-    // grid-launch limits when chunked at 256 threads/block.
-    const long long total = (long long)N * (long long)N;
-    const long long idx = (long long)blockIdx.x * (long long)blockDim.x
-                         + (long long)threadIdx.x;
-    if (idx >= total) return;
-    const int v = (int)(idx / (long long)N);
-    const int s = (int)(idx - (long long)v * (long long)N);
-    D[idx] = (v == s) ? 0.0f : __int_as_float(0x7f800000);  // +inf
-}
-""", "init_distance_matrix")
+def _static_smem_bytes(nw: int, cap: int) -> int:
+    return 8 * nw + 4 * cap + 16
 
 
-# ─────────────────────────────────────────────────────────────────────
-# Kernel 3 — one pull-based Bellman-Ford iteration.
-#
-# Block grid:
-#   * blockIdx.y = destination vertex v ∈ [0, N)
-#   * blockIdx.x = source-tile id ∈ [0, ceil(N / _BF_BLOCK_S))
-#   * threadIdx.x ∈ [0, _BF_BLOCK_S)   — source offset within tile
-#
-# Each block:
-#   1. Cooperatively loads ``vertex_nbors[v, :M]`` + ``edge_weights[v, :M]``
-#      into shared mem (M tiny, just 1 thread per slot).
-#   2. Reads ``self = D_in[v, s]`` for its (v, s).
-#   3. Loops over slots — broadcasts neighbor index + weight from smem,
-#      reads ``D_in[u, s]`` (coalesced across the warp), and takes
-#      ``min(self, D_in[u, s] + w)``.
-#   4. Writes ``D_out[v, s] = best``; ``atomicOr``s the changed flag if
-#      strictly improved.
-#
-# Bank conflicts: shared reads are pure broadcast (all threads same
-# slot) → 0 conflicts. Global reads are perfectly coalesced for the
-# warp (same v, consecutive s).
-#
-# Note: M is templated as a compile-time constant via the
-# ``#define BF_M`` macro substitution in the Python builder below.
-# This lets ``#pragma unroll`` actually unroll the slot loop at JIT
-# time — at fixed M=6 for icosphere meshes the unrolled body is a
-# clean register-only sequence.
-# ─────────────────────────────────────────────────────────────────────
-_BF_ITER_KERNEL_SRC = r"""
-#define BF_M %d
-#define BF_BLOCK_S %d
+MAX_N = 32 * ((_SMEM_STATIC_LIMIT - 4 * DEFAULT_CAP - 16) // 8)
 
-extern "C" __global__
-void bf_iter(
-        float*       __restrict__ D,              // (N, N) fp32, row-major D[v, s]; IN-PLACE
-        const int*   __restrict__ vertex_nbors,   // (N, M) int32, 1-idx
-        const float* __restrict__ edge_weights,   // (N, M) fp32 — precomputed (g_v+g_u)/2
+_SRC = r"""
+#define NW   %(NW)d
+#define CAP  %(CAP)d
+#define TPB  %(TPB)d
+#define MSLOT %(MSLOT)d
+#define SLOTS %(SLOTS)d
+#define NPAIR %(NPAIR)d
+#define NREAD %(NREAD)d
+#define INF_BITS 0x7f800000u
+
+// ─────────────────────────────────────────────────────────────────────
+// Kernel 0 — neighbour-table topology probe.
+//
+// The relax step PUSHES along `v -> nbors[v]`, so an asymmetric table
+// describes the transposed graph and is a hard error (see the module
+// docstring); a slot outside [0, N] would be an out-of-bounds row read
+// in every kernel below. One thread per vertex, MSLOT x MSLOT
+// compares, reported as a flag word: bit 1 (= 2) for a slot outside
+// [0, N], bit 0 (= 1) for a listed edge (v, u) with no matching
+// (u, v). The range test guards this kernel's own back-edge read, so
+// it runs first. At N = 12962 / M = 6 that is 466k int loads, paid
+// once per call on the neighbour table only -- not once per gradient
+// field.
+// ─────────────────────────────────────────────────────────────────────
+extern "C" __global__ void probe_topology(
+        const int* __restrict__ vertex_nbors,   // (N, MSLOT) int32, 1-indexed
         int N,
-        int*         __restrict__ changed_flag) {
-    // ─────────────────────────────────────────────────────────────────
-    // Gauss-Seidel pull-based Bellman-Ford. Reads + writes the SAME
-    // buffer ``D`` each iter. Race conditions are benign for SSSP:
-    //   * Reads of D[u, s] may see a value either before or after some
-    //     other block's update — both are valid (upper-)bounds on the
-    //     true shortest path because relaxation is monotone.
-    //   * Min-reduction is monotone, so any stale read just delays
-    //     convergence by at most one iter — never wrong.
-    //   * The flag set is `atomicOr` so multiple improvers don't
-    //     conflict.
-    //
-    // Vs Jacobi double-buffered BF (the natural starting design):
-    //   - Jacobi propagates exactly 1 hop / iter.
-    //   - Gauss-Seidel propagates AT LEAST 1 hop / iter, often more,
-    //     because blocks processing later ``v`` can observe earlier
-    //     blocks' improvements within the same kernel launch.
-    //   - On icosphere(12962) this halves iteration count empirically
-    //     (~131 → ~50-70). Memory traffic per iter is identical so
-    //     wall scales with iter count.
-    //
-    // Bank conflicts: shared reads remain pure broadcast (all threads
-    // same slot) → 0 conflicts. The in-place layout doesn't change
-    // shared-mem access at all.
-    //
-    // Output bit-equivalence: SSSP final distances are uniquely
-    // determined by the input graph (modulo fp32 ties at the optimal
-    // predecessor). Final ``d[v] = d[u*] + (g_u* + g_v) * 0.5f`` is
-    // identical to the CPU Dijkstra path; only intermediate (pre-
-    // optimal) values differ. CPU-vs-GPU max-abs-diff stays <= 1e-6
-    // on measured icosphere inputs.
-    // ─────────────────────────────────────────────────────────────────
-    __shared__ int   s_nbors[BF_M];
-    __shared__ float s_weights[BF_M];
-
-    const int v = blockIdx.y;
-    const int s = blockIdx.x * BF_BLOCK_S + threadIdx.x;
-
-    if (threadIdx.x < BF_M) {
-        const int slot = threadIdx.x;
-        s_nbors[slot]   = vertex_nbors[v * BF_M + slot];
-        s_weights[slot] = edge_weights[v * BF_M + slot];
-    }
-    __syncthreads();
-
-    if (s >= N) return;
-
-    const size_t self_idx = (size_t)v * (size_t)N + (size_t)s;
-    const float prev = D[self_idx];
-    float best = prev;
-
+        int*       __restrict__ bad)            // (1,) int32 flag word, pre-zeroed
+{
+    const int v = blockIdx.x * blockDim.x + threadIdx.x;
+    if (v >= N) return;
     #pragma unroll
-    for (int slot = 0; slot < BF_M; slot++) {
-        const int u1 = s_nbors[slot];
+    for (int m = 0; m < MSLOT; m++) {
+        const int u1 = vertex_nbors[v * MSLOT + m];
         if (u1 == 0) continue;
+        if (u1 < 0 || u1 > N) { atomicOr(bad, 2); return; }
         const int u = u1 - 1;
-        const float w = s_weights[slot];
-        // Reading D[u, s] in-place — may see this iter's update from
-        // an earlier block (Gauss-Seidel effect) or last iter's value
-        // (Jacobi-like effect, when the block schedule happened to put
-        // u's block later). Either way the read is a valid upper-bound
-        // candidate; never produces a wrong final answer.
-        const float cand = D[(size_t)u * (size_t)N + (size_t)s] + w;
-        if (cand < best) best = cand;
+        int back = 0;
+        #pragma unroll
+        for (int q = 0; q < MSLOT; q++)
+            if (vertex_nbors[u * MSLOT + q] == v + 1) back = 1;
+        if (!back) { atomicOr(bad, 1); return; }
     }
+}
 
-    // Only write when strict improvement — avoids redundant store
-    // (~half the writes after the wavefront has passed). The read of
-    // ``prev`` and the write here form an acquire-release pair via
-    // the global-memory-order — strict-less-than guarantees the new
-    // value is still a valid upper bound under any thread interleaving.
-    if (best < prev) {
-        D[self_idx] = best;
-        atomicOr(changed_flag, 1);
+
+// ─────────────────────────────────────────────────────────────────────
+// Kernel 1 — fuse vertex_nbors + grad_data into the packed edge table.
+//
+// tab[v * SLOTS + m] = { u, bitcast<int>((g[v] + g[u]) * 0.5f) } for the
+// m-th neighbour of v, and { -1, 0 } for absent / padding slots. One
+// thread per vertex: SLOTS is a compile-time 8 so the store is a clean
+// 64 B block and the loop unrolls away.
+// ─────────────────────────────────────────────────────────────────────
+extern "C" __global__ void build_edge_table(
+        const int*   __restrict__ vertex_nbors,   // (N, MSLOT) int32, 1-indexed
+        const float* __restrict__ grad_data,      // (N,) fp32
+        int2*        __restrict__ tab,            // (N, SLOTS) {u, w-bits}
+        int N)
+{
+    const int v = blockIdx.x * blockDim.x + threadIdx.x;
+    if (v >= N) return;
+    const float gv = grad_data[v];
+    int2* out = tab + (size_t)v * SLOTS;
+    #pragma unroll
+    for (int m = 0; m < SLOTS; m++) {
+        int2 e;
+        e.x = -1;
+        e.y = 0;
+        if (m < MSLOT) {
+            const int u1 = vertex_nbors[v * MSLOT + m];
+            if (u1 != 0) {
+                const int u = u1 - 1;
+                e.x = u;
+                e.y = __float_as_int((gv + grad_data[u]) * 0.5f);
+            }
+        }
+        out[m] = e;
     }
+}
+
+
+// ─────────────────────────────────────────────────────────────────────
+// Kernel 2 — per-source Δ-stepping SSSP.
+//
+// grid : any number of CTAs; each grid-strides over sources [0, NS).
+//        Sized as blocks_per_sm × SM count so the live set of distance
+//        rows stays inside L2 instead of thrashing it.
+// block: TPB threads (64). Shared state per CTA:
+//        mnear[NW], mfar[NW]  frontier bitmasks   (2 × 1624 B)
+//        list[CAP]            compacted worklist  (2048 B)
+//        cnt[2], minfar, smax bookkeeping
+//        => 5312 B/CTA at the shipped NW/CAP (1624 + 1624 + 2048 + 16),
+//        confirmed by the compiled kernel (38 registers, 5312 B), i.e.
+//        19 CTAs/SM by shared memory (100 KB/SM) and 24 by threads.
+//        The launch uses 16/SM on purpose — see DEFAULT_BLOCKS_PER_SM.
+//
+// gmax accumulates the global max |dist| as a raw fp32 bit pattern via
+// atomicMax on uint32. Distances are non-negative so the IEEE-754 bit
+// pattern orders exactly like the float, and +inf (0x7f800000) is the
+// largest value — which doubles as the disconnected-mesh detector.
+// ─────────────────────────────────────────────────────────────────────
+extern "C" __global__ void sssp_delta_rows(
+        float*        __restrict__ Drows,   // (NS, N) fp32 source-major work buffer
+        const int2*   __restrict__ tab,     // (N, SLOTS) packed edges
+        int N, int NS, float delta,
+        unsigned int* __restrict__ gmax)    // (1,) uint32, pre-zeroed
+{
+    __shared__ unsigned int mnear[NW];
+    __shared__ unsigned int mfar[NW];
+    __shared__ int          list[CAP];
+    __shared__ int          cnt[2];
+    __shared__ unsigned int minfar;
+    __shared__ unsigned int smax;
+
+    const int tid   = threadIdx.x;
+    const int nhalf = N >> 1;
+
+    for (int sid = blockIdx.x; sid < NS; sid += gridDim.x) {
+        float* dist = Drows + (size_t)sid * (size_t)N;
+
+        // ---- init: row = +inf, masks empty, source seeded in `mnear` ----
+        // float2 stores halve the instruction count, but only when the
+        // row base is 8 B aligned. Row s starts at byte 4*s*N, so that
+        // holds for every s iff N is even (the fsaverage6 icosphere has
+        // N = 12962). Odd N takes the scalar path.
+        if ((N & 1) == 0) {
+            float2* d2 = (float2*)dist;
+            const float2 inf2 = make_float2(__int_as_float(INF_BITS),
+                                            __int_as_float(INF_BITS));
+            for (int i = tid; i < nhalf; i += TPB) __stcg(d2 + i, inf2);
+        } else {
+            for (int i = tid; i < N; i += TPB)
+                __stcg(dist + i, __int_as_float(INF_BITS));
+        }
+        for (int w = tid; w < NW; w += TPB) { mnear[w] = 0u; mfar[w] = 0u; }
+        __syncthreads();
+        if (tid == 0) {
+            __stcg(dist + sid, 0.0f);
+            mnear[sid >> 5] = 1u << (sid & 31);
+            cnt[0] = 0; cnt[1] = 0; smax = 0u;
+        }
+        __syncthreads();
+
+        unsigned int thrb = __float_as_uint(delta);   // bucket bound, as bits
+        int it = 0;
+        while (true) {
+            // cnt is double buffered on the round parity so the reset of
+            // the *next* round's counter can be issued before the barrier
+            // that publishes this round's count — 2 barriers per round
+            // instead of 3.
+            const int cur = it & 1;
+
+            // ---- drain `mnear` into the compacted worklist ----
+            // Purely shared-memory work: no global traffic at all.
+            for (int w = tid; w < NW; w += TPB) {
+                unsigned int word = mnear[w];
+                if (word == 0u) continue;
+                int p = atomicAdd(&cnt[cur], __popc(word));
+                unsigned int kept = 0u;
+                int k = 0;
+                while (word) {
+                    const int b = __ffs(word) - 1;
+                    word &= (word - 1u);
+                    // Overflow is not an error: the bit stays set and the
+                    // vertex is picked up on a later round.
+                    if (p + k < CAP) list[p + k] = (w << 5) + b;
+                    else             kept |= (1u << b);
+                    k++;
+                }
+                mnear[w] = kept;
+            }
+            if (tid == 0) cnt[cur ^ 1] = 0;
+            __syncthreads();
+            const int ncnt = cnt[cur];
+            const int n = ncnt < CAP ? ncnt : CAP;
+
+            if (n == 0) {
+                // ---- bucket advance ----
+                // pass A: min-reduce the tentative distances still in `mfar`.
+                if (tid == 0) minfar = INF_BITS;
+                __syncthreads();
+                unsigned int lmin = INF_BITS;
+                for (int w = tid; w < NW; w += TPB) {
+                    unsigned int word = mfar[w];
+                    while (word) {
+                        const int b = __ffs(word) - 1;
+                        word &= (word - 1u);
+                        const unsigned int dv =
+                            __float_as_uint(__ldcg(dist + ((w << 5) + b)));
+                        if (dv < lmin) lmin = dv;
+                    }
+                }
+                if (lmin != INF_BITS) atomicMin(&minfar, lmin);
+                __syncthreads();
+                const unsigned int mf = minfar;   // warp-uniform after the barrier
+                if (mf == INF_BITS) break;        // both piles empty → converged
+                thrb = __float_as_uint(__uint_as_float(mf) + delta);
+                // pass B: promote everything at or below the new bound. The
+                // `<=` (not `<`) guarantees the minimum itself moves, so the
+                // loop always makes progress even for delta == 0.
+                for (int w = tid; w < NW; w += TPB) {
+                    unsigned int word = mfar[w];
+                    if (word == 0u) continue;
+                    unsigned int kept = 0u, mv = 0u;
+                    while (word) {
+                        const int b = __ffs(word) - 1;
+                        word &= (word - 1u);
+                        const unsigned int dv =
+                            __float_as_uint(__ldcg(dist + ((w << 5) + b)));
+                        if (dv <= thrb) mv   |= (1u << b);
+                        else            kept |= (1u << b);
+                    }
+                    mfar[w] = kept;
+                    if (mv) atomicOr(&mnear[w], mv);
+                }
+                it++;
+                __syncthreads();
+                continue;
+            }
+
+            // ---- relax ----
+            for (int i = tid; i < n; i += TPB) {
+                const int v = list[i];
+                const float dv = __ldcg(dist + v);
+                // NPAIR × 16 B covers all MSLOT neighbours (two {u,w} pairs
+                // per int4); the whole 64 B vertex block is 2 L2 sectors.
+                const int4* p = (const int4*)(tab + (size_t)v * SLOTS);
+                int4 blk[NPAIR];
+                #pragma unroll
+                for (int q = 0; q < NPAIR; q++) blk[q] = __ldg(p + q);
+                #pragma unroll
+                for (int m = 0; m < NREAD; m++) {
+                    const int4 e = blk[m >> 1];
+                    const int   u  = (m & 1) ? e.z : e.x;
+                    const float ew = __int_as_float((m & 1) ? e.w : e.y);
+                    if (u < 0) continue;
+                    const unsigned int ndb = __float_as_uint(dv + ew);
+                    // Filter read first: ~83 percent of candidate relaxations
+                    // and a plain compare is far cheaper than a failed atomic.
+                    // A stale value here can only be an over-estimate, so the
+                    // worst case is a redundant atomicMin.
+                    if (ndb >= __float_as_uint(__ldcg(dist + u))) continue;
+                    const unsigned int old = atomicMin((unsigned int*)(dist + u), ndb);
+                    if (ndb < old) {
+                        const unsigned int bit = 1u << (u & 31);
+                        if (ndb < thrb) atomicOr(&mnear[u >> 5], bit);
+                        else            atomicOr(&mfar[u >> 5], bit);
+                    }
+                }
+            }
+            it++;
+            __syncthreads();
+        }
+
+        // ---- row max, folded into the global max ----
+        // The row was just written so it is still L2-hot; doing it here
+        // avoids a separate 672 MB cupy reduction pass over the matrix.
+        unsigned int lm = 0u;
+        for (int i = tid; i < N; i += TPB) {
+            const unsigned int d = __float_as_uint(__ldcg(dist + i));
+            if (d > lm) lm = d;
+        }
+        atomicMax(&smax, lm);
+        __syncthreads();
+        if (tid == 0) atomicMax(gmax, smax);
+        __syncthreads();
+        if (tid == 0) smax = 0u;
+    }
+}
+
+
+// ─────────────────────────────────────────────────────────────────────
+// Kernel 3 — 32×32 tiled transpose with the normalisation multiply
+// fused into the store (saves a full 1.34 GB read+write pass).
+//
+// The 33-wide shared tile skews the column stride by one bank so the
+// transposed read ``tile[threadIdx.x][threadIdx.y + j]`` is conflict
+// free; both the load and the store are 128 B coalesced.
+// ─────────────────────────────────────────────────────────────────────
+extern "C" __global__ void transpose_scale(
+        const float* __restrict__ in,    // (N, N) source-major
+        float*       __restrict__ out,   // (N, N) destination-major
+        int N, float inv)
+{
+    __shared__ float tile[32][33];
+    int x = blockIdx.x * 32 + threadIdx.x;
+    int y = blockIdx.y * 32 + threadIdx.y;
+    #pragma unroll
+    for (int j = 0; j < 32; j += 8)
+        if (x < N && (y + j) < N)
+            tile[threadIdx.y + j][threadIdx.x] = in[(size_t)(y + j) * N + x];
+    __syncthreads();
+    x = blockIdx.y * 32 + threadIdx.x;
+    y = blockIdx.x * 32 + threadIdx.y;
+    #pragma unroll
+    for (int j = 0; j < 32; j += 8)
+        if (x < N && (y + j) < N)
+            out[(size_t)(y + j) * N + x] = tile[threadIdx.x][threadIdx.y + j] * inv;
 }
 """
 
 
-def _build_bf_iter_kernel(M: int) -> cp.RawKernel:
-    """Compile the BF iter kernel with M templated as a compile-time
-    constant. Re-compiling per M is cheap (CuPy caches by source) and
-    enables full unroll of the slot loop."""
-    src = _BF_ITER_KERNEL_SRC % (M, _BF_BLOCK_S)
-    return cp.RawKernel(src, "bf_iter")
+_MODULE_CACHE: dict = {}
 
 
-# Module-level cache so a batch driver running multiple subjects on
-# the same M doesn't pay the JIT compile twice.
-_BF_KERNEL_CACHE: dict = {}
+def get_delta_module(N: int, M: int, tpb: int = DEFAULT_TPB,
+                     cap: int = DEFAULT_CAP):
+    """Compile (and cache) the Δ-stepping module for this graph shape.
+
+    The shape parameters are baked in as macros, so the frontier
+    bitmasks are statically sized shared arrays and the slot loops
+    unroll; one module per ``(NW, M, tpb, cap)``.
+    """
+    if not (1 <= M <= EDGE_SLOTS):
+        raise ValueError(
+            f"delta-stepping kernel supports valence 1..{EDGE_SLOTS}; got M={M}")
+    nw = (N + 31) // 32
+    smem = _static_smem_bytes(nw, cap)
+    if smem > _SMEM_STATIC_LIMIT:
+        raise ValueError(
+            f"delta-stepping kernel: N={N} (cap={cap}) needs {smem} B of "
+            f"static shared memory per CTA, over the {_SMEM_STATIC_LIMIT} B "
+            f"limit -- N <= {MAX_N} at the default cap.")
+    npair = (M + 1) // 2
+    key = (nw, M, tpb, cap)
+    mod = _MODULE_CACHE.get(key)
+    if mod is None:
+        subs = dict(NW=nw, CAP=cap, TPB=tpb, MSLOT=M, SLOTS=EDGE_SLOTS,
+                    NPAIR=npair, NREAD=2 * npair)
+        # Token substitution rather than %-formatting: the CUDA source
+        # carries literal '%' characters in comments.
+        src = _SRC
+        for name, val in subs.items():
+            src = src.replace("%%(%s)d" % name, str(val))
+        mod = cp.RawModule(code=src)
+        # Force the JIT now so a compile error surfaces at build time.
+        mod.get_function("sssp_delta_rows")
+        _MODULE_CACHE[key] = mod
+    return mod
 
 
-def get_bf_iter_kernel(M: int) -> cp.RawKernel:
-    """Return the BF iter RawKernel for graphs of valence ``M``,
-    compiling + caching on first lookup."""
-    k = _BF_KERNEL_CACHE.get(M)
-    if k is None:
-        k = _build_bf_iter_kernel(M)
-        _BF_KERNEL_CACHE[M] = k
-    return k
+def build_edge_table_cupy(vertex_nbors_d: cp.ndarray,
+                          grad_data_d: cp.ndarray,
+                          N: int, M: int,
+                          mod=None) -> cp.ndarray:
+    """Return the packed ``(N, EDGE_SLOTS, 2)`` int32 edge table."""
+    if mod is None:
+        mod = get_delta_module(N, M)
+    tab = cp.empty((N, EDGE_SLOTS, 2), dtype=cp.int32)
+    k = mod.get_function("build_edge_table")
+    block = 128
+    k(((N + block - 1) // block,), (block,),
+      (vertex_nbors_d, grad_data_d, tab, cp.int32(N)))
+    return tab
 
 
-# ─────────────────────────────────────────────────────────────────────
-# Public helper — drives precompute_edge_weights from Python.
-# Layout (N, M) row-major; vertex_nbors is the input view from
-# `compute_topology`.
-# ─────────────────────────────────────────────────────────────────────
-def precompute_edge_weights_cupy(vertex_nbors_d: cp.ndarray,
-                                  grad_data_d: cp.ndarray,
-                                  N: int, M: int) -> cp.ndarray:
-    """Run kernel 1 and return ``edge_weights[N, M]`` fp32 on device."""
-    edge_weights = cp.empty((N, M), dtype=cp.float32)
-    total = N * M
-    grid = ((total + _BF_BLOCK_S - 1) // _BF_BLOCK_S,)
-    _precompute_edge_weights_kernel(
-        grid, (_BF_BLOCK_S,),
-        (vertex_nbors_d, grad_data_d, edge_weights, N, M),
-    )
-    return edge_weights
+def probe_topology_cupy(vertex_nbors_d: cp.ndarray,
+                        N: int, M: int,
+                        mod=None) -> int:
+    """Flag word over the 1-indexed neighbour table: bit 1 (2) set iff
+    some slot lies outside ``[0, N]``, bit 0 (1) iff the listed relation
+    is not symmetric; ``0`` for a table the solver accepts. Building the
+    module first also applies the shared-memory bound on ``N``.
+    """
+    if mod is None:
+        mod = get_delta_module(N, M)
+    bad = cp.zeros(1, dtype=cp.int32)
+    k = mod.get_function("probe_topology")
+    block = 128
+    k(((N + block - 1) // block,), (block,),
+      (vertex_nbors_d, cp.int32(N), bad))
+    return int(bad.get()[0])
 
 
-def init_distance_cupy(N: int) -> cp.ndarray:
-    """Run kernel 2 and return D[N, N] fp32 initialized to inf except 0
-    on the diagonal."""
-    D = cp.empty((N, N), dtype=cp.float32)
-    total = N * N
-    block = _BF_BLOCK_S
-    grid = ((total + block - 1) // block,)
-    _init_distance_kernel(grid, (block,), (D, N))
-    return D
+def sm_count() -> int:
+    """Multiprocessor count of the current device (grid sizing input)."""
+    return int(cp.cuda.Device().attributes["MultiProcessorCount"])

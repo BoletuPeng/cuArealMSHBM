@@ -1,33 +1,39 @@
 """generate_profiles
 
-Step-1 leaf — per-session functional-connectivity profile (binary,
-top-fraction thresholded) on the fsaverage* path.
+Step-1 leaf — functional-connectivity profile (binary, top-fraction
+thresholded) on the fsaverage* path.
 
 For each (sub, sess): for every BOLD run, build a (K, V) seed-to-target
 correlation matrix (fp32 GEMM after a fused per-column zscore+L2-norm),
-NaN→0, average across runs, threshold the joint lh+rh sum at the top
-``threshold`` fraction (selection, not full sort), binarize, and
-return the per-hemi arrays (layout is backend-dependent — see
-below). The step-1 pipeline stacks
-the per-session arrays into a per-subject ``(T, N, D)`` block and
-writes one ``.b2nd`` per subject via
-:func:`arealmshbm.data_io.profile_io.write_subject_profile_tnd`.
+average across runs, threshold the joint lh+rh sum at the top
+``threshold`` fraction (selection, not full sort), binarize and zero
+the medial wall. The step-1 pipeline stacks the per-session results
+into a per-subject ``(T, N, D)`` block and writes one ``.b2nd`` per
+subject via :mod:`arealmshbm.data_io.profile_io`.
 
-Backends (dispatched by the ``backend=`` kwarg on the supercall):
-    cpu — numba ``@njit(parallel=True)`` kernels + numpy/MKL BLAS.
-    gpu — CuPy RawKernel zscore + cuBLAS sgemm + ufunc threshold /
-          binarize. cupy is imported lazily — the cpu path never
-          touches it.
+The two paths are shaped differently, not backend-switched: the CPU
+one is per-session and returns arrays, the GPU one owns the whole
+subject and writes the file itself.
 
 Public API:
-    compute_profile_arrays(seed_mesh, targ_mesh, out_dir, sub, sess, …,
-                            backend='cpu' | 'gpu')
-        — pure compute, returns ``(lh_arr, rh_arr, K_unpacked)``.
-          cpu: ``(K, V_h) fp32`` binary arrays + ``K_unpacked=None``;
-          the writer does the host transpose + packbits.
-          gpu: ``(V_h, ⌈K/8⌉) uint8`` pre-packed bytes + integer
-          ``K_unpacked`` — binarize + MW-zero + transpose + packbits
-          fused into one device RawKernel.
+    compute_profile_arrays(seed_mesh, targ_mesh, out_dir, sub, sess, …)
+        — CPU only. numba ``@njit(parallel=True)`` kernels + numpy/MKL
+          BLAS. Pure compute, one (sub, sess) at a time, returning
+          ``(lh_KxV_fp32, rh_KxV_fp32)``; the writer still owes the
+          transpose + packbits.
+
+    generate_subject_profiles_gpu(project_dir, sub_id, sess_ids, ...)
+    compute_subject_profiles_gpu(sessions, ...)
+    prewarm_generate_profiles_gpu(bold_paths=None)
+        — the GPU path, WHOLE-SUBJECT, in :mod:`.profiles_subject_gpu`.
+          Ingest of session g+1 overlaps the compute of session g, all
+          sessions share one device packed buffer, and the subject
+          leaves the GPU in a single pinned D2H; the .b2nd write runs
+          on a background thread. Ingest is nvCOMP-batched when
+          ``nvidia-nvcomp-cu12`` is installed and the CPU GIFTI reader
+          otherwise — same bytes either way, so the compute and the
+          artifacts are identical. Import it directly: the package
+          ``__init__`` must stay cupy-free for the CPU path.
 
 Reads:
     <out_dir>/data_list/fMRI_list/{lh,rh}_sub<sub>_sess<sess>.txt
