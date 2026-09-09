@@ -16,7 +16,7 @@ changes). Verify downloads against the release's `SHA256SUMS.txt`.
 | asset | size | needed by |
 |---|---:|---|
 | `avg_mesh-fsaverage6.tar.gz` | 4.3 MB | **everyone** |
-| `step0_inputs-fsaverage6_sigma2.55_khop3.tar.gz` | 82.6 MB | anyone without a CBIG checkout |
+| `step0_inputs-fsaverage6_sigma2.55_khop3.tar.gz` | 82.6 MB | **everyone** (see the note under Layout) |
 
 ```bash
 curl -L -O https://github.com/BoletuPeng/cuArealMSHBM/releases/download/assets-v1/avg_mesh-fsaverage6.tar.gz
@@ -46,11 +46,15 @@ arealmshbm/data/
   via `$MSHBM_PRECOMPUTED_ROOT`). There is **no** runtime rebuild from
   FreeSurfer sources — these bundles are the only source of mesh
   geometry.
-- `precomputed/step0_inputs/` is a cache. `Step0Pipeline.load_inputs`
-  rebuilds it on a miss and writes it back, but the rebuild
-  (`python -m arealmshbm.precompute.step0_inputs_builder`) needs a CBIG
-  checkout for the midthickness atlas and the raw FreeSurfer sphere
-  surfaces. Download it instead if you do not have one.
+- `precomputed/step0_inputs/` is nominally a cache: `Step0Pipeline.load_inputs`
+  rebuilds it on a miss and writes it back. In practice, download it — the
+  rebuild (`python -m arealmshbm.precompute.step0_inputs_builder`) reads the
+  raw FreeSurfer sphere surfaces and `cortex.label` from
+  `<CBIG>/data/templates/surface/<mesh>/`, and current CBIG revisions keep
+  the fsaverage meshes at `fake_freesurfer/subjects/<mesh>/` instead, so the
+  builder raises `FileNotFoundError` against a real checkout. (It builds in
+  ~9 s once the sources are where it looks.) The midthickness atlas path it
+  uses is correct.
 - **Group priors** are model *inputs*, not required by the package: Mode A
   reads the prior only from `<project>/priors/<variant>/beta<B>/Params_Final.mat`
   and staging it there is the project creator's job; Mode B trains one
