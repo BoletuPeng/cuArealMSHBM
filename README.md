@@ -219,6 +219,46 @@ a single subject**, with most of a 24 GB card left over. How far the
 cohort can grow before the (S, N, ·) terms dominate has not been
 measured.
 
+## Agreement with the reference implementation
+
+Measured against **stock CBIG as published**, on 30 subjects across three
+cohorts — K = 300, β = 5, w = 50, c = 10, fsaverage6 target /
+fsaverage3 seed, with the same group-prior file loaded on both sides.
+Backends: `backend_step0` / `backend_step1` = `gpu`, and `backend_step3` =
+`gpu_sparse` for the variants that have a candidate-set path, `gpu_full`
+for cMSHBM, which does not.
+
+Per-vertex label agreement over cortical vertices, medial wall excluded —
+it is label 0 on both sides and would otherwise count as free agreement.
+All-vertex figures in parentheses.
+
+| cohort | subjects × sessions | gMSHBM | cMSHBM | dMSHBM |
+|---|---|---|---|---|
+| in-house | 10 × 6 | 95.12 % (95.52 %) | 99.42 % (99.46 %) | **99.99 %** (99.98 %) |
+| OpenNeuro `ds004466` | 10 × 4 | 93.20 % (93.63 %) | 98.26 % (98.35 %) ᵃ | **99.84 %** (99.69 %) |
+| OpenNeuro `ds000221` | 10 × 4 | 93.07 % (93.12 %) | 98.08 % (98.20 %) ᵇ | **99.67 %** (99.12 %) |
+
+ᵃ n = 9 · ᵇ n = 8 — the reference implementation itself
+fails on three cMSHBM subjects (`sub2ind` index-out-of-range inside
+`CBIG_ArealMSHBM_component_distance`, reproducible on retry), so no reference
+labels exist for those cells. cuArealMSHBM completes all three. Every other
+cell is over the full 10 subjects.
+
+**Why gMSHBM sits lower than cMSHBM and dMSHBM.** cMSHBM and dMSHBM never
+read step 0's gradient output; gMSHBM does. Step 0 is where the port makes a
+few deliberately different implementation choices from the reference —
+most visibly in how the watershed driver chunks its sample columns, and in
+the transform applied to the gradient distance matrix before the diffusion
+embedding. A controlled experiment that reverts both to the reference
+behaviour recovers 0.7–1.4 percentage points of gMSHBM's gap, so those
+choices account for part of it, not all. If closer agreement with the
+original turns out to matter for downstream use, we will revisit them.
+
+The 98.33 % / 98.05 % row in the Mode A table above answers a different
+question: it is measured against a MATLAB reference whose step 0 carries the
+same two changes the port does. Same port, different reference — the two
+sets of numbers are not in conflict.
+
 ## On the original paper's claims
 
 A large-scale stability analysis and an independent third-party
@@ -483,6 +523,24 @@ step 2 的 GPU 一列取自 `gpu` 后端 —— 在 v2.0.0 中这个名字指的
 ² 由参考实现源码（`CBIG_ArealMSHBM_gMSHBM_estimate_group_priors_{parent,child}.m`）推算，而非实测 —— 因为它在工作站上*无法*实测。参考实现的 step 2被架构为 **1 个 parent + S 个 child 集群作业**（其源码头注释原文：*"user should submit 1 parent job and num_sub child jobs"*），在**每个 M-step 内层迭代**都通过文件系统交换 `.mat` 文件。child 会阻塞在迭代中途等待 parent 的回复，因此被试无法串行处理：40 个 child 必须**同时**常驻。在本基准形状下（N = 81,924 顶点、D = 1,175 profile 维、T = 6 session、L = 300 分区、全 fp64），每个 child 持有 profile 主存储`data_series`（N × D × T，4.6 GB），外加代码以*不同内存布局*物化的多份全尺寸拷贝 —— 每 session 的 N × D 切片副本、`mtimesx` 产出的N × L × T κ 更新乘积、转置的 L × N × T log-vMF 堆栈、(N, L, T) 空间先验堆栈 —— 工作集达**每被试约 9–12 GB**；parent 另持有 (N, L, S) 后验（S = 40 时 7.9 GB）及同尺寸临时量。合计：41 个进程约 370–490 GB 的同时常驻内存，外加每迭代经共享存储的 `.mat` 流量 —— 计算集群是硬性前提，而非可选优化。
 
 cuArealMSHBM 将这一切收拢到单个设备上：每份二值化 profile 在显存中**只存在一次**，以位打包的 `uint8 (N, T, ⌈D/8⌉)` 张量存放（每被试72 MB，整个队列 1.45 GB —— 对比未打包的约 11.6 GB，以及参考实现*尚未计入额外拷贝*的每被试约 4.6 GB fp64），并在所有内核间按引用共享。后验以 fp32 而非 fp64 存储（40 被试共 3.93 GB；仅在 softmax 需要处使用 fp64 暂存），算子融合则使参考实现在内存与磁盘间往返的 N × L × T中间量根本不被物化。`gpu` 后端上实测的设备峰值占用为 **6.7 GiB** —— **整个 40 被试队列所需的显存比参考实现单个被试所需的内存还少**，且 24 GB 显卡还剩下大半。队列还能扩到多大才会被 (S, N, ·) 项主导，尚未实测。
+
+## 与参考实现的一致性
+
+以**未经修改的 CBIG 原版**为基准，在三个队列共 30 名被试上实测 —— K = 300、β = 5、w = 50、c = 10，目标网格 fsaverage6 / 种子网格 fsaverage3，两侧载入同一份组先验文件。后端：`backend_step0` / `backend_step1` = `gpu`；`backend_step3` 在有候选集路径的变体上取 `gpu_sparse`，cMSHBM 没有该路径，取 `gpu_full`。
+
+逐顶点标签一致率，仅计皮层顶点、剔除内侧壁 —— 内侧壁两侧同为标签 0，计入会白送一致率。括号内为全顶点口径。
+
+| 队列 | 被试 × session | gMSHBM | cMSHBM | dMSHBM |
+|---|---|---|---|---|
+| 自有队列 | 10 × 6 | 95.12 %（95.52 %） | 99.42 %（99.46 %） | **99.99 %**（99.98 %） |
+| OpenNeuro `ds004466` | 10 × 4 | 93.20 %（93.63 %） | 98.26 %（98.35 %）ᵃ | **99.84 %**（99.69 %） |
+| OpenNeuro `ds000221` | 10 × 4 | 93.07 %（93.12 %） | 98.08 %（98.20 %）ᵇ | **99.67 %**（99.12 %） |
+
+ᵃ n = 9 · ᵇ n = 8 —— 参考实现自身在三名被试的 cMSHBM 上失败（`CBIG_ArealMSHBM_component_distance` 内 `sub2ind` 下标越界，重试可复现），这几格没有参考标签可比。cuArealMSHBM 这三名被试均正常完成。其余各格均为完整 10 名被试。
+
+**为什么 gMSHBM 低于 cMSHBM 与 dMSHBM。** cMSHBM 与 dMSHBM 完全不读取 step 0 的梯度输出，gMSHBM 读取。step 0 正是本移植与参考实现有意采取不同实现的地方 —— 最明显的两处是 watershed 驱动对采样列的分块方式，以及在扩散嵌入之前施加于梯度距离矩阵的变换。一项将两处都还原为参考行为的对照实验可以收回 gMSHBM 差距中的 0.7–1.4 个百分点，因此它们解释的是其中一部分，而非全部。若后续发现与原版更高度的一致性对下游使用确有必要，我们会重新考虑这些选择。
+
+上文 Mode A 表中的 98.33 % / 98.05 % 回答的是另一个问题：它是针对一份 step 0 已带有与本移植相同的那两处改动的 MATLAB 参考测得的。同一个移植，不同的参考基准 —— 两组数字并不矛盾。
 
 ## 关于原论文的声明
 
