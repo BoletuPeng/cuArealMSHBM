@@ -302,9 +302,13 @@ comes from — it is never rebuilt at runtime.
 input cache: the pipeline does contain a builder for it
 (`arealmshbm.precompute.step0_inputs_builder`), but that reads raw
 FreeSurfer sphere surfaces from a CBIG checkout at a layout current CBIG
-revisions do not use, so treat the download as the supported path. Any
-location works if you point `MSHBM_PRECOMPUTED_ROOT` at the directory
-holding `avg_mesh/` and `step0_inputs/`.
+revisions do not use, so treat the download as the supported path.
+
+Extract both into `arealmshbm/data/precomputed/`. `$MSHBM_PRECOMPUTED_ROOT`
+relocates the `avg_mesh/` bundles only — the step-0 cache is always read
+from inside the package — so do not use it to move the pair elsewhere: the
+run would fail inside step 0 with an unrelated-looking message about a
+missing CBIG checkout.
 
 **2. Atlas directory** — set `MSHBM_ATLAS_DIR` to a directory whose
 `<targ_mesh>/label/` holds the aparc and Schaefer2018 Kong2022 `.annot`
@@ -571,7 +575,7 @@ curl -L -O https://github.com/BoletuPeng/cuArealMSHBM/releases/download/assets-v
 tar -xzf avg_mesh-fsaverage6.tar.gz -C arealmshbm/data/precomputed/
 ```
 
-两个都是**必需的**。`avg_mesh`（4.3 MB）是所有网格几何的唯一来源，运行时不会重建。`step0_inputs-fsaverage6_sigma2.55_khop3.tar.gz`（82.6 MB）是 step 0 的输入缓存：仓库里确实带了它的构建器（`arealmshbm.precompute.step0_inputs_builder`），但它需要从 CBIG checkout 读原始 FreeSurfer 球面，而其期待的目录布局与当前 CBIG 版本不一致，因此请以下载为准。放在其它位置也可以，把 `MSHBM_PRECOMPUTED_ROOT` 指向同时含 `avg_mesh/` 与 `step0_inputs/` 的那个目录即可。
+两个都是**必需的**。`avg_mesh`（4.3 MB）是所有网格几何的唯一来源，运行时不会重建。`step0_inputs-fsaverage6_sigma2.55_khop3.tar.gz`（82.6 MB）是 step 0 的输入缓存：仓库里确实带了它的构建器（`arealmshbm.precompute.step0_inputs_builder`），但它需要从 CBIG checkout 读原始 FreeSurfer 球面，而其期待的目录布局与当前 CBIG 版本不一致，因此请以下载为准。两个都请解压到 `arealmshbm/data/precomputed/`。`$MSHBM_PRECOMPUTED_ROOT` 只能重定向 `avg_mesh/` bundle —— step 0 的缓存始终从包内读取 —— 所以不要用它把两者一起搬走：那样会在 step 0 里以一条看上去不相干的、抱怨 CBIG checkout 缺失的错误失败。
 
 **2、Atlas 目录** —— 把 `MSHBM_ATLAS_DIR` 指向一个目录，其 `<targ_mesh>/label/` 下存放 aparc 与 Schaefer2018 Kong2022 的 `.annot` 文件（从 CBIG checkout 里准备）。step 1 会实时读取它们，没有降级路径。
 
