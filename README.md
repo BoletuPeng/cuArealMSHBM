@@ -243,6 +243,36 @@ Templates: [`projects/sample_modeA_single/`](projects/sample_modeA_single/),
 [`projects/sample_modeA_batch/`](projects/sample_modeA_batch/),
 [`projects/sample_modeB/`](projects/sample_modeB/).
 
+### Before the first run
+
+Two things live outside the repository and must be staged once.
+
+**1. Precomputed assets** — published as release assets under the
+[`assets-v1`](https://github.com/BoletuPeng/cuArealMSHBM/releases/tag/assets-v1) tag (versioned independently of the
+code releases). Extract into `arealmshbm/data/precomputed/`:
+
+```bash
+curl -L -O https://github.com/BoletuPeng/cuArealMSHBM/releases/download/assets-v1/avg_mesh-fsaverage6.tar.gz
+tar -xzf avg_mesh-fsaverage6.tar.gz -C arealmshbm/data/precomputed/
+```
+
+`avg_mesh` (4.3 MB) is **required** — mesh geometry is read from these
+bundles and never rebuilt at runtime.
+`step0_inputs-fsaverage6_sigma2.55_khop3.tar.gz` (82.6 MB) is a step-0
+cache; skip it if you have a CBIG checkout (set `$CBIG_CODE_DIR` and the
+first run builds it in ~3 s, then reuses it). Any location works if you
+point `MSHBM_PRECOMPUTED_ROOT` at the directory holding `avg_mesh/`.
+
+**2. Atlas directory** — set `MSHBM_ATLAS_DIR` to a directory whose
+`<targ_mesh>/label/` holds the aparc and Schaefer2018 Kong2022 `.annot`
+files (staged from a CBIG checkout). Step 1 reads them live; there is no
+fallback.
+
+Group priors and spatial masks are **not** shipped here — they are
+byte-identical to CBIG's and are taken from a CBIG checkout when needed.
+Full layout and provenance:
+[`arealmshbm/data/README.md`](arealmshbm/data/README.md).
+
 Run the full pipeline:
 
 ```bash
@@ -468,6 +498,24 @@ projects/<name>/
 模板：[`projects/sample_modeA_single/`](projects/sample_modeA_single/)、
 [`projects/sample_modeA_batch/`](projects/sample_modeA_batch/)、
 [`projects/sample_modeB/`](projects/sample_modeB/)。
+
+### 首次运行前
+
+有两样东西不在仓库里，需要先就位一次。
+
+**1、预计算资产** —— 以 release asset 形式发布在 [`assets-v1`](https://github.com/BoletuPeng/cuArealMSHBM/releases/tag/assets-v1) tag 下（与代码版本独立编号）。解压到 `arealmshbm/data/precomputed/`：
+
+```bash
+curl -L -O https://github.com/BoletuPeng/cuArealMSHBM/releases/download/assets-v1/avg_mesh-fsaverage6.tar.gz
+tar -xzf avg_mesh-fsaverage6.tar.gz -C arealmshbm/data/precomputed/
+```
+
+`avg_mesh`（4.3 MB）是**必需的** —— 网格几何全部从这些 bundle 读取，运行时不会重建。`step0_inputs-fsaverage6_sigma2.55_khop3.tar.gz`（82.6 MB）是 step 0 的缓存；如果你手边有 CBIG checkout 可以不下（设好 `$CBIG_CODE_DIR`，首次运行会用约 3 秒自己建好并落盘复用）。放在其它位置也可以，把 `MSHBM_PRECOMPUTED_ROOT` 指向含 `avg_mesh/` 的那个目录即可。
+
+**2、Atlas 目录** —— 把 `MSHBM_ATLAS_DIR` 指向一个目录，其 `<targ_mesh>/label/` 下存放 aparc 与 Schaefer2018 Kong2022 的 `.annot` 文件（从 CBIG checkout 里准备）。step 1 会实时读取它们，没有降级路径。
+
+组先验与空间掩码**不**在此发布 —— 它们与 CBIG 的文件逐字节相同，需要时从 CBIG checkout 取用。完整布局与出处见
+[`arealmshbm/data/README.md`](arealmshbm/data/README.md)。
 
 运行完整流水线：
 
