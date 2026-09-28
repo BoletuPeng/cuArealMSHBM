@@ -179,15 +179,18 @@ kind are functionally meaningful is described in
 
 | | MATLAB (CBIG, MEX) | cuArealMSHBM CPU | cuArealMSHBM GPU |
 |---|---|---|---|
-| step 2 — group-prior EM (production `max_iter_inter=10`; 48 EM iterations on both backends) | not feasible on a workstation² | 2,638.7 s | **15.8 s (167×)** |
+| step 2 — group-prior EM (production `max_iter_inter=10`; 48 EM iterations on both backends) | not feasible on a workstation² | 2,945.6 s | **15.8 s (186×)** |
 | full pipeline steps 0–3, whole cohort (production run) | not feasible on a workstation² | — | **70.5–75.9 s (≈1.2 min)** |
 | device memory, step 2, whole 40-subject cohort | **≈ 370–490 GB RAM** (estimated²) | — | **peak 5.6 GiB of 24 GB VRAM** |
-| host memory, step 2 alone (standalone `arealmshbm.step2_pipeline.profile` process), whole 40-subject cohort | (the same ≈ 370–490 GB²) | — | **peak 1.1 GiB** |
+| host memory, step 2 alone (standalone `arealmshbm.step2_pipeline.profile` process), whole 40-subject cohort | (the same ≈ 370–490 GB²) | 11.1 GiB | **peak 1.1 GiB** |
 
 The step-2 GPU column is the `gpu` backend, the candidate-set session
 (since v2.0.0; the dense CuPy port that held the name in v1.0.0 is gone).
 Measured as a single run in a fresh process (a warm in-process repeat is
-14.1 s). The full-pipeline row is two production runs; in the faster
+14.1 s). The CPU figure is likewise a single run in a fresh process, 48 EM
+iterations (the v2.0.0 tree measured 2,638.7 s on the same shape; the CPU
+EM kernel is the same code, so the spread is run-to-run variation of a
+49-minute all-core run on a laptop). The full-pipeline row is two production runs; in the faster
 one step 2 took 14.2 s beside step 0 38.0 s, step 1 8.1 s and step 3
 8.1 s; between the two runs step 0 accounted for 2.8 s of the 5.4 s
 difference, step 2 for 1.5 s and step 1 for 0.6 s. The host-memory row
@@ -578,12 +581,12 @@ GPU 一列所用后端：`backend_step0` / `backend_step1` / `backend_step3` = `
 
 | | MATLAB (CBIG, MEX) | cuArealMSHBM CPU | cuArealMSHBM GPU |
 |---|---|---|---|
-| step 2 —— 组先验 EM（生产配置 `max_iter_inter=10`；两个后端均为 48 次 EM 迭代） | 工作站上不可实施² | 2,638.7 s | **15.8 s（167×）** |
+| step 2 —— 组先验 EM（生产配置 `max_iter_inter=10`；两个后端均为 48 次 EM 迭代） | 工作站上不可实施² | 2,945.6 s | **15.8 s（186×）** |
 | 全流程 step 0–3，整个队列（生产运行） | 工作站上不可实施² | — | **70.5–75.9 s（≈1.2 分钟）** |
 | step 2 在 40 被试全队列下的设备内存 | **≈ 370–490 GB RAM**（预估²） | — | **峰值 5.6 GiB / 24 GB 显存** |
-| step 2 单独运行（独立的 `arealmshbm.step2_pipeline.profile` 进程）在 40 被试全队列下的主机内存 | （同上，≈ 370–490 GB²） | — | **峰值 1.1 GiB** |
+| step 2 单独运行（独立的 `arealmshbm.step2_pipeline.profile` 进程）在 40 被试全队列下的主机内存 | （同上，≈ 370–490 GB²） | 11.1 GiB | **峰值 1.1 GiB** |
 
-step 2 的 GPU 一列取自 `gpu` 后端，即候选集 session（自 v2.0.0 起；v1.0.0 中占用该名字的稠密 CuPy 移植已不存在）。该数字为新进程中的单次运行（进程内的预热重复运行为 14.1 s）。全流程一行是两次生产运行；较快的一次中 step 2 为 14.2 s，另有 step 0 38.0 s、step 1 8.1 s、step 3 8.1 s；两次运行 5.4 s 的差值中 step 0 占 2.8 s、step 2 占 1.5 s、step 1 占 0.6 s。主机内存一行是 v2.1.0 新增的，在独立的 step-2 进程中测得：在显存常驻缓存模式下（`eager_bitpacked`；`bold_cache_mode` 为 `auto` 时，只要位打包队列、session 的常驻状态与一段安全余量放得进空闲显存就选用它），session 不再在主机内存中保留位打包队列的副本 —— 每名被试直接解码进一个两槽页锁定环形缓冲并上传 —— 主机工作集因此不再随队列规模增长；在端到端驱动器运行中，step 2 期间的进程峰值为 2.8 GiB，其中大部分是 step 0–1 遗留的内存。放不进显存的队列走 `stream` 模式：设备上只保留一名被试，并在主机内存允许时在主机内存中缓存整个位打包队列。step 1 在所有配置下都去掉了同一份主机副本。
+step 2 的 GPU 一列取自 `gpu` 后端，即候选集 session（自 v2.0.0 起；v1.0.0 中占用该名字的稠密 CuPy 移植已不存在）。该数字为新进程中的单次运行（进程内的预热重复运行为 14.1 s）。CPU 一列同样是新进程中的单次运行、48 次 EM 迭代（v2.0.0 代码在同一形状上测得 2,638.7 s；CPU 的 EM 内核代码未变，差异属于笔记本上一次 49 分钟全核运行的逐次波动）。全流程一行是两次生产运行；较快的一次中 step 2 为 14.2 s，另有 step 0 38.0 s、step 1 8.1 s、step 3 8.1 s；两次运行 5.4 s 的差值中 step 0 占 2.8 s、step 2 占 1.5 s、step 1 占 0.6 s。主机内存一行是 v2.1.0 新增的，在独立的 step-2 进程中测得：在显存常驻缓存模式下（`eager_bitpacked`；`bold_cache_mode` 为 `auto` 时，只要位打包队列、session 的常驻状态与一段安全余量放得进空闲显存就选用它），session 不再在主机内存中保留位打包队列的副本 —— 每名被试直接解码进一个两槽页锁定环形缓冲并上传 —— 主机工作集因此不再随队列规模增长；在端到端驱动器运行中，step 2 期间的进程峰值为 2.8 GiB，其中大部分是 step 0–1 遗留的内存。放不进显存的队列走 `stream` 模式：设备上只保留一名被试，并在主机内存允许时在主机内存中缓存整个位打包队列。step 1 在所有配置下都去掉了同一份主机副本。
 
 **与 v1.0.0 的同机对比。** v1.0.0 公布的 step 2 数字是 794.0 s（CPU）/ 156.7 s（稠密 GPU），但那是在 `max_iter_inter=2` —— 短跑基准的迭代上限 —— 下测得的，并非生产默认值 10，见 [`docs/step2_flow_and_subgraphs.md`](docs/step2_flow_and_subgraphs.md) 的 § Production-cohort walls。在 v2.0.0 代码上重跑同样的形状，`gpu` 后端为 **11.1 s**：比 v1.0.0 的 GPU 数字快 **14×**，比其 CPU 数字快 **72×**。其实测显存峰值在 `max_iter_inter=2` 与 `=10` 下**同为 6.7 GiB** —— 不随外层迭代数增长，因为候选集 session 只分配一次并全程复用。v1.0.0 的稠密 GPU 后端在同一形状下实测为 **21 GiB**，在 `inter=10` 时已溢出到主机内存；v2.0.0 将其移除，除了显存原因，也因为它的 fp32 清零（flush-to-zero）E-step 是两者中精度较低的一个。
 
