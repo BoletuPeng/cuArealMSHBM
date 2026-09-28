@@ -60,21 +60,7 @@ class ProjectLayout:
     def cohort_json_path(self) -> Path:
         return self.project_dir / "cohort.json"
 
-    # ── step0 outputs ──
-    def gradient_dir(self, sub_id: str) -> Path:
-        return self.project_dir / "gradients" / f"sub{sub_id}"
-
-    def gradient_path(self, sub_id: str, hemi: str, n_components: int) -> Path:
-        return self.gradient_dir(sub_id) / (
-            f"{hemi}_emb_{n_components}_distance_matrix.npy"
-        )
-
     # ── step1 outputs ──
-    def profile_b2nd_path(self, sub_id: str, targ_mesh: str, seed_mesh: str) -> Path:
-        # Mirrors arealmshbm.data_io.profile_io.profile_path.
-        return (self.project_dir / "profiles_raw" / f"sub{sub_id}"
-                / f"sub{sub_id}_{targ_mesh}_roi{seed_mesh}.profile.b2nd")
-
     @property
     def group_mat_path(self) -> Path:
         return self.project_dir / "group" / "group.mat"

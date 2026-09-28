@@ -4,8 +4,9 @@ The full step-3 EM body, single-subject (Mode A). One ``run()`` call
 corresponds to one ``intra_em`` outer-loop iteration.
 
 Public API:
-    VmfClusteringSession — caches every sub-Session and per-call scratch.
-        ``backend='cpu' | 'gpu_elambda' | 'gpu_full'``.
+    VmfClusteringSession — the ``backend='cpu'`` session: caches every
+        sub-Session and per-call scratch. (``backend='gpu'`` is
+        :class:`.vmf_clustering_gpu.VmfClusteringSessionSparseCUDA`.)
 
 Caller-facing array shapes (all single-subject; no ``S`` axis):
     data_series_NTD       : (N, T, ⌈D/8⌉) uint8 — bit-packed caller BOLD;
@@ -40,7 +41,6 @@ Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
@@ -59,23 +59,13 @@ from arealmshbm.step3_pipeline.variant import VariantSpec
 from arealmshbm.data_io.bitpacked_norm import unpack_normalize_packed_NTD_host
 
 from ._session_common import (
+    _stage_1d,
+    _stage_2d,
+    _stage_3d,
     validate_packed_bold_shape,
     validate_variant_requirements,
 )
 from .e_step_lambda import ELambdaSession
-
-
-# Backend selection (constructor parameter — see VmfClusteringSession docstring).
-# Validated values for ``backend=``:
-_VALID_BACKENDS = ("cpu", "gpu_elambda", "gpu_full", "gpu_sparse")
-
-
-def _validate_backend(backend: str) -> str:
-    if backend not in _VALID_BACKENDS:
-        raise ValueError(
-            f"unknown backend {backend!r}; expected one of {_VALID_BACKENDS}"
-        )
-    return backend
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -89,13 +79,6 @@ def _get(params: Dict[str, Any], key: str) -> Any:
     if key not in params:
         raise KeyError(f"Params is missing required field '{key}'")
     return params[key]
-
-
-# _stage_{1,2,3}d moved to ._session_common (cross-backend shared
-# helpers; the GPU module also uses them). Re-exported here so any
-# external script that imported them from this module before
-# 2026-06-XX continues to work.
-from ._session_common import _stage_1d, _stage_2d, _stage_3d  # noqa: F401
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -203,15 +186,6 @@ def _check_connectedness_step(
 # ─────────────────────────────────────────────────────────────────────────
 # Production hot path — Session
 # ─────────────────────────────────────────────────────────────────────────
-@dataclass
-class _Inputs:
-    """Static inputs cached on the Session (don't change across run() calls
-    within a single sub-task)."""
-    boundary_mask: np.ndarray
-    lh_sphere_mesh: Dict[str, np.ndarray]
-    rh_sphere_mesh: Dict[str, np.ndarray]
-
-
 class VmfClusteringSession:
     """Pre-allocated state for a vmf_clustering super-call.
 
@@ -229,40 +203,9 @@ class VmfClusteringSession:
     Session-owned scratch and ping-pong buffers; concurrent calls on the
     same Session would race. Build one Session per worker.
 
-    Backend dispatch
-    ----------------
-    The ``backend=`` constructor parameter selects the compute path:
-
-      * ``'cpu'`` (default) — pure CPU numba kernels.
-      * ``'gpu_elambda'``   — only the E-step lambda loop body runs on GPU
-        (CuPy); per-comp_iter ping-pongs (N, L) arrays. Useful baseline.
-      * ``'gpu_full'``      — full-GPU super-call (M-step + ELambda +
-        EMStop + spatial_priors all device-resident; only check_connectedness
-        BFS stays CPU). ``__new__`` redirects construction to
-        :class:`VmfClusteringSessionCUDA`, drop-in same external API.
-
-    Promote backend to constructor param (rather than env var) so it's
-    settable from a config file or GUI.
+    Pure CPU numba kernels throughout; this is the ``backend='cpu'``
+    session.
     """
-
-    def __new__(cls, *args, backend: str = "cpu", **kwargs):
-        _validate_backend(backend)
-        # Full-GPU dispatch: redirect construction to the GPU class.
-        # If __new__ returns an instance of a *different* class than ``cls``,
-        # Python skips this class's ``__init__`` — the GPU class's own
-        # ``__init__`` (already invoked inside the call below) is the only
-        # initializer that runs. Same external API, drop-in replacement.
-        if cls is VmfClusteringSession and backend == "gpu_sparse":
-            raise ValueError(
-                "backend='gpu_sparse' is constructed by Step3Pipeline from "
-                "sparse inputs (vmf_clustering_gpu_sparse."
-                "VmfClusteringSessionSparseCUDA), not via VmfClusteringSession"
-            )
-        if cls is VmfClusteringSession and backend == "gpu_full":
-            from .vmf_clustering_gpu import VmfClusteringSessionCUDA
-            # The GPU class doesn't accept ``backend`` itself.
-            return VmfClusteringSessionCUDA(*args, **kwargs)
-        return super().__new__(cls)
 
     def __init__(self,
                  data_series_NTD: np.ndarray,              # (N, T, ⌈D/8⌉) uint8 packed
@@ -290,27 +233,17 @@ class VmfClusteringSession:
                  cMSHBM_isolated_component_min_size: int = 5,
                  *,
                  D_unpacked: int,
-                 backend: str = "cpu",
-                 variant_spec: Optional[VariantSpec] = None):
-        # Default variant for back-compat: gMSHBM. Existing call sites
-        # that don't pass ``variant_spec`` see the same behaviour as
-        # before this refactor.
-        if variant_spec is None:
-            variant_spec = VariantSpec.from_pipeline_type("gMSHBM")
+                 variant_spec: VariantSpec):
         self.variant = variant_spec
         # Strong invariants per variant — fail loudly at construction
-        # if the caller fed mismatched inputs. Shared with the GPU
-        # Session via ``_session_common`` so the two backends can't
-        # drift on what input shapes they accept.
+        # if the caller fed mismatched inputs. The gpu session calls the
+        # same ``_session_common`` validator, so the two backends accept
+        # the same variant inputs.
         validate_variant_requirements(
             variant_spec, grad_data, sphere_xyz,
             lh_sphere_mesh, rh_sphere_mesh,
         )
         # Single-subject pipeline — no S axis anywhere in the super-call.
-        # ``backend`` is already validated by ``__new__`` (which is the
-        # only construction path; instantiating bypassing it would be a
-        # subclass concern). Just store the validated value.
-        self.backend = backend
 
         self.dim = int(dim)
         self.num_clusters = int(num_clusters)
@@ -417,49 +350,25 @@ class VmfClusteringSession:
             row_idx_active=self.row_idx_active,
         )
 
-        # E-step lambda Session — picked by ``self.backend``.
-        #   'gpu_elambda' → CUDA / CuPy implementation
-        #   'cpu'         → CPU numba implementation
-        # The GPU backend H2D's BOLD + theta + log(θ) + boundary_mask + the
-        # V_lambda neighborhood/(row,col) once at construction; from then on
-        # each ``run_lambda_loop`` call ping-pongs s_lambda / scv / sxv
-        # between host and device. The CPU backend shares the (N, T, D)
-        # BOLD reference with the super-call (no per-Session copy).
-        if self.backend == "gpu_elambda":
-            from .e_step_lambda_gpu import ELambdaSessionCUDA
-            self.e_lambda_session = ELambdaSessionCUDA(
-                data_series_NTD=ds_NTD,
-                theta=self.theta_f32,
-                boundary_mask=self.boundary_mask_f32,
-                v_lambda_session=self.v_lambda_session,
-                dim=self.dim,
-                num_clusters=self.num_clusters,
-                num_session=self.num_session,
-                w=self.w,
-                c=self.c,
-                beta=self.beta_f32,
-                epsilon=self.epsilon,
-                max_iter=self.max_iter_lambda,
-            )
-        else:
-            self.e_lambda_session = ELambdaSession(
-                data_series_NTD=ds_NTD,
-                theta=self.theta_f32,
-                boundary_mask=self.boundary_mask_f32,
-                v_lambda_session=self.v_lambda_session,
-                dim=self.dim,
-                num_clusters=self.num_clusters,
-                num_session=self.num_session,
-                w=self.w,
-                c=self.c,
-                beta=self.beta_f32,
-                epsilon=self.epsilon,
-                max_iter=self.max_iter_lambda,
-            )
+        # E-step lambda Session — shares the (N, T, D) BOLD reference
+        # with the super-call (no per-Session copy).
+        self.e_lambda_session = ELambdaSession(
+            data_series_NTD=ds_NTD,
+            theta=self.theta_f32,
+            boundary_mask=self.boundary_mask_f32,
+            v_lambda_session=self.v_lambda_session,
+            dim=self.dim,
+            num_clusters=self.num_clusters,
+            num_session=self.num_session,
+            w=self.w,
+            c=self.c,
+            beta=self.beta_f32,
+            epsilon=self.epsilon,
+            max_iter=self.max_iter_lambda,
+        )
 
         # EM-stop session — shares the same (N, T, D) BOLD reference as
-        # ELambda. The pre-S-drop refactor allocated 2.31 GB twice (once
-        # per Session); now both reference the same buffer.
+        # ELambda (one buffer, not one per Session).
         self.em_stop_session = EMStopSession(
             data_series_NTD=ds_NTD,
             theta=self.theta_f32,
@@ -518,8 +427,8 @@ class VmfClusteringSession:
         import time as _time
 
         # ── Stage Params into local Python state ──
-        # Strict shapes — single-subject pipeline; the (..., 1) MATLAB
-        # leftovers are no longer accepted.
+        # Strict shapes — single-subject pipeline; (..., 1) MATLAB
+        # shapes are rejected.
         s_lambda = _stage_2d(_get(params_in, "s_lambda"), self.N, self.L, "s_lambda")
         s_t_nu   = _stage_3d(_get(params_in, "s_t_nu"),
                               self.D, self.L, self.T, "s_t_nu")
@@ -740,7 +649,7 @@ class VmfClusteringSession:
                 else self._zero_NL
             )
             t0 = _time.perf_counter()
-            update_cost_scalar, stop_em, cost_em_view, _llp, scv_cleaned_view = self.em_stop_session.compute(
+            update_cost_scalar, stop_em, cost_em_view, scv_cleaned_view = self.em_stop_session.compute(
                 s_t_nu=s_t_nu,
                 kappa=kappa,
                 s_lambda=s_lambda,

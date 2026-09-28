@@ -35,28 +35,24 @@ def compute_diffusion_map_gpu_repaired(
     *,
     alpha: float = 0.5,
     n_components: int = 100,
-    working_dtype=None,
 ) -> np.ndarray:
     """Repaired GPU diffusion-map embedding of a precomputed distance matrix.
 
     Accepts either a host ``np.ndarray`` or a device ``cp.ndarray``. The
     host case triggers a single H2D copy at ``cp.asarray(dist, dtype=…)``;
-    the device case aliases (no copy) when the dtype already matches
-    ``working_dtype``. Identical semantics to
+    the device case aliases (no copy) when it is already fp32. Identical
+    semantics to
     :func:`compute_diffusion_map_gpu`; the only difference is the
     prepended distance → affinity transform, done on the GPU side.
     """
     import cupy as cp
 
-    if working_dtype is None:
-        working_dtype = cp.float32
-
     if dist.ndim != 2 or dist.shape[0] != dist.shape[1]:
         raise ValueError(f"dist must be square 2D, got {dist.shape}")
 
-    # H2D as working_dtype; if the caller already passed a cupy array
-    # with the matching dtype this is an alias (no copy).
-    L = cp.asarray(dist, dtype=working_dtype)
+    # H2D as fp32; if the caller already passed an fp32 cupy array this
+    # is an alias (no copy).
+    L = cp.asarray(dist, dtype=cp.float32)
     dm = float(cp.max(L))
     if dm <= 0.0:
         raise ValueError(
@@ -64,14 +60,13 @@ def compute_diffusion_map_gpu_repaired(
             "D.max() <= 0; cannot construct a meaningful affinity matrix."
         )
     # In-place A = exp(-D / D.max()).
-    # ``-1.0 / dm`` cast to working_dtype keeps the in-place multiply
+    # ``-1.0 / dm`` cast to fp32 keeps the in-place multiply
     # type-stable; cp.exp(out=...) avoids a temporary allocation.
-    L *= working_dtype(-1.0 / dm)
+    L *= cp.float32(-1.0 / dm)
     cp.exp(L, out=L)
 
     return compute_diffusion_map_gpu(
         L,
         alpha=alpha,
         n_components=n_components,
-        working_dtype=working_dtype,
     )

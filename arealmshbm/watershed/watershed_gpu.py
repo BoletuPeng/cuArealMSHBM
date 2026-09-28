@@ -76,11 +76,11 @@ def watershed_edge_count_gpu(
     PCIe-5 bound at ~32 GB/s).
 
     ``edge_metrics`` and ``minima`` accept both host and device input
-    (PR #56-pattern device-stay refactor). The production caller hands
+    The production caller hands
     off the device cp.ndarray straight from
     ``cifti_smoothing_gpu`` / ``find_minima_gpu``; ``cp.asarray`` then
-    aliases (no copy, no sync). Host inputs still work via a one-shot
-    H2D, preserving the legacy contract for tests / ad-hoc callers.
+    aliases (no copy, no sync). Host inputs work via a one-shot H2D
+    (tests / ad-hoc callers).
 
     Parameters
     ----------
@@ -137,9 +137,8 @@ def watershed_edge_count_gpu(
     # min/max compute on device; ``float()`` materialises each scalar
     # to host so np.arange below can run on host fp64. Two implicit
     # syncs per call (one per ``.min/.max`` reduction's float()
-    # block) — net still wins over the old host-side min/max because
-    # we no longer pay the (N, K) H2D for edge_metrics ahead of those
-    # reductions.
+    # block) — cheaper than a host-side min/max, which would need the
+    # (N, K) H2D of edge_metrics ahead of those reductions.
     em_min64 = float(em_d.min())
     em_max64 = float(em_d.max())
     stoph = em_max64 * float(fracmaxh)

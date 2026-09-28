@@ -3,22 +3,18 @@
 GPU implementation of :func:`gradient_geodesic_distance` — same
 signature, precision contract and output shape as the CPU function.
 
-The solver is the per-source Δ-stepping SSSP in
-:mod:`._kernels_gpu`. It replaced a batched pull-based
-Bellman-Ford in 2026-09: both reach the same fixed point of
-``d[u] = min_v fl(d[v] + w(v, u))`` and were bit-identical, so the
-older one was dropped rather than kept as a knob — hence the two rows
-in the timing table of ``docs/step0_flow_and_subgraphs.md``.
+The solver is the per-source Δ-stepping SSSP in :mod:`._kernels_gpu`;
+its bit-identity with pull Bellman-Ford is pinned by the oracle in
+``tests/test_gpu_delta_correctness.py``.
 
 Every entry point returns ``D[dest, source]``; a per-source SSSP fills
 ``D[source, dest]`` and fp32 addition is not reassociative, so the
 transpose pass is not optional.
 
-The preconditions are hard — there is nothing to fall back to, so each
-one raises ``ValueError``: valence ``M <= EDGE_SLOTS``, ``N <= MAX_N``
-(the kernel's static shared-memory budget), neighbour slots inside the
-1-indexed range ``[0, N]``, a symmetric neighbour table, and
-non-negative non-NaN weights.
+Each precondition raises ``ValueError``: valence ``M <= EDGE_SLOTS``,
+``N <= MAX_N`` (the kernel's static shared-memory budget), neighbour
+slots inside the 1-indexed range ``[0, N]``, a symmetric neighbour
+table, and non-negative non-NaN weights.
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """
@@ -27,22 +23,6 @@ from __future__ import annotations
 from typing import Optional
 
 import numpy as np
-
-
-def _shape_check(verts, vertex_nbors, grad_data) -> int:
-    """Shared input validation; returns N. Lifted from the CPU wrapper
-    so both backends fail with the same error messages."""
-    if vertex_nbors.ndim != 2:
-        raise ValueError(
-            f"vertex_nbors must be 2D; got {vertex_nbors.shape}")
-    N = vertex_nbors.shape[0]
-    if grad_data.shape != (N,):
-        raise ValueError(
-            f"grad_data shape {grad_data.shape} must equal (N,) = ({N},)")
-    if verts.ndim != 2 or verts.shape[0] != N or verts.shape[1] != 3:
-        raise ValueError(
-            f"verts must be (N, 3) = ({N}, 3); got {verts.shape}")
-    return N
 
 
 def _delta_for(grad_data_d, delta_mult: float) -> float:
@@ -170,33 +150,3 @@ def gradient_geodesic_distance_gpu_device(vertex_nbors_d,
     from ._kernels_gpu import DEFAULT_CAP
     return _gpu_device_delta(vertex_nbors_d, grad_data_d,
                              cap=DEFAULT_CAP if cap is None else int(cap))
-
-
-def gradient_geodesic_distance_gpu(verts: np.ndarray,
-                                     vertex_nbors: np.ndarray,
-                                     grad_data: np.ndarray,
-                                     ) -> np.ndarray:
-    """Drop-in replacement for the CPU ``gradient_geodesic_distance``.
-
-    Same parameter contract as the CPU function. ``verts`` is accepted
-    for API parity but unused inside (the algorithm only needs the
-    graph topology + per-vertex gradient values).
-
-    Returns the normalized (N, N) fp32 distance matrix as a numpy array
-    on the host. Internal transfers are H2D (vertex_nbors + grad_data
-    on launch) and D2H (the (N, N) matrix on return). For the pipeline
-    fast path that avoids the D2H entirely see
-    :func:`gradient_geodesic_distance_gpu_device`.
-    """
-    import cupy as cp
-
-    _shape_check(verts, vertex_nbors, grad_data)
-    # ``cp.asarray`` handles the numpy → device copy + dtype cast; the
-    # CBIG vertex_nbors / grad_data are already C-contig on the host so
-    # the result is contiguous without a separate ascontiguousarray pass.
-    vn_d = cp.asarray(vertex_nbors, dtype=cp.int32)
-    gd_d = cp.asarray(grad_data, dtype=cp.float32)
-
-    D_d = gradient_geodesic_distance_gpu_device(vn_d, gd_d)
-
-    return cp.asnumpy(D_d)

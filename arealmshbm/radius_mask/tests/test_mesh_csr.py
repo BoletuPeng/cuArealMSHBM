@@ -4,15 +4,15 @@ What is pinned here:
 
   * ``_build_mesh_csr`` reading adjacency out of the bundle's
     ``vertexNbors`` table is bit-identical (``np.array_equal`` on
-    indptr / indices / weights) to the previous implementation, which
-    deduplicated the 6*F directed face edges through ``np.unique``.
+    indptr / indices / weights) to the face-based oracle
+    ``_build_mesh_csr_from_faces``, which deduplicates the 6*F directed
+    face edges through ``np.unique``.
     Checked on a synthetic icosphere and on both shipped fsaverage6
     bundles;
   * every documented precondition of the new argument raises a named
-    ``ValueError`` -- including the three graph invariants the retired
-    faces+``np.unique`` route used to guarantee by construction and a
-    raw bundle table cannot be assumed to have: no self-loop, no
-    duplicate neighbour, symmetry;
+    ``ValueError`` -- including the three graph invariants a raw bundle
+    table cannot be assumed to have: no self-loop, no duplicate
+    neighbour, symmetry;
   * ``_mask_to_csc`` equals ``scipy.sparse.csc_matrix(mask.astype(f8))``
     down to indptr / indices / data.
 
@@ -32,6 +32,7 @@ import pytest
 import scipy.sparse as sp
 
 from arealmshbm.radius_mask._common import _build_mesh_csr, _mask_to_csc
+from ._mesh_fixture import _nbors_from_faces
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -69,24 +70,6 @@ def _build_mesh_csr_from_faces(vertices, faces):
             csr.indices.astype(np.int64),
             np.ascontiguousarray(csr.data, dtype=np.float32))
 
-
-def _nbors_from_faces(faces, n):
-    """(max_neigh, V) 1-indexed neighbour table, 0 = absent slot — the
-    layout ``load_avg_mesh`` bundles ship."""
-    F = np.asarray(faces, dtype=np.int64)
-    a = np.concatenate([F[:, 0], F[:, 1], F[:, 2]])
-    b = np.concatenate([F[:, 1], F[:, 2], F[:, 0]])
-    adj = [set() for _ in range(n)]
-    for u, v in zip(a.tolist(), b.tolist()):
-        adj[u].add(v)
-        adj[v].add(u)
-    m = max(len(s) for s in adj)
-    tab = np.zeros((m, n), dtype=np.int64)
-    for v, s in enumerate(adj):
-        # deliberately NOT sorted: the builder must sort per column.
-        for k, u in enumerate(sorted(s, reverse=True)):
-            tab[k, v] = u + 1
-    return tab
 
 
 @pytest.fixture(scope="module")
@@ -169,8 +152,7 @@ def test_mask_to_csc_rejects_bad_input():
 
 
 def test_csr_rejects_asymmetric_nbors(icosphere_mesh):
-    """The retired faces route built the reverse edge by construction;
-    the table route has to check for it, or a corrupt bundle silently
+    """A table route must check symmetry, or a corrupt bundle silently
     yields a directed graph and wrong geodesics."""
     verts, faces, nbors = icosphere_mesh
     bad = nbors.copy()

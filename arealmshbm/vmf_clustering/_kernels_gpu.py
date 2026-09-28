@@ -1,22 +1,29 @@
 """_kernels_gpu.py
 
-GPU kernels for the E-step λ-loop body. CuPy ports of the two hot
-kernels in :mod:`arealmshbm.vmf_clustering._kernels` and
-:mod:`arealmshbm.V_lambda._kernels`. All inputs and outputs are
-``cupy.ndarray``; no PCIe transfers inside these functions.
+CUDA kernels (CuPy ``RawModule``) for the ``gpu`` step-3 backend.
+Everything operates on the candidate-set layout described in
+:mod:`arealmshbm.vmf_clustering.sparse_layout` and in
+``docs/step3_sparse_design.md`` (§2 is the contract each kernel below
+implements; the reference is the CPU numba kernel named in each
+docstring).
 
-Public API:
-    vlambda_potts_closeform_fused_cupy
-        — CuPy port of ``v_lambda_potts_closeform_fused_f32``.
-          Fancy-indexing for the per-candidate gather.
-    fused_v_lambda_assemble_softmax_drift_cupy
-        — CuPy port of ``fused_v_lambda_assemble_softmax_drift_f32``.
-
-Both kernels are mathematically identical to the CPU versions but not
-bit-equal: CuPy's parallel reduction trees vs the CPU's serial
-accumulators give fp32 ULP-level drift on output magnitudes ~O(1). The
-≥99% vertex-agreement spec absorbs this the same way it absorbs the
-CPU-vs-MATLAB drift.
+Design rules
+------------
+* No floating-point atomics. Every reduction is a fixed tree (block
+  partials → single-block final pass), so a run is bit-reproducible.
+* The module is compiled with ``-fmad=false``: the fp32 op sequences that
+  mirror the CPU kernels (E-step assembly, softmax, intra_em algebra)
+  must not be contracted into FMAs, or they would round differently from
+  numba's ``fastmath=False`` code.
+* ``exp`` is evaluated in fp64 on the fp32 difference and cast, exactly
+  like numba's ``float32(math.exp(x))``.
+* CuPy appends ``-ftz=true`` to every nvrtc compile, so fp32 denormals
+  DO flush to zero here — that cannot be turned off from ``options=``.
+  It is safe for this backend because the one quantity with denormal
+  inputs, ``log(theta)``, is computed on the host in fp64 (see
+  :class:`VmfClusteringSessionSparseCUDA`); every other fp32 value the
+  kernels touch is far from the 1e-38 boundary.
+* Kernels never allocate; the Session owns every buffer.
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """
@@ -24,345 +31,735 @@ Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 from __future__ import annotations
 
 import cupy as cp
+import numpy as np
+
+from arealmshbm.em_stop_criterion._kernels import LOG_EPS_POW20
+from arealmshbm.vmf_clustering.sparse_layout import MAX_D_BYTES
 
 
-# ─────────────────────────────────────────────────────────────────────────
-# V_lambda Potts close-form (3-phase fused, GPU)
-# ─────────────────────────────────────────────────────────────────────────
-def vlambda_potts_closeform_fused_cupy(
-    neighborhood_NM: cp.ndarray,    # (N, M1) int64
-    lam: cp.ndarray,                # (N, K)  fp32
-    row_idx: cp.ndarray,            # (P,)    int64
-    col_idx: cp.ndarray,            # (P,)    int64
-    V_lam: cp.ndarray,              # (N, K)  fp32 — pre-zeroed at construction
-) -> None:
-    """Fused 3-phase V_lambda Potts close-form, all on GPU.
+_SRC = r"""
 
-    Mirrors :func:`arealmshbm.V_lambda._kernels.v_lambda_potts_closeform_fused_f32`.
+#define WARP 32
 
-    Phase 1 (per-vertex row-sum):
-        row_sum[m] = Σ_k lam[m, k]
-    Phase 2 (per-vertex neighbor-sum, j>0 mask):
-        nbr_sum[m] = Σ_n: j>0 row_sum[j-1]
-    Phase 3 (per-candidate close-form):
-        V_lam[m, k] = nbr_sum[m] - Σ_n: j>0 lam[j-1, k]
+// ---------------------------------------------------------------------
+// Block-level fixed-tree reduction of doubles (blockDim.x must be a
+// power of two <= 1024). Result valid in thread 0's return value.
+// ---------------------------------------------------------------------
+__device__ __forceinline__ double block_reduce_sum_d(double v, double* sh) {
+    const int tid = threadIdx.x;
+    sh[tid] = v;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (tid < s) sh[tid] += sh[tid + s];
+        __syncthreads();
+    }
+    double r = sh[0];
+    __syncthreads();
+    return r;
+}
 
-    All three phases run as CuPy primitives. Sub-001 timing on RTX 5090:
-    ~1 ms / call (vs ~32 ms CPU; ~32× speedup).
+__device__ __forceinline__ double warp_reduce_sum_d(double v) {
+    #pragma unroll
+    for (int o = WARP / 2; o > 0; o >>= 1)
+        v += __shfl_down_sync(0xffffffffu, v, o);
+    return v;
+}
 
-    Inputs/outputs are CuPy device arrays; no host-device transfer.
-    Caller pre-zeros ``V_lam`` once at construction (static-candidate-set
-    invariant).
-    """
-    N, M1 = neighborhood_NM.shape
-    # Phase 1
-    row_sum = lam.sum(axis=1)                                 # (N,) fp32
+__device__ __forceinline__ float warp_reduce_sum_f(float v) {
+    #pragma unroll
+    for (int o = WARP / 2; o > 0; o >>= 1)
+        v += __shfl_down_sync(0xffffffffu, v, o);
+    return v;
+}
 
-    # Phase 2 — gather neighbors' row_sums with j>0 mask.
-    valid = neighborhood_NM > 0                                # (N, M1) bool
-    safe_j = cp.where(valid, neighborhood_NM - 1, 0)           # (N, M1) int64
-    # row_sum[safe_j] is (N, M1); zero out invalid entries via valid mask.
-    nbr_vals = cp.where(valid, row_sum[safe_j], cp.float32(0.0))
-    nbr_sum = nbr_vals.sum(axis=1)                            # (N,) fp32
+// Final fixed-order sum of per-block partials -> out[0].
+extern "C" __global__
+void reduce_partials_d(const double* __restrict__ part, int n, double* __restrict__ out) {
+    __shared__ double sh[1024];
+    double v = 0.0;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) v += part[i];
+    v = block_reduce_sum_d(v, sh);
+    if (threadIdx.x == 0) out[0] = v;
+}
 
-    # Phase 3 — per-candidate gather + reduce.
-    nbh_at_p = neighborhood_NM[row_idx]                        # (P, M1) int64
-    valid_p = nbh_at_p > 0                                     # (P, M1) bool
-    safe_j_p = cp.where(valid_p, nbh_at_p - 1, 0)              # (P, M1) int64
-    # lam[safe_j_p, col_idx[:, None]]: gather (P, M1) values from lam.
-    lam_vals = lam[safe_j_p, col_idx[:, None]]                 # (P, M1) fp32
-    acc_lam = cp.where(valid_p, lam_vals, cp.float32(0.0)).sum(axis=1)  # (P,)
-    # Scatter into V_lam at (row_idx, col_idx).
-    V_lam[row_idx, col_idx] = nbr_sum[row_idx] - acc_lam
+// ---------------------------------------------------------------------
+// Packed-BOLD helpers
+// ---------------------------------------------------------------------
+// Zero the MW rows of the packed BOLD for every session t.
+extern "C" __global__
+void zero_rows_packed(unsigned char* __restrict__ packed, int T, int N, int Db,
+                      const int* __restrict__ rows, int n_rows) {
+    const long long total = (long long)T * n_rows * Db;
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+         i < total; i += (long long)gridDim.x * blockDim.x) {
+        int b = (int)(i % Db);
+        long long r = i / Db;
+        int ri = (int)(r % n_rows);
+        int t = (int)(r / n_rows);
+        packed[((long long)t * N + rows[ri]) * Db + b] = 0;
+    }
+}
+
+// ---------------------------------------------------------------------
+// s_t_nu column statistics: S[t,l] = Sum_d s_t_nu[t,l,d] (fp64),
+// allzero[t,l], anynan[t,l]. One block per (t, l).
+// ---------------------------------------------------------------------
+extern "C" __global__
+void stnu_col_stats(const float* __restrict__ stnu, int D,
+                    double* __restrict__ S, unsigned char* __restrict__ allzero,
+                    unsigned char* __restrict__ anynan) {
+    __shared__ double sh[1024];
+    __shared__ int flags[2];
+    const int tl = blockIdx.x;
+    const float* row = stnu + (size_t)tl * D;
+    if (threadIdx.x == 0) { flags[0] = 1; flags[1] = 0; }
+    __syncthreads();
+    double s = 0.0;
+    int nz = 0, nan = 0;
+    for (int d = threadIdx.x; d < D; d += blockDim.x) {
+        float v = row[d];
+        s += (double)v;
+        if (v != 0.0f) nz = 1;
+        if (v != v) nan = 1;
+    }
+    if (nz) atomicAnd(&flags[0], 0);
+    if (nan) atomicOr(&flags[1], 1);
+    s = block_reduce_sum_d(s, sh);
+    if (threadIdx.x == 0) {
+        S[tl] = s;
+        allzero[tl] = (unsigned char)flags[0];
+        anynan[tl] = (unsigned char)flags[1];
+    }
+}
+
+// Combine the per-(t,l) flags over t -> per-l col_zero / col_nan.
+extern "C" __global__
+void combine_col_flags(const unsigned char* __restrict__ allzero,
+                       const unsigned char* __restrict__ anynan,
+                       int T, int L, unsigned char* __restrict__ col_zero,
+                       unsigned char* __restrict__ col_nan) {
+    int l = blockIdx.x * blockDim.x + threadIdx.x;
+    if (l >= L) return;
+    unsigned char z = 1, n = 0;
+    for (int t = 0; t < T; ++t) {
+        z &= allzero[t * L + l];
+        n |= anynan[t * L + l];
+    }
+    col_zero[l] = z;
+    col_nan[l] = n;
+}
+
+// ---------------------------------------------------------------------
+// acc[p] = Sum_t Sum_d X[n,t,d] * s_t_nu[t,l,d]   (design ?2.1)
+//   X[n,t,d] = (bit - mean[t,n]) * inv[t,n]
+//   => acc = Sum_t inv * (Sum_{d: bit} s_t_nu[t,l,d] - mean * S[t,l])
+// One warp per active row m. The warp first expands the set bits of
+// row (t, n) into a shared-memory list, then for each candidate l the
+// lanes stride over that list gathering s_t_nu[t,l,*] (a 4.7 KB,
+// L1-resident segment). fp64 accumulation throughout, fp32 store.
+// Candidates are processed in chunks of ACC_CHUNK so the per-candidate
+// fp64 accumulators live in shared memory regardless of row degree.
+// ---------------------------------------------------------------------
+#define ACC_WARPS 4
+#define ACC_MAXB 8          // bytes per lane; 32 lanes => Db <= MAX_D_BYTES
+
+extern "C" __global__
+void acc_bits(int M, const int* __restrict__ row_idx_active,
+              const int* __restrict__ row_ptr, const int* __restrict__ col,
+              int T, int N, int Db, int D, int L,
+              const unsigned char* __restrict__ packed,
+              const float* __restrict__ row_mean, const float* __restrict__ row_inv,
+              const float* __restrict__ stnu,      // (T, L, D)
+              const double* __restrict__ S,        // (T, L)
+              float* __restrict__ acc_out) {
+    const int lane = threadIdx.x & 31;
+    const int wid = threadIdx.x >> 5;
+    const int m = blockIdx.x * ACC_WARPS + wid;
+    if (m >= M) return;
+    const int n = row_idx_active[m];
+    const int p0 = row_ptr[m], p1 = row_ptr[m + 1];
+    const int nB = (Db + WARP - 1) / WARP;      // bytes per lane
+
+    for (int p = p0; p < p1; ++p) {
+        const int l = col[p];
+        float part = 0.0f;                       // lane partial of Sum_t inv_t * (bits_t . s_t_nu[t,l,:])
+        for (int t = 0; t < T; ++t) {
+            const float inv = row_inv[t * N + n];
+            if (inv == 0.0f) continue;           // zero row (has_zero gate)
+            const unsigned char* prow = packed + ((size_t)t * N + n) * Db;
+            const float* srow = stnu + ((size_t)t * L + l) * D;
+            float pt = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < ACC_MAXB; ++i) {
+                if (i >= nB) break;
+                const int b = lane + i * WARP;
+                unsigned int byte = (b < Db) ? (unsigned int)__ldg(prow + b) : 0u;
+                const float* sb = srow + b * 8;
+                // Fixed 8-step predicated form: no data-dependent loop,
+                // the 8 loads are independent and issue together.
+                float v0 = (byte & 1u)   ? __ldg(sb + 0) : 0.0f;
+                float v1 = (byte & 2u)   ? __ldg(sb + 1) : 0.0f;
+                float v2 = (byte & 4u)   ? __ldg(sb + 2) : 0.0f;
+                float v3 = (byte & 8u)   ? __ldg(sb + 3) : 0.0f;
+                float v4 = (byte & 16u)  ? __ldg(sb + 4) : 0.0f;
+                float v5 = (byte & 32u)  ? __ldg(sb + 5) : 0.0f;
+                float v6 = (byte & 64u)  ? __ldg(sb + 6) : 0.0f;
+                float v7 = (byte & 128u) ? __ldg(sb + 7) : 0.0f;
+                pt += ((v0 + v1) + (v2 + v3)) + ((v4 + v5) + (v6 + v7));
+            }
+            part += inv * pt;
+        }
+        const float tot = warp_reduce_sum_f(part);
+        if (lane == 0) {
+            double cval = 0.0;                   // Sum_t inv_t * mean_t * S[t,l]
+            for (int t = 0; t < T; ++t) {
+                const float inv = row_inv[t * N + n];
+                if (inv == 0.0f) continue;
+                cval += (double)inv * (double)row_mean[t * N + n] * S[t * L + l];
+            }
+            acc_out[p] = (float)((double)tot - cval);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// E-step lambda-iteration (design ?2.2) ? mirrors
+// V_lambda/_kernels.v_lambda_potts_closeform_fused_full_lam_f32 +
+// vmf_clustering/_kernels.fused_v_lambda_assemble_softmax_drift_f32.
+// ---------------------------------------------------------------------
+extern "C" __global__
+void row_sum_k(int M, const int* __restrict__ row_ptr, const float* __restrict__ lam,
+               float* __restrict__ row_sum) {
+    int m = blockIdx.x * blockDim.x + threadIdx.x;
+    if (m >= M) return;
+    float s = 0.0f;
+    for (int p = row_ptr[m]; p < row_ptr[m + 1]; ++p) s += lam[p];
+    row_sum[m] = s;
+}
+
+extern "C" __global__
+void estep_k(int M, const int* __restrict__ row_ptr, const int* __restrict__ col,
+             const int* __restrict__ nbh, int M1,
+             const float* __restrict__ lam, const float* __restrict__ row_sum,
+             const float* __restrict__ acc, const float* __restrict__ kappa,
+             const float* __restrict__ cdln_T, const unsigned char* __restrict__ col_zero,
+             const float* __restrict__ log_theta, float w, float two_c,
+             const float* __restrict__ beta, const float* __restrict__ scv,
+             const float* __restrict__ sxv, const float* __restrict__ bm,
+             const unsigned char* __restrict__ row_poison,
+             float* __restrict__ V_temp, float* __restrict__ out,
+             double* __restrict__ block_drift) {
+    __shared__ double sh[1024];
+    const int m = blockIdx.x * blockDim.x + threadIdx.x;
+    double drift = 0.0;
+    if (m < M) {
+        const int p0 = row_ptr[m], p1 = row_ptr[m + 1];
+        // Phase 2: neighbour sum of row sums (ascending n).
+        float nbr = 0.0f;
+        for (int nn = 0; nn < M1; ++nn) {
+            int j = nbh[(size_t)m * M1 + nn];
+            if (j != 0) nbr += row_sum[j - 1];
+        }
+        // Pass A: V_lambda close-form + log_vmf assembly, rmax.
+        float rmax = (-__int_as_float(0x7f800000));
+        for (int p = p0; p < p1; ++p) {
+            const int k = col[p];
+            float acc_lam = 0.0f;
+            for (int nn = 0; nn < M1; ++nn) {
+                int j = nbh[(size_t)m * M1 + nn];
+                if (j == 0) continue;
+                float val = 0.0f;
+                const int q0 = row_ptr[j - 1], q1 = row_ptr[j];
+                for (int q = q0; q < q1; ++q) {
+                    int ck = col[q];
+                    if (ck == k) { val = lam[q]; break; }
+                    if (ck > k) break;
+                }
+                acc_lam += val;
+            }
+            const float vt = nbr - acc_lam;
+            V_temp[p] = vt;
+            float v = acc[p] * kappa[k] + (col_zero[k] ? 0.0f : cdln_T[k]);
+            v += w * log_theta[p];
+            v -= two_c * vt;
+            v += beta[k] * scv[p];
+            v += sxv[p];
+            out[p] = v;
+            if (v > rmax) rmax = v;
+        }
+        // Pass B: exp + boundary mask.
+        float rsum = 0.0f;
+        for (int p = p0; p < p1; ++p) {
+            const float bmv = bm[p];
+            if (bmv == 0.0f) { out[p] = 0.0f; continue; }
+            float ev = (float)exp((double)(out[p] - rmax));
+            ev *= bmv;
+            out[p] = ev;
+            rsum += ev;
+        }
+        // Pass C: normalise + drift.
+        if (rsum > 0.0f && rsum == rsum && row_poison[m] == 0) {
+            const float inv = 1.0f / rsum;
+            for (int p = p0; p < p1; ++p) {
+                const int k = col[p];
+                float nv = col_zero[k] ? 0.0f : out[p] * inv;
+                out[p] = nv;
+                double d = (double)nv - (double)lam[p];
+                drift += (d < 0.0) ? -d : d;
+            }
+        } else {
+            for (int p = p0; p < p1; ++p) {
+                drift += (double)lam[p];
+                out[p] = 0.0f;
+            }
+        }
+    }
+    drift = block_reduce_sum_d(drift, sh);
+    if (threadIdx.x == 0) block_drift[blockIdx.x] = drift;
+}
+
+// row_poison[m] = any(col_nan[l] for l in bm support of row m)
+extern "C" __global__
+void row_poison_k(int M, const int* __restrict__ bm_row_ptr, const int* __restrict__ bm_col,
+                  const unsigned char* __restrict__ col_nan, unsigned char* __restrict__ out) {
+    int m = blockIdx.x * blockDim.x + threadIdx.x;
+    if (m >= M) return;
+    unsigned char r = 0;
+    for (int p = bm_row_ptr[m]; p < bm_row_ptr[m + 1]; ++p) r |= col_nan[bm_col[p]];
+    out[m] = r;
+}
+
+// ---------------------------------------------------------------------
+// argmax labels: labels[n] = 1 + first argmax over P(n); 0 if the row
+// sums to zero or is inactive. (data_io.derive_labels semantics)
+// ---------------------------------------------------------------------
+extern "C" __global__
+void argmax_labels_k(int N, const int* __restrict__ inv_active,
+                     const int* __restrict__ row_ptr, const int* __restrict__ col,
+                     const float* __restrict__ lam, int* __restrict__ labels) {
+    int n = blockIdx.x * blockDim.x + threadIdx.x;
+    if (n >= N) return;
+    int m = inv_active[n];
+    int lab = 0;
+    if (m >= 0) {
+        float s = 0.0f, best = (-__int_as_float(0x7f800000)); int bk = -1;
+        for (int p = row_ptr[m]; p < row_ptr[m + 1]; ++p) {
+            float v = lam[p];
+            s += v;
+            if (v > best) { best = v; bk = col[p]; }
+        }
+        if (s != 0.0f && bk >= 0) lab = bk + 1;
+    }
+    labels[n] = lab;
+}
+
+// ---------------------------------------------------------------------
+// spatial_connect (design ?2.4) ? mirrors spatial_priors.ConnectSession
+// ---------------------------------------------------------------------
+// u[l, :] and u_sq[l]: one block per parcel, thread per gradient dim.
+extern "C" __global__
+void connect_u_k(int L, int Dg, const int* __restrict__ col_ptr,
+                 const int* __restrict__ csc_row, const int* __restrict__ csc_pidx,
+                 const float* __restrict__ lam, const float* __restrict__ grad,
+                 float* __restrict__ u, float* __restrict__ u_sq) {
+    __shared__ float s_u[1024];
+    const int l = blockIdx.x;
+    const int i0 = col_ptr[l], i1 = col_ptr[l + 1];
+    double slam = 0.0;
+    for (int i = i0; i < i1; ++i) slam += (double)lam[csc_pidx[i]];
+    const float slam_f = (float)slam;
+    for (int d = threadIdx.x; d < Dg; d += blockDim.x) {
+        double s = 0.0;
+        for (int i = i0; i < i1; ++i) {
+            float sl = lam[csc_pidx[i]];
+            s += (double)(sl * grad[(size_t)csc_row[i] * Dg + d]);
+        }
+        float uu = (float)s / slam_f;          // NaN at empty parcels (0/0)
+        u[(size_t)l * Dg + d] = uu;
+        if (d < 1024) s_u[d] = uu;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float sq = 0.0f;
+        for (int d = 0; d < Dg; ++d) {
+            float uu = (d < 1024) ? s_u[d] : u[(size_t)l * Dg + d];
+            sq += uu * uu;
+        }
+        u_sq[l] = sq;
+    }
+}
+
+// scv[p] = 2*(g_n*u_l) - ||g_n||^2 - ||u_l||^2, NaN -> -Inf. One thread per p.
+extern "C" __global__
+void connect_scv_k(int P, const int* __restrict__ p_row_m, const int* __restrict__ row_idx_active,
+                   const int* __restrict__ col, int Dg,
+                   const float* __restrict__ grad, const float* __restrict__ grad_sq,
+                   const float* __restrict__ u, const float* __restrict__ u_sq,
+                   float* __restrict__ scv) {
+    int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= P) return;
+    const int n = row_idx_active[p_row_m[p]];
+    const int l = col[p];
+    const float* g = grad + (size_t)n * Dg;
+    const float* uu = u + (size_t)l * Dg;
+    double cross = 0.0;
+    for (int d = 0; d < Dg; ++d) cross += (double)(g[d] * uu[d]);
+    float v = 2.0f * (float)cross - grad_sq[n] - u_sq[l];
+    scv[p] = (v != v) ? (-__int_as_float(0x7f800000)) : v;
+}
+
+// ---------------------------------------------------------------------
+// spatial_xyz (design ?2.5) ? mirrors spatial_priors.XyzSession
+// ---------------------------------------------------------------------
+#define LOG_2PI 1.8378770664093454835606594728112
+
+extern "C" __global__
+void xyz_muc_k(int L, const int* __restrict__ col_ptr, const int* __restrict__ csc_row,
+               const int* __restrict__ csc_pidx, const float* __restrict__ lam,
+               const float* __restrict__ sphere,        // (N, 3)
+               const double* __restrict__ gamma,        // (L,) fp64
+               float* __restrict__ s_muc,               // (3, L)
+               float* __restrict__ cdln3, float* __restrict__ gamma_f32) {
+    // One block per parcel; threads stride over the members, fixed-tree
+    // fp64 block reductions (deterministic).
+    __shared__ double sh[1024];
+    const int l = blockIdx.x;
+    double x = 0.0, y = 0.0, z = 0.0;
+    for (int i = col_ptr[l] + threadIdx.x; i < col_ptr[l + 1]; i += blockDim.x) {
+        const float sl = lam[csc_pidx[i]];
+        const float* sp = sphere + (size_t)csc_row[i] * 3;
+        x += (double)(sp[0] * sl); y += (double)(sp[1] * sl); z += (double)(sp[2] * sl);
+    }
+    x = block_reduce_sum_d(x, sh);
+    y = block_reduce_sum_d(y, sh);
+    z = block_reduce_sum_d(z, sh);
+    if (threadIdx.x != 0) return;
+    float xf = (float)x, yf = (float)y, zf = (float)z;
+    float cn = sqrtf(xf * xf + yf * yf + zf * zf);
+    s_muc[l] = xf / cn; s_muc[L + l] = yf / cn; s_muc[2 * L + l] = zf / cn;
+    // Cdln(k, 3) closed form: log k - k + log(2*pi)/2 - log1p(-e^{-2k}), NaN at k <= 0.
+    double k = gamma[l];
+    float c;
+    if (k <= 0.0) c = __int_as_float(0x7fc00000);
+    else {
+        double lom = (k < 30.0) ? log1p(-exp(-2.0 * k)) : 0.0;
+        c = (float)(log(k) - k + LOG_2PI * 0.5 - lom);
+    }
+    cdln3[l] = c;
+    gamma_f32[l] = (float)k;
+}
+
+extern "C" __global__
+void xyz_sxv_k(int P, int L, const int* __restrict__ p_row_m, const int* __restrict__ row_idx_active,
+               const int* __restrict__ col, const float* __restrict__ sphere,
+               const float* __restrict__ s_muc, const float* __restrict__ cdln3,
+               const float* __restrict__ gamma_f32, float* __restrict__ sxv) {
+    int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= P) return;
+    const int n = row_idx_active[p_row_m[p]];
+    const int l = col[p];
+    const float* s = sphere + (size_t)n * 3;
+    float cosv = s[0] * s_muc[l] + s[1] * s_muc[L + l] + s[2] * s_muc[2 * L + l];
+    float v = cdln3[l] + gamma_f32[l] * cosv;
+    sxv[p] = (v != v) ? 0.0f : v;
+}
+
+// ---------------------------------------------------------------------
+// EM stop cost (design ?2.7) ? mirrors
+// em_stop_criterion/_kernels.fused_em_stop_assemble_cleanup_cost_f32
+// ---------------------------------------------------------------------
+extern "C" __global__
+void em_stop_k(int P, const int* __restrict__ col, const float* __restrict__ acc,
+               const float* __restrict__ kappa, const float* __restrict__ cdln,
+               float Tf, const float* __restrict__ lam, const float* __restrict__ log_theta_cost,
+               const float* __restrict__ V_temp, float* __restrict__ scv,
+               double w, double c, const float* __restrict__ beta, float floor_f32,
+               double floor_f64, double* __restrict__ block_out) {
+    __shared__ double sh[1024];
+    int p = blockIdx.x * blockDim.x + threadIdx.x;
+    double term = 0.0;
+    if (p < P) {
+        const int l = col[p];
+        float llp = Tf * cdln[l] + kappa[l] * acc[p];
+        float scv_v = scv[p];
+        if (!isfinite(scv_v)) scv_v = floor_f32;
+        scv[p] = scv_v;
+        float sl_f = lam[p];
+        double sl = (double)sl_f;
+        double log_sl = (sl_f <= 0.0f) ? floor_f64 : log(sl);
+        double t = (double)llp + (double)log_theta_cost[p] - w * log_sl
+                   - c * (double)V_temp[p] + (double)beta[l] * (double)scv_v;
+        term = sl * t;
+    }
+    term = block_reduce_sum_d(term, sh);
+    if (threadIdx.x == 0) block_out[blockIdx.x] = term;
+}
+
+// ---------------------------------------------------------------------
+// intra_em outer-loop algebra (design ?2.8) ? mirrors
+// intra_em.intra_subject_var + intra_em.intra_em_cost. One thread per l.
+//   s_t_nu (T, L, D), mu / s_psi (L, D)
+// ---------------------------------------------------------------------
+extern "C" __global__
+void intra_psi_k(int T, int L, int D, const float* __restrict__ stnu,
+                 const float* __restrict__ sigma, const float* __restrict__ epsil,
+                 const float* __restrict__ mu, float* __restrict__ s_psi_new,
+                 float* __restrict__ summed_LD,
+                 double* __restrict__ per_col1, double* __restrict__ per_col2) {
+    // One block per parcel l. Pass 1/3 are parallel over d; the fp32
+    // column norm (pass 2) is a serial ascending-d sum on thread 0 so it
+    // rounds exactly like numpy's axis-0 reduction in intra_subject_var.
+    // The T sum below is serial too, which matches numpy bit-for-bit
+    // only for T < 8 (above that numpy's pairwise sum starts blocking).
+    __shared__ double sh[1024];
+    __shared__ float s_cn;
+    const int l = blockIdx.x;
+    const float sig = sigma[l], eps = epsil[l];
+    float* upd_row = s_psi_new + (size_t)l * D;
+    float* sum_row = summed_LD + (size_t)l * D;
+    const float* mu_row = mu + (size_t)l * D;
+    for (int d = threadIdx.x; d < D; d += blockDim.x) {
+        float summed = 0.0f;
+        for (int t = 0; t < T; ++t) summed += stnu[((size_t)t * L + l) * D + d];
+        sum_row[d] = summed;
+        upd_row[d] = summed * sig + mu_row[d] * eps;      // un-normalised
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float norm_acc = 0.0f;
+        for (int d = 0; d < D; ++d) { float u = upd_row[d]; norm_acc += u * u; }
+        s_cn = sqrtf(norm_acc);
+    }
+    __syncthreads();
+    const float cn = s_cn;
+    const float safe = (cn > 0.0f) ? cn : 1.0f;
+    double pc1 = 0.0, pc2 = 0.0;
+    for (int d = threadIdx.x; d < D; d += blockDim.x) {
+        float psi = (cn == 0.0f) ? 0.0f : upd_row[d] / safe;
+        upd_row[d] = psi;
+        pc1 += (double)psi * (double)sum_row[d];
+        pc2 += (double)mu_row[d] * (double)psi;
+    }
+    pc1 = block_reduce_sum_d(pc1, sh);
+    pc2 = block_reduce_sum_d(pc2, sh);
+    if (threadIdx.x == 0) { per_col1[l] = pc1; per_col2[l] = pc2; }
+}
+
+// Reset s_t_nu[t, l, :] = mu[l, :] for every t.
+extern "C" __global__
+void broadcast_mu_k(int T, long long LD, const float* __restrict__ mu, float* __restrict__ stnu) {
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+         i < LD; i += (long long)gridDim.x * blockDim.x) {
+        float v = mu[i];
+        for (int t = 0; t < T; ++t) stnu[(size_t)t * LD + i] = v;
+    }
+}
+
+// Scatter a P-vector into a dense (N, L) array (zero-filled by caller).
+extern "C" __global__
+void scatter_dense_k(int P, const int* __restrict__ p_row_m, const int* __restrict__ row_idx_active,
+                     const int* __restrict__ col, int L, const float* __restrict__ x,
+                     float* __restrict__ dense) {
+    int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= P) return;
+    dense[(size_t)row_idx_active[p_row_m[p]] * L + col[p]] = x[p];
+}
+
+"""
+
+_MODULE = None
 
 
-# ─────────────────────────────────────────────────────────────────────────
-# Mega-fused: assemble + softmax + drift (GPU)
-# ─────────────────────────────────────────────────────────────────────────
-def fused_v_lambda_assemble_softmax_drift_cupy(
-    acc: cp.ndarray,                # (N, L) fp32
-    kappa: cp.ndarray,              # (L,)   fp32
-    cdln_T: cp.ndarray,             # (L,)   fp32
-    col_zero_mask: cp.ndarray,      # (L,)   bool
-    log_theta: cp.ndarray,          # (N, L) fp32
-    w: float,
-    V_lambda_active: cp.ndarray,    # (M_active, L) fp32
-    inv_active_idx: cp.ndarray,     # (N,) int64 (m if active, -1 if not)
-    c: float,
-    beta: cp.ndarray,               # (L,)   fp32
-    spatial_connect_vmf: cp.ndarray,    # (N, L) fp32
-    spatial_xyz_vmf: cp.ndarray,        # (N, L) fp32
-    boundary_mask: cp.ndarray,          # (N, L) fp32
-    s_lambda_curr: cp.ndarray,          # (N, L) fp32
-    V_temp_out: cp.ndarray,             # (N, L) fp32 — written for em_stop
-    out: cp.ndarray,                    # (N, L) fp32 — s_lambda_new
-) -> float:
-    """GPU equivalent of ``fused_v_lambda_assemble_softmax_drift_f32``.
-
-    Returns the fp32-mean drift ``mean(|out - s_lambda_curr|)`` as a
-    Python float (synchronized off-device).
-
-    Implementation uses CuPy primitives in a chain that mirrors the
-    CPU kernel's three-pass per-row body but with all (N, L) buffers
-    materialized between steps; bandwidth-bound. A hand-written
-    ``cupy.RawKernel`` collapsing the intermediates would be faster
-    if this kernel ever shows up as the dominant hot spot.
-
-    Math:
-      Pass A:
-          V_temp[n, l] = V_lambda_active[inv_active_idx[n], l] if active
-                          else 0
-          log_vmf[n, l] = acc[n, l] * kappa[l]
-                          + (cdln_T[l] if not col_zero_mask[l] else 0)
-                          + w * log_theta[n, l]
-                          - 2c * V_temp[n, l]
-                          + beta[l] * scv[n, l]
-                          + sxv[n, l]
-          rmax[n] = max_l log_vmf[n, l]
-      Pass B (with bm==0 early-skip baked in via mask):
-          ev[n, l] = exp(log_vmf[n, l] - rmax[n]) * boundary_mask[n, l]
-          rsum[n] = Σ_l ev[n, l]
-      Pass C:
-          out[n, l] = ev[n, l] / rsum[n]   (or 0 if rsum<=0/NaN/col_zero)
-          drift = mean_{n, l} |out[n, l] - s_lambda_curr[n, l]|
-
-    The bm==0 early-skip in CPU's Pass B is replaced here by
-    multiplication by ``boundary_mask`` after exp(); mathematically
-    identical (exp(...)*0 = 0). The libm exp() floor doesn't apply on
-    GPU — exp is a hardware intrinsic — so the skip wouldn't help speed
-    even if we did it.
-    """
-    two_c = cp.float32(2.0 * c)
-    w_f32 = cp.float32(w)
-
-    # Pass A.0 — gather V_temp from V_lambda_active via inv_active_idx.
-    # For inactive rows (idx == -1) we want V_temp[n, :] = 0; do this via
-    # safe-indexing with mask.
-    active = inv_active_idx >= 0                              # (N,) bool
-    safe_idx = cp.where(active, inv_active_idx, 0)            # (N,) int64
-    V_temp = cp.where(active[:, None],
-                       V_lambda_active[safe_idx],
-                       cp.float32(0.0))                       # (N, L) fp32
-    cp.copyto(V_temp_out, V_temp)
-
-    # Pass A.1 — assemble log_vmf.
-    cdln_eff = cp.where(col_zero_mask, cp.float32(0.0), cdln_T)  # (L,) fp32
-    log_vmf = (acc * kappa
-               + cdln_eff
-               + w_f32 * log_theta
-               - two_c * V_temp
-               + beta * spatial_connect_vmf
-               + spatial_xyz_vmf)                             # (N, L) fp32
-
-    # Pass B — softmax with boundary mask.
-    rmax = log_vmf.max(axis=1, keepdims=True)                 # (N, 1)
-    ev = cp.exp(log_vmf - rmax) * boundary_mask                # (N, L)
-    rsum = ev.sum(axis=1, keepdims=True)                       # (N, 1)
-
-    # Pass C — normalize + drift, with rsum>0 / col_zero cleanup.
-    safe_rsum = cp.where(rsum > 0, rsum, cp.float32(1.0))
-    new_val = cp.where(rsum > 0, ev / safe_rsum, cp.float32(0.0))
-    new_val = cp.where(col_zero_mask, cp.float32(0.0), new_val)
-    cp.copyto(out, new_val)
-
-    drift = cp.abs(out - s_lambda_curr).mean()
-    return float(drift)
+def module() -> cp.RawModule:
+    global _MODULE
+    if _MODULE is None:
+        _MODULE = cp.RawModule(code=_SRC, options=("-std=c++17", "-fmad=false"))
+    return _MODULE
 
 
-# ─────────────────────────────────────────────────────────────────────────
-# M-step kernels (GPU)
-# ─────────────────────────────────────────────────────────────────────────
-def mstep_X_dot_sl_TDL_cupy(
-    data_series_NTD_dev: cp.ndarray,    # (N, T, D) fp32 on GPU
-    s_lambda_NL_dev: cp.ndarray,        # (N, L)    fp32 on GPU
-    out_TDL_dev: cp.ndarray,            # (T, D, L) fp32 on GPU
-) -> None:
-    """Per-t sgemm batch, GPU. Mirrors :func:`m_step._compute_X_dot_sl_TDL`.
-
-    Uses ``data_series_NTD_dev[:, t, :]`` strided view per t — cuBLAS
-    handles the lda fine (just like MKL on CPU). One ``cublasSgemm`` per
-    t; could be batched via ``cublasSgemmStridedBatched`` for marginal
-    speedup but the per-t loop is already ~24 ms on RTX 5090 for sub-001
-    shapes.
-    """
-    N, T, D = data_series_NTD_dev.shape
-    for t in range(T):
-        X = data_series_NTD_dev[:, t, :]   # (N, D) strided view
-        cp.matmul(X.T, s_lambda_NL_dev, out=out_TDL_dev[t])
+def _k(name: str):
+    return module().get_function(name)
 
 
-def mstep_fused_iter_m_body_cupy(
-    kappa_f32,                          # python float
-    X_dot_sl_TDL_dev: cp.ndarray,       # (T, D, L) fp32
-    sigma_psi_DL_dev: cp.ndarray,       # (D, L)    fp32
-    s_t_nu_old_TDL_dev: cp.ndarray,     # (T, D, L) fp32
-    s_t_nu_new_TDL_dev: cp.ndarray,     # (T, D, L) fp32 — output
-    cos_TL_dev: cp.ndarray,             # (T, L)    fp32 — output
-) -> None:
-    """Per-iter_m M-step body — TDL-batch shape, GPU.
-
-    Mirrors :func:`m_step._kernels.fused_lambda_X_normalize_TDL_f32`.
-
-    For each (t, l):
-        col[d]  = kappa * X_dot_sl[t, d, l] + sigma_psi[d, l]
-        col_norm = sqrt(sum_d col[d]^2)
-        s_t_nu_new[t, d, l] = col[d] / col_norm
-        cos[t, l] = sum_d s_t_nu_new[t, d, l] * s_t_nu_old[t, d, l]
-
-    All vectorized via cupy primitives. Empty parcels (col_norm == 0)
-    yield NaN entries via 0 * inf — same as CPU and MATLAB.
-    """
-    # Pass 1: lambda_X (broadcast + add).
-    lambda_X = cp.float32(kappa_f32) * X_dot_sl_TDL_dev + sigma_psi_DL_dev
-    # col_norms over D axis: (T, L)
-    col_norms_TL = cp.sqrt((lambda_X ** 2).sum(axis=1))
-    # Normalize per (t, l): broadcast (T, 1, L)
-    inv_norm = cp.float32(1.0) / col_norms_TL          # (T, L); inf at empty parcels
-    cp.multiply(lambda_X, inv_norm[:, None, :], out=s_t_nu_new_TDL_dev)
-    # Cosine: per (t, l), sum_d new * old
-    cp.sum(s_t_nu_new_TDL_dev * s_t_nu_old_TDL_dev, axis=1, out=cos_TL_dev)
+def _grid(n: int, block: int) -> int:
+    return (int(n) + block - 1) // block
 
 
-# ─────────────────────────────────────────────────────────────────────────
-# spatial_xyz_prior kernel (GPU)
-# ─────────────────────────────────────────────────────────────────────────
-def spatial_xyz_compute_cupy(
-    sphere_xyz_unit_lh_dev: cp.ndarray,       # (n_lh, 3) fp32
-    sphere_xyz_unit_rh_dev: cp.ndarray,       # (n_lh, 3) fp32
-    sphere_xyz_unit_full_dev: cp.ndarray,     # (N, 3)    fp32 — for step 3
-    s_lambda_dev: cp.ndarray,                 # (N, L)    fp32
-    xyz_gamma_f32_dev: cp.ndarray,            # (L,) fp32
-    cdln_per_k_dev: cp.ndarray,               # (L,) fp32 (computed CPU-side via cdln_d3)
-    n_lh: int, L_lh: int,
-    s_muc_dev: cp.ndarray,                    # (3, L) fp32 — output
-    spatial_xyz_vmf_dev: cp.ndarray,          # (N, L) fp32 — output
-) -> None:
-    """GPU spatial_xyz_prior. Mirrors :class:`spatial_priors.XyzSession.compute`.
-
-    Block-diagonal LH-LH + RH-RH for steps 1+2. Step 3 + 5 are FULL
-    sgemm/elementwise. Cdln(xyz_gamma, 3) is supplied by the caller
-    (computed CPU-side via ``cdln_d3_to_f32``).
-    """
-    # Step 1: lambda_X = sphere.T @ s_lambda, block-diagonal.
-    s_lam_lh = s_lambda_dev[:n_lh, :L_lh]
-    s_lam_rh = s_lambda_dev[n_lh:, L_lh:]
-    lambda_X_lh = sphere_xyz_unit_lh_dev.T @ s_lam_lh   # (3, L_lh)
-    lambda_X_rh = sphere_xyz_unit_rh_dev.T @ s_lam_rh   # (3, L_lh)
-
-    # Step 2: column-normalize per hemi.
-    col_norms_lh = cp.sqrt((lambda_X_lh ** 2).sum(axis=0))   # (L_lh,)
-    col_norms_rh = cp.sqrt((lambda_X_rh ** 2).sum(axis=0))
-    s_muc_lh = lambda_X_lh / col_norms_lh                   # (3, L_lh)
-    s_muc_rh = lambda_X_rh / col_norms_rh
-    s_muc_dev[:, :L_lh] = s_muc_lh
-    s_muc_dev[:, L_lh:] = s_muc_rh
-
-    # Step 3: FULL sgemm sphere @ s_muc → vmf.
-    cp.matmul(sphere_xyz_unit_full_dev, s_muc_dev, out=spatial_xyz_vmf_dev)
-
-    # Step 5: assemble vmf = cdln + xyz_gamma * gamma_cos, then NaN → 0.
-    cp.multiply(spatial_xyz_vmf_dev, xyz_gamma_f32_dev,
-                 out=spatial_xyz_vmf_dev)
-    cp.add(spatial_xyz_vmf_dev, cdln_per_k_dev, out=spatial_xyz_vmf_dev)
-    finite = cp.isfinite(spatial_xyz_vmf_dev)
-    spatial_xyz_vmf_dev[:] = cp.where(finite, spatial_xyz_vmf_dev,
-                                        cp.float32(0.0))
+# ─────────────────────────────────────────────────────────────────────
+# Python wrappers. All arguments are device arrays unless noted.
+# ─────────────────────────────────────────────────────────────────────
+def zero_rows_packed(packed_TND: cp.ndarray, rows: cp.ndarray) -> None:
+    T, N, Db = packed_TND.shape
+    n_rows = int(rows.size)
+    if n_rows == 0:
+        return
+    total = T * n_rows * Db
+    _k("zero_rows_packed")((min(_grid(total, 256), 4096),), (256,),
+                           (packed_TND, np.int32(T), np.int32(N), np.int32(Db),
+                            rows, np.int32(n_rows)))
 
 
-# ─────────────────────────────────────────────────────────────────────────
-# spatial_connect_prior kernel (GPU)
-# ─────────────────────────────────────────────────────────────────────────
-def spatial_connect_compute_cupy(
-    grad_lh_dev: cp.ndarray,                  # (n_lh, D) fp32
-    grad_rh_dev: cp.ndarray,                  # (n_lh, D) fp32
-    grad_sq_norms_dev: cp.ndarray,            # (N,) fp32 — cached
-    s_lambda_dev: cp.ndarray,                 # (N, L) fp32
-    n_lh: int, L_lh: int, D: int,
-    u_dev: cp.ndarray,                        # (L, D) fp32 — output
-    spatial_connect_vmf_dev: cp.ndarray,      # (N, L) fp32 — output (cross-hemi pre-filled -Inf)
-) -> None:
-    """GPU spatial_connect_prior. Mirrors :class:`spatial_priors.ConnectSession.compute`.
-
-    Block-diagonal sgemm + closed-form distance via the gemm trick.
-    Cross-hemi cells of ``spatial_connect_vmf`` MUST be pre-filled with
-    ``-Inf`` by the caller (constant across calls).
-    """
-    s_lam_lh = s_lambda_dev[:n_lh, :L_lh]
-    s_lam_rh = s_lambda_dev[n_lh:, L_lh:]
-
-    # Step 1a: u_update = grad.T @ s_lambda (block-diag).
-    u_update_lh = grad_lh_dev.T @ s_lam_lh    # (D, L_lh)
-    u_update_rh = grad_rh_dev.T @ s_lam_rh    # (D, L_lh)
-    # Step 1b: sum_lambda per parcel + divide.
-    sum_lam_lh = s_lam_lh.sum(axis=0)         # (L_lh,)
-    sum_lam_rh = s_lam_rh.sum(axis=0)
-    # u[k, d] = u_update[d, k] / sum_lam[k]
-    u_dev[:L_lh] = (u_update_lh / sum_lam_lh).T
-    u_dev[L_lh:] = (u_update_rh / sum_lam_rh).T
-
-    # Step 2: cross = grad @ u.T (block-diag, written to vmf diagonal blocks).
-    u_lh = u_dev[:L_lh]
-    u_rh = u_dev[L_lh:]
-    cp.matmul(grad_lh_dev, u_lh.T, out=spatial_connect_vmf_dev[:n_lh, :L_lh])
-    cp.matmul(grad_rh_dev, u_rh.T, out=spatial_connect_vmf_dev[n_lh:, L_lh:])
-
-    # Step 3: u_sq_norms.
-    u_sq = (u_dev ** 2).sum(axis=1)           # (L,)
-
-    # Step 4: assemble vmf = -||grad||^2 + 2*cross - ||u||^2.
-    # Block-diagonal: only LH-LH and RH-RH cells. Cross-hemi cells stay -Inf
-    # (pre-filled at session __init__).
-    block_lh = spatial_connect_vmf_dev[:n_lh, :L_lh]
-    block_rh = spatial_connect_vmf_dev[n_lh:, L_lh:]
-    grad_sq_lh = grad_sq_norms_dev[:n_lh]
-    grad_sq_rh = grad_sq_norms_dev[n_lh:]
-    u_sq_lh = u_sq[:L_lh]
-    u_sq_rh = u_sq[L_lh:]
-    block_lh[:] = (cp.float32(2.0) * block_lh
-                    - grad_sq_lh[:, None] - u_sq_lh)
-    block_rh[:] = (cp.float32(2.0) * block_rh
-                    - grad_sq_rh[:, None] - u_sq_rh)
-    # NaN cleanup → -Inf (matches MATLAB)
-    NEG_INF = cp.float32(-cp.inf)
-    not_finite_lh = ~cp.isfinite(block_lh)
-    not_finite_rh = ~cp.isfinite(block_rh)
-    block_lh[:] = cp.where(not_finite_lh, NEG_INF, block_lh)
-    block_rh[:] = cp.where(not_finite_rh, NEG_INF, block_rh)
+def stnu_col_stats(stnu_TLD: cp.ndarray, S_TL: cp.ndarray,
+                   allzero_TL: cp.ndarray, anynan_TL: cp.ndarray,
+                   col_zero_L: cp.ndarray, col_nan_L: cp.ndarray) -> None:
+    T, L, D = stnu_TLD.shape
+    _k("stnu_col_stats")((T * L,), (256,),
+                         (stnu_TLD, np.int32(D), S_TL, allzero_TL, anynan_TL))
+    _k("combine_col_flags")((_grid(L, 128),), (128,),
+                            (allzero_TL, anynan_TL, np.int32(T), np.int32(L),
+                             col_zero_L, col_nan_L))
 
 
-def warmup() -> None:
-    """JIT-compile every CuPy operation with realistic dtypes/shapes.
+def acc_bits(lay: dict, packed_TND: cp.ndarray, row_mean: cp.ndarray,
+             row_inv: cp.ndarray, stnu_TLD: cp.ndarray, S_TL: cp.ndarray,
+             D: int, acc_out: cp.ndarray) -> None:
+    T, N, Db = packed_TND.shape
+    L = stnu_TLD.shape[1]
+    if Db > MAX_D_BYTES:
+        raise ValueError(
+            f"acc_bits: D_bytes > {MAX_D_BYTES} (D > {MAX_D_BYTES * 8}) "
+            f"not supported")
+    M = lay["M_active"]
+    _k("acc_bits")((_grid(M, 4),), (128,),
+                   (np.int32(M), lay["row_idx_active"], lay["row_ptr"], lay["col"],
+                    np.int32(T), np.int32(N), np.int32(Db), np.int32(D), np.int32(L),
+                    packed_TND, row_mean, row_inv, stnu_TLD, S_TL, acc_out))
 
-    CuPy compiles its ufuncs / reductions on first invocation per dtype
-    combo. The calls below force compilation upfront so the first real
-    call doesn't pay JIT cost. ~50 ms one-shot.
-    """
-    N, L, M_act, M1, P = 16, 8, 6, 6, 12
-    nbh = cp.zeros((M_act, M1), dtype=cp.int64)
-    nbh[0, 0] = 2
-    lam = cp.full((M_act, L), 1.0 / L, dtype=cp.float32)
-    rows = cp.array([0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5], dtype=cp.int64)
-    cols = cp.array([0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3], dtype=cp.int64)
-    V_lam = cp.zeros((M_act, L), dtype=cp.float32)
-    vlambda_potts_closeform_fused_cupy(nbh, lam, rows, cols, V_lam)
 
-    acc = cp.zeros((N, L), dtype=cp.float32)
-    kappa = cp.ones(L, dtype=cp.float32)
-    cdln_T = cp.zeros(L, dtype=cp.float32)
-    col_zero = cp.zeros(L, dtype=cp.bool_)
-    log_theta = cp.zeros((N, L), dtype=cp.float32)
-    Vlam = cp.zeros((M_act, L), dtype=cp.float32)
-    inv_idx = cp.full(N, -1, dtype=cp.int64)
-    inv_idx[:M_act] = cp.arange(M_act, dtype=cp.int64)
-    beta = cp.zeros(L, dtype=cp.float32)
-    scv = cp.zeros((N, L), dtype=cp.float32)
-    sxv = cp.zeros((N, L), dtype=cp.float32)
-    bmask = cp.ones((N, L), dtype=cp.float32)
-    s_lam = cp.zeros((N, L), dtype=cp.float32)
-    V_temp_out = cp.empty((N, L), dtype=cp.float32)
-    out = cp.empty((N, L), dtype=cp.float32)
-    fused_v_lambda_assemble_softmax_drift_cupy(
-        acc, kappa, cdln_T, col_zero, log_theta, 50.0,
-        Vlam, inv_idx, 10.0, beta, scv, sxv, bmask,
-        s_lam, V_temp_out, out,
-    )
+def row_poison(lay: dict, col_nan_L: cp.ndarray, out_M: cp.ndarray) -> None:
+    M = lay["M_active"]
+    _k("row_poison_k")((_grid(M, 256),), (256,),
+                       (np.int32(M), lay["bm_row_ptr"], lay["bm_col"], col_nan_L, out_M))
+
+
+class EStepWorkspace:
+    """Scratch for the λ-iteration: row sums + fp64 block partials."""
+
+    BLOCK = 256
+
+    def __init__(self, M: int):
+        self.M = int(M)
+        self.nblocks = _grid(self.M, self.BLOCK)
+        self.row_sum = cp.empty(self.M, dtype=cp.float32)
+        self.partials = cp.empty(self.nblocks, dtype=cp.float64)
+        self.scalar = cp.empty(1, dtype=cp.float64)
+        self.host = cp.cuda.alloc_pinned_memory(8)
+        self.host_np = np.frombuffer(self.host, dtype=np.float64, count=1)
+
+
+def estep_iteration(lay: dict, ws: EStepWorkspace,
+                    lam: cp.ndarray, acc: cp.ndarray, kappa_f32: cp.ndarray,
+                    cdln_T: cp.ndarray, col_zero: cp.ndarray, log_theta: cp.ndarray,
+                    w: float, c: float, beta: cp.ndarray, scv: cp.ndarray,
+                    sxv: cp.ndarray, bm: cp.ndarray, row_poison_M: cp.ndarray,
+                    V_temp: cp.ndarray, out: cp.ndarray) -> float:
+    """One λ-iteration; returns ``mean(|out - lam|)`` over N·L (fp64).
+
+    Performs one device→host copy (the drift scalar)."""
+    M = lay["M_active"]
+    M1 = int(lay["neighborhood"].shape[1])
+    _k("row_sum_k")((ws.nblocks,), (ws.BLOCK,), (np.int32(M), lay["row_ptr"], lam, ws.row_sum))
+    _k("estep_k")((ws.nblocks,), (ws.BLOCK,),
+                  (np.int32(M), lay["row_ptr"], lay["col"], lay["neighborhood"], np.int32(M1),
+                   lam, ws.row_sum, acc, kappa_f32, cdln_T, col_zero, log_theta,
+                   np.float32(w), np.float32(np.float32(2.0) * np.float32(c)),
+                   beta, scv, sxv, bm, row_poison_M, V_temp, out, ws.partials))
+    _k("reduce_partials_d")((1,), (1024,), (ws.partials, np.int32(ws.nblocks), ws.scalar))
+    ws.scalar.get(out=ws.host_np)
+    return float(ws.host_np[0]) / float(lay["N"] * lay["L"])
+
+
+def argmax_labels(lay: dict, lam: cp.ndarray, labels_N: cp.ndarray) -> None:
+    N = lay["N"]
+    _k("argmax_labels_k")((_grid(N, 256),), (256,),
+                          (np.int32(N), lay["inv_active"], lay["row_ptr"], lay["col"],
+                           lam, labels_N))
+
+
+def connect_prior(lay: dict, p_row_m: cp.ndarray, lam: cp.ndarray, grad: cp.ndarray,
+                  grad_sq: cp.ndarray, u: cp.ndarray, u_sq: cp.ndarray,
+                  scv: cp.ndarray) -> None:
+    L = lay["L"]; P = lay["P"]
+    Dg = int(grad.shape[1])
+    _k("connect_u_k")((L,), (128,),
+                      (np.int32(L), np.int32(Dg), lay["col_ptr"], lay["csc_row"],
+                       lay["csc_pidx"], lam, grad, u, u_sq))
+    _k("connect_scv_k")((_grid(P, 256),), (256,),
+                        (np.int32(P), p_row_m, lay["row_idx_active"], lay["col"], np.int32(Dg),
+                         grad, grad_sq, u, u_sq, scv))
+
+
+def xyz_prior(lay: dict, p_row_m: cp.ndarray, lam: cp.ndarray, sphere: cp.ndarray,
+              gamma_f64: cp.ndarray, s_muc: cp.ndarray, cdln3: cp.ndarray,
+              gamma_f32: cp.ndarray, sxv: cp.ndarray) -> None:
+    L = lay["L"]; P = lay["P"]
+    _k("xyz_muc_k")((L,), (128,),
+                    (np.int32(L), lay["col_ptr"], lay["csc_row"], lay["csc_pidx"], lam,
+                     sphere, gamma_f64, s_muc, cdln3, gamma_f32))
+    _k("xyz_sxv_k")((_grid(P, 256),), (256,),
+                    (np.int32(P), np.int32(L), p_row_m, lay["row_idx_active"], lay["col"],
+                     sphere, s_muc, cdln3, gamma_f32, sxv))
+
+
+class EMStopWorkspace:
+    BLOCK = 256
+
+    def __init__(self, P: int):
+        self.nblocks = _grid(int(P), self.BLOCK)
+        self.partials = cp.empty(self.nblocks, dtype=cp.float64)
+        self.scalar = cp.empty(1, dtype=cp.float64)
+        self.host = cp.cuda.alloc_pinned_memory(8)
+        self.host_np = np.frombuffer(self.host, dtype=np.float64, count=1)
+
+
+def em_stop_cost(lay: dict, ws: EMStopWorkspace, acc: cp.ndarray, kappa_f32: cp.ndarray,
+                 cdln: cp.ndarray, T: int, lam: cp.ndarray, log_theta_cost: cp.ndarray,
+                 V_temp: cp.ndarray, scv: cp.ndarray, w: float, c: float,
+                 beta: cp.ndarray) -> float:
+    """fp64 cost over P; also rewrites non-finite ``scv`` to the floor."""
+    P = lay["P"]
+    _k("em_stop_k")((ws.nblocks,), (ws.BLOCK,),
+                    (np.int32(P), lay["col"], acc, kappa_f32, cdln, np.float32(T), lam,
+                     log_theta_cost, V_temp, scv, np.float64(w), np.float64(c), beta,
+                     np.float32(LOG_EPS_POW20), np.float64(LOG_EPS_POW20), ws.partials))
+    _k("reduce_partials_d")((1,), (1024,), (ws.partials, np.int32(ws.nblocks), ws.scalar))
+    ws.scalar.get(out=ws.host_np)
+    return float(ws.host_np[0])
+
+
+def intra_psi(stnu_TLD: cp.ndarray, sigma: cp.ndarray, epsil: cp.ndarray, mu_LD: cp.ndarray,
+              s_psi_new_LD: cp.ndarray, summed_LD: cp.ndarray,
+              per_col1: cp.ndarray, per_col2: cp.ndarray) -> None:
+    T, L, D = stnu_TLD.shape
+    _k("intra_psi_k")((L,), (256,),
+                      (np.int32(T), np.int32(L), np.int32(D), stnu_TLD, sigma, epsil, mu_LD,
+                       s_psi_new_LD, summed_LD, per_col1, per_col2))
+
+
+def broadcast_mu(mu_LD: cp.ndarray, stnu_TLD: cp.ndarray) -> None:
+    T, L, D = stnu_TLD.shape
+    LD = L * D
+    _k("broadcast_mu_k")((min(_grid(LD, 256), 4096),), (256,),
+                         (np.int32(T), np.int64(LD), mu_LD, stnu_TLD))
+
+
+def scatter_dense(lay: dict, p_row_m: cp.ndarray, x_P: cp.ndarray, dense_NL: cp.ndarray) -> None:
+    P = lay["P"]
+    _k("scatter_dense_k")((_grid(P, 256),), (256,),
+                          (np.int32(P), p_row_m, lay["row_idx_active"], lay["col"],
+                           np.int32(lay["L"]), x_P, dense_NL))
+
+
+def p_row_m_of(lay: dict) -> cp.ndarray:
+    """(P,) int32 — active-row index m of each CSR entry."""
+    row_ptr = cp.asnumpy(lay["row_ptr"])
+    counts = np.diff(row_ptr)
+    return cp.asarray(np.repeat(np.arange(lay["M_active"], dtype=np.int32), counts))
+
+
+__all__ = [
+    "module", "zero_rows_packed", "stnu_col_stats", "acc_bits", "row_poison",
+    "EStepWorkspace", "estep_iteration", "argmax_labels", "connect_prior",
+    "xyz_prior", "EMStopWorkspace", "em_stop_cost", "intra_psi", "broadcast_mu",
+    "scatter_dense", "p_row_m_of",
+]

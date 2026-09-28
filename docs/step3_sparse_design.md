@@ -1,14 +1,20 @@
-# Step 3 `gpu_sparse` backend — design contract
+# Step 3 `gpu` backend — design contract
 
-Working spec for the candidate-set (P-layout) rewrite of the single-subject
-step-3 EM. Everything below is the contract shared by the kernel modules;
-the numerical reference is always the **CPU backend** (`backend='cpu'`,
-numba kernels under `arealmshbm/{vmf_clustering,V_lambda,m_step,
-spatial_priors,em_stop_criterion,check_connectedness}`), not `gpu_full`.
+Working spec for the candidate-set (P-layout) step-3 GPU backend
+(`backend_step3='gpu'`, the single-subject EM). Everything below is the
+contract shared by the kernel modules; the numerical reference is always
+the **CPU backend** (`backend='cpu'`, numba kernels under
+`arealmshbm/{vmf_clustering,V_lambda,m_step,spatial_priors,
+em_stop_criterion,check_connectedness}`). `gpu` requires seed_mesh
+fsaverage3 (`ceil(D/8) ≤ 256`); any other seed mesh is rejected at
+config / driver validation — select `backend_step3='cpu'` for it.
+Every backend requires w > 0 (`w·log θ` is NaN outside supp(θ) at
+w = 0).
 
 ## 0. Why
 
-Measured on sub-001 (fsaverage6, T=6, L=300, D=1175), `gpu_full`:
+Measured 2026-09-03 on sub-001 (fsaverage6, T=6, L=300, D=1175) on the
+dense CuPy EM (`gpu_full`, every (N, L) buffer dense, fp32 BOLD):
 
 | stage | wall | calls | per call |
 |---|---:|---:|---:|
@@ -33,9 +39,9 @@ Layout arrays: see `arealmshbm/vmf_clustering/sparse_layout.py`
 
 | name | shape / dtype | notes |
 |---|---|---|
-| `bold_packed` | `(T, N, D_bytes)` uint8 | **on-disk layout, no transpose**; MW rows zeroed; bit `d` ↔ bit `(d & 7)` of byte `d >> 3` (LSB-first). `D_bytes = ceil(D/8) ≤ MAX_D_BYTES = 256` (`sparse_layout.py`; `acc_bits` gives its 32 lanes `ACC_MAXB = 8` bytes each) — checked by `fetch_packed_bold_TND`, the session ctor and the `acc_bits` wrapper |
+| `bold_packed` | `(T, N, D_bytes)` uint8 | **on-disk layout, no transpose**; MW rows zeroed; bit `d` ↔ bit `(d & 7)` of byte `d >> 3` (LSB-first). `D_bytes = ceil(D/8) ≤ MAX_D_BYTES = 256` (`sparse_layout.py`; `acc_bits` gives its 32 lanes `ACC_MAXB = 8` bytes each) — checked by `fetch_packed_bold_TND`, the `acc_bits` wrapper and the `x_dot_sl_bits` wrapper (`m_step_gpu.py`) |
 | `row_mean` | `(T, N)` fp32 | `fp32(fp64(popcount) / fp64(D))` |
-| `row_inv` | `(T, N)` fp32 | `fp32(1 / sqrt(pop - D·mean²))` computed in fp64 (same as `_normalize_bold_bitpacked_kernel`); **0 when `pop ∈ {0, D}`** (the `has_zero` gate ⇒ the row is identically zero) |
+| `row_inv` | `(T, N)` fp32 | `fp32(1 / sqrt(pop - D·mean²))` computed in fp64 (same as the CPU `_normalize_session_bitpacked_numba`, `data_io/bitpacked_norm.py`); **0 when `pop ∈ {0, D}`** (the `has_zero` gate ⇒ the row is identically zero) |
 | `grad` | `(N, Dg)` fp32, `grad_sq (N,)` fp32 | gMSHBM |
 | `sphere_unit` | `(N, 3)` fp32 | `compute_unit_sphere_xyz` |
 | `lh_nbors`, `rh_nbors` | `(M1, n_hemi)` int32 | 1-indexed, 0 = absent (mesh `vertexNbors`) |
@@ -111,7 +117,7 @@ drift       += Σ |out − curr|  (fp64)         (else Σ curr)
 V_temp[p]    = V[m,k]
 ```
 Row poisoning: if `col_nan[l]` for any `l` in the **boundary-mask
-support** of row m (not just P), the dense kernel produces NaN `rsum`
+support** of row m (not just P), the dense CPU kernel produces NaN `rsum`
 ⇒ whole row 0. Mirror it via `bm_row_ptr/bm_col` (only evaluated when
 `any(col_nan)`). `checklam = drift / (N·L)`; converged when
 `|checklam_new − checklam_old| ≤ ε`. V_lambda is bit-identical to the
@@ -139,15 +145,25 @@ Empty parcels: `cn = 0 ⇒ inv_cn = inf ⇒ new = NaN` (IEEE, no trapping).
 `u[l,:] = (Σ_{n∈members(l)} sl·grad[n,:]) / Σ sl` (NaN if empty),
 `scv[p] = 2·(grad[n]·u[l]) − grad_sq[n] − Σ_d u[l,d]²`, NaN → −Inf.
 
-### 2.5 spatial_xyz (after every check_connectedness)
+### 2.5 spatial_xyz (after every check_connectedness; cMSHBM also once per em_iter before the comp loop)
 
 `lambda_X[:,l] = Σ_{n∈members(l)} sl·sphere[n,:]`, `s_muc = lambda_X / ‖·‖`
-(NaN if 0), `cdln3(γ)` = closed form of `spatial_priors/_cdln.py`
-(NaN at γ ≤ 0), `sxv[p] = cdln3[l] + γ[l]·(sphere[n]·s_muc[l])`, NaN → 0.
+(NaN if 0), `cdln3(γ)` = closed form of Cdln(γ, 3),
+log γ − γ + ½log 2π − log1p(−e^{−2γ}) (NaN at γ ≤ 0), `sxv[p] = cdln3[l] + γ[l]·(sphere[n]·s_muc[l])`, NaN → 0.
 
-### 2.6 check_connectedness (after every λ-loop when `iter_em ≥ 2`)
+### 2.6 check_connectedness (after every λ-loop when `iter_em ≥ first_em_iter_with_conn_xyz`: 2 for gMSHBM, 1 for cMSHBM)
 
 `labels[n] = 1 + argmax_{l∈P(n)} sl` (first max), 0 if the row sums to 0.
+cMSHBM first applies `remove_isolated_surface_components` to those
+labels on device (`ConnectednessGPU.remove_isolated`: hook-to-min
+components of the label-restricted graph, members threaded into per-root
+linked lists, one block per component smaller than
+`cMSHBM_isolated_component_min_size` histograms its neighbours' labels
+excluding 0 and its own and takes the most frequent, smallest on ties;
+every vote reads the entry-state labels and the counts are integers, so
+the result is order-invariant and bit-identical to the host function
+applied per hemisphere, at a cost flat in the threshold; the cleaned
+copy stays internal, as on the CPU chain).
 Then exactly `compute_components_general` + `component_distance`
 (`arealmshbm/check_connectedness`), producing `parcel_components (L,)
 fp64 (NaN if empty)` and `eucli (L,) fp32`; then
@@ -181,40 +197,78 @@ only below the length at which its pairwise summation starts blocking.
 
 * Unit: each kernel vs its CPU counterpart on sub-001 data
   (`arealmshbm/vmf_clustering/tests/_sub001_fixture.py`).
-* End-to-end: labels of `gpu_sparse` vs `cpu` and vs `gpu_full` on
-  sub-001…003; the accepted band is the documented CPU↔GPU drift
-  (17–500 vertices per subject, `docs/step3_flow_and_subgraphs.md`).
-* Determinism: two `gpu_sparse` runs must be `np.array_equal` on labels
+* End-to-end: labels of `gpu` vs `cpu` on sub-001…003; the reference
+  drift is the one measured in `docs/step3_flow_and_subgraphs.md`
+  § `gpu` (3 / 35 / 1334 / 122 vertices on sub-001 / YS 1–3).
+* Determinism: two `gpu` runs must be `np.array_equal` on labels
   and on `s_lambda`.
-* Cohort ground truth: on an internal 10-subject cohort, `gpu_sparse`
+
+The ground-truth records below are dated; arms named `gpu_full` are the
+dense CuPy EM measured alongside `gpu` on the same inputs. Pooled over
+cohorts the two are fidelity-equivalent, not uniformly ordered (of the
+cells below, cMSHBM YS is the one where the dense arm is ahead).
+
+* Cohort ground truth: on an internal 10-subject cohort, `gpu`
   labels agree with the stock-MATLAB reference (produced by an
   internal MATLAB-alignment oracle) at **gMSHBM 95.19 %** and
   **dMSHBM 99.988 %** cortex-only (measured 2026-09-04 on this tree,
   GPU step 0/1). Same run, `gpu_full`: 95.12 % / 99.984 %; clean
-  8cb68a0 `gpu_full`: 95.13 % / 99.984 %. Label delta `gpu_sparse` vs
+  8cb68a0 `gpu_full`: 95.13 % / 99.984 %. Label delta `gpu` vs
   `gpu_full`: dMSHBM 50 vertices over 10 subjects; gMSHBM 3 115, of
   which 2 074 sit in the one subject that also dominates the step-0
   GPU run-to-run band (2 297 of 2 614 between two clean-HEAD runs).
-  On a Mode-B prior trained by step-2 `gpu_sparse`, the GT agreement
+  On a Mode-B prior trained by step-2 `gpu`, the GT agreement
   is 74.90 % vs 74.92 % for `gpu_full` on the same prior.
   `lib/hyperparameters/step3.json` points here for it.
+* cMSHBM (2026-09-20, the device `remove_isolated` pre-predicate; same
+  step-0/1 caches for every arm, scored by the internal cohort-comparison
+  harness against the stock-MATLAB reference on the three 10-subject
+  cohorts; stock cMSHBM itself crashes
+  on 3 of the 30 subjects, so those cells are 9 / 8): cortex agreement
+  `gpu` **99.35 / 98.42 / 98.13 %** (YS / ds004466 / ds000221) vs
+  `gpu_full` 99.42 / 98.26 / 98.08 % and `cpu` 99.25 / 98.28 / 98.17 %.
+  Label delta `gpu` vs `cpu`: 2 093 / 3 820 / 4 542 vertices over
+  the 10 subjects (`gpu_full` vs `cpu` on the same inputs: 2 264 / 2 309 /
+  5 079); `gpu` vs `gpu_full`: 1 883 / 3 155 / 1 584. Sub-001 of
+  YS and ds004466 is identical on all three backends. The device
+  pre-pass itself is bit-identical to the host function
+  (`check_connectedness/tests/test_connectedness_gpu.py`, 4 thresholds on
+  grids + 9 sub-001 label fields with up to 1 643 relabelled vertices).
 
-## 4. Results (2026-09-03, sub-001, RTX 5090 Laptop)
+## 4. Results (sub-001, RTX 5090 Laptop; 2026-09-03 unless dated)
 
-| | before (`gpu_full`) | `gpu_sparse` |
+| | dense GPU EM (`gpu_full`) | `gpu` |
 |---|---:|---:|
 | load_inputs | 0.57 s | 0.16–0.20 s (streaming MAT parse via `data_io/mat5_stream.py`, θ→CSR, no dense mask, no BOLD transpose) |
 | session_init (warm) | 0.86 s | 0.02–0.04 s |
 | EM | 4.0 s | 0.10 s |
 | λ-iteration | 19 ms | 0.15 ms |
 | check_connectedness | 4.3 ms | 0.16 ms |
-| M-step call (incl. X·s_λ) | 50 ms | 2.5 ms |
+| check_connectedness, cMSHBM (with the `remove_isolated` pre-pass; 2026-09-24) | 18-27 ms (host pre-pass 14-23 ms) | 0.27 ms (pre-pass 0.12 ms at 400-1 600 small components) |
+| M-step call (incl. X·s_λ; mean per `MStepGPU.run` over a full EM run; 2026-09-03, staged `x_dot_sl_bits`) | 50 ms | 2.5 ms |
 
-Validation: kernel tests (`vmf_clustering/tests/test_kernels_gpu_sparse.py`,
-`m_step/tests/test_m_step_gpu_sparse.py`,
+`x_dot_sl_bits` (2026-09-20): the kernel text is the one shared with step 2
+(`m_step/_xdot_kernel.py` — member bytes are read straight from global memory
+with a 4-deep `__ldg` prefetch instead of being staged in shared memory;
+member weights (still) and row ids (new) are staged per 64-member chunk in
+`XDOT_CHUNK * 8` B of dynamic shared memory, with the same two `__syncthreads`
+per chunk; still 128 threads × 2 bytes here, which keeps the fp64 B-term tree
+unchanged), uint32-identical to the shared-memory-staged form, which is the
+oracle in `m_step/tests/test_m_step_gpu.py`, instantiated at both
+consumers' geometries (the B tree spans `blockDim.x` lanes, so 128 × 2 and
+256 × 1 are not bit-comparable to each other; a cancellation fixture there
+makes the B-term order visible, which the sub-001 inputs do not). Same
+session on sub-001: `x_dot_sl_bits` 1.55 → 0.80 ms per launch; standalone
+`MStepGPU.run` calls on the fixture inputs (θ as s_λ, μ as s_ψ and as the
+initial s_t_ν; mean of 5 warm calls after a warm-up) 3.45 → 2.73 ms. That is a
+different workload (inner-iteration count) from the table's per-call EM mean
+above, which was not re-measured, so the two are not comparable.
+
+Validation: kernel tests (`vmf_clustering/tests/test_kernels_gpu.py`,
+`m_step/tests/test_m_step_gpu.py`,
 `check_connectedness/tests/test_connectedness_gpu.py`,
 `step3_pipeline/tests/test_sparse_inputs.py`) + the end-to-end
-`vmf_clustering/tests/test_gpu_sparse_session.py`; backend A/B via an
+`vmf_clustering/tests/test_session_gpu.py`; backend A/B via an
 internal step-3 comparison harness. Two gotchas found on the
 way: cupy's fp32 elementwise kernels (`log`, even `astype`) flush
 denormals — θ carries a few 1e-45 cells, so `log(θ)` is taken on the

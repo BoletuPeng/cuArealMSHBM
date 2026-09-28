@@ -15,9 +15,8 @@ and the cohort.json write is performed by
 [`pipeline/cohort_writer.py`](../arealmshbm/pipeline/cohort_writer.py)
 at the end of the step-1 phase. The per-stage wall-time report at
 [`step1_pipeline/profile.py`](../arealmshbm/step1_pipeline/profile.py)
-calls those same module functions directly. (The MATLAB-GT
-`validate.py` gate was retired when the pipeline decoupled from
-MATLAB; regression now rides on the out-of-tree ICC scorer.)
+calls those same module functions directly. (Regression rides on the
+out-of-tree ICC scorer; there is no in-tree MATLAB-GT gate.)
 
 ## The whole flow
 
@@ -33,7 +32,7 @@ pipeline.Pipeline._run_step1_all_subjects()                    [arealmshbm/pipel
 │
 ├── run_generate_profiles(seed_mesh, targ_mesh, sub, sess, …)  pipeline/step1_runners.py → generate_profiles
 │   ├── gpu: generate_subject_profiles_gpu (one call per subject) generate_profiles/profiles_subject_gpu.py
-│   │   ├── batched nvCOMP GIFTI ingest, raw (T, n_lh+n_rh)    data_io/gifti_bold_gpu.iter_subject_bold_gpu(raw_sessions=True)
+│   │   ├── batched nvCOMP GIFTI ingest, (T, n_lh+n_rh) fp32   data_io/gifti_bold_gpu.iter_subject_bold_gpu
 │   │   │   (pinned readinto → H2D → GPU bytescan + base64 →
 │   │   │    one Deflate batch per 2-session group, own streams)
 │   │   ├── per session, all on device:
@@ -44,24 +43,22 @@ pipeline.Pipeline._run_step1_all_subjects()                    [arealmshbm/pipel
 │   │   │   ├── exact k-th order statistic (radix histogram)   _kernels_gpu.exact_kth_smallest_cupy (3 streaming passes)
 │   │   │   └── binarize + MW-zero + pack → slab t of          _kernels_gpu.binarize_mwzero_pack_cupy
 │   │   │       device (n_sess, N, ⌈K/8⌉) uint8
+│   │   ├── on_packed(t, slab): slab t folded into the cohort   avg_profiles_gpu.PackedProfileAccumulator.add
+│   │   │   sums on device, before it ever leaves the GPU
 │   │   ├── per-session pinned D2H of slab t (event-gated)
 │   │   └── .b2nd streamed one chunk (= session) at a time on  data_io/profile_io.SubjectProfileStreamWriter
 │   │       a background thread; .wait() joins the last slab
-│   │   (no nvCOMP ⇒ same leaf, CPU-reader ingest: read_surface_gifti
-│   │    (time_major, strict b64) on an 8-worker pool → pinned
-│   │    (T, n_lh+n_rh) → H2D. Same accepted files, same bytes, so the
-│   │    artifacts are identical by construction; the verbose line
-│   │    says which ingest ran)
 │   └── cpu: stage pipeline (unchanged)                        pipeline/_step1_stage_pipeline.py
 │       ├── parallel BOLD reads (.func.gii, numba b64 + isal)  data_io/gifti_io.read_surface_gifti
 │       ├── seed_select, zscore, MKL GEMM, nan_to_zero, sum    generate_profiles/_kernels.py (numba)
 │       ├── threshold_top_fraction (introselect), binarize     np.partition / numba
 │       └── per-subject .b2nd writer                           data_io/profile_io.write_subject_profile_tnd
 │
-├── run_avg_profiles(…, packed_subjects, D)                     pipeline/step1_runners.py → avg_profiles
-│   ├── gpu: avg_profiles_from_packed_gpu                      avg_profiles/avg_profiles_gpu.py
-│   │   ├── packed slabs from ``packed_sink`` (no .b2nd re-read) H2D once per subject
-│   │   ├── fused bit-unpack + accumulate (no atomics), scale   RawKernel accum_packed_session_NhDb
+├── run_avg_profiles(…, accumulator)                            pipeline/step1_runners.py → avg_profiles
+│   ├── gpu: avg_profiles_from_accumulator                     avg_profiles/avg_profiles_gpu.py
+│   │   ├── sums already on device: the leaf's on_packed hook   RawKernel accum_packed_session_NhDb
+│   │   │   folded every session in as it was packed (no       (fused bit-unpack + accumulate, no atomics)
+│   │   │   .b2nd re-read, no H2D); scale in place
 │   │   ├── one pinned D2H shared with the writer               AvgProfilesResult.lh_avg / rh_avg (host)
 │   │   └── .npy pair write on a background thread              AvgProfilesResult.writer.wait() joins
 │   │   returns lh_avg_dev / rh_avg_dev (device fp32) for subgraph 3
@@ -142,13 +139,14 @@ arealmshbm/
 │   │                                        binarize+MW-zero+pack
 │   ├── profiles.py                          CPU supercall (per session)
 │   └── profiles_subject_gpu.py              fused WHOLE-SUBJECT GPU leaf (the GPU path;
-│                                            owns its ingest, nvCOMP or CPU reader)
+│                                            batched nvCOMP ingest)
 │
 ├── avg_profiles/                            # subgraph 2 — sum/divide across sub × sess
 │   ├── _kernels.py                          numba CPU: accum_inplace, scale_inplace
 │   ├── avg_profiles.py                      CPU supercall + dispatch shim (returns AvgProfilesResult)
-│   └── avg_profiles_gpu.py                  GPU supercall: disk-reading avg_profiles_gpu +
-│                                            memory-side avg_profiles_from_packed_gpu
+│   └── avg_profiles_gpu.py                  GPU supercall: PackedProfileAccumulator (the leaf's
+│                                            on_packed hook) + avg_profiles_from_accumulator; the
+│                                            disk-reading avg_profiles_gpu feeds the same accumulator
 │
 ├── ini_params/                              # subgraph 3 — vMF init from group labels
 │   ├── _kernels.py                          numba CPU kernels
@@ -211,50 +209,47 @@ supercall):
 * `generate_subject_profiles_gpu` (the GPU entry, one call per
   subject): raw-session ingest → per session one zscore launch over
   all `n_lh + n_rh` columns (a zero-variance column is written as
-  exact `0.0f`, which is what `nan_to_num` produced after the retired
-  `+inf` normaliser — so that pass is gone) → one cuBLAS sgemm
+  exact `0.0f`, the value `nan_to_num` gives an `+inf`-normalised
+  column, so no separate `nan_to_num` pass runs) → one cuBLAS sgemm
   `(K, T) @ (T, n_full)` → exact k-th order statistic by a three-pass
   radix histogram over an order-preserving uint32 key
   (`np.partition`-identical, and with no permutation buffer, unlike
   `cp.partition`) → fused binarize + MW-zero + pack into slab `t` of a
   device `(n_sess, N, ⌈K/8⌉)` buffer → per-session pinned D2H →
-  background `.b2nd` write. The packed payload is bit-identical to the
-  per-session GPU leaf this replaced, whose algorithm now lives only
-  as the oracle in `test_subject_profiles_gpu.py` — an empirical fact
+  background `.b2nd` write. The packed payload is bit-identical to a
+  per-session, per-hemi-sgemm oracle kept in `test_subject_profiles_gpu.py`
+  — an empirical fact
   at the production shape (two per-hemi sgemms plus `nan_to_num`
   against one whole-subject sgemm), which is why it stays pinned. The
   path is fp32 only, so a non-`float32` `profile_dtype_reduce` is
   rejected rather than ignored.
 
-  **Ingest** is the leaf's own choice, made once from
-  `_nvcomp_batched.nvcomp_available()` and reported as `.ingest` on
-  the result (the runner prints it in the per-subject line): batched
-  nvCOMP device decode when the library is installed,
-  `read_surface_gifti(time_major=True, allow_wrapped_b64=False)` on
-  an 8-worker pool (up to 4 pairs ahead, ramped from one; assembled
-  into a pooled pinned block; H2D on the producer thread's cached
-  stream) when it is not. The strict flag makes the two ingests accept
-  the same files — a line-wrapped payload is refused on both, not
-  read on one machine and rejected on another — and
-  `test_gifti_readers.py` pins the two readers byte-equal at the
-  `(T, n_lh+n_rh)` boundary, so the compute cannot tell them apart
-  and the artifacts are identical by construction — no fallback
-  numerics, no dropped memory hand-off. The CPU-reader ingest still
-  pays a per-subject start-up bubble (one file's decode before the
-  first session lands, ~0.13 s at fsaverage6/T=242); a cross-subject
-  prefetch would remove it but would restructure the runner for the
-  no-nvCOMP case only, so it is not done.
-* `avg_profiles_from_packed_gpu`: takes the packed slabs straight from
-  `run_generate_profiles(packed_sink=…)`, accumulates on device
-  (`accum_packed_session_NhDb`, integer-exact fp32), does one pinned
-  D2H shared with the background `.npy` writer, and hands the device
-  means (`lh_avg_dev` / `rh_avg_dev`) to subgraph 3. The disk-reading
-  `avg_profiles_gpu` remains for cohorts run subgraph by subgraph, and
-  clears the device fields so the pool can reclaim them.
+  **Ingest** is the batched nvCOMP device decode
+  (`gifti_bold_gpu.iter_subject_bold_gpu`), full
+  stop: `nvidia-nvcomp-cu12` is a hard dependency of the GPU backend.
+  A missing or unloadable install is an `ImportError`, raised by
+  `prewarm_step1_gpu` before step 0 on the driver path (at ingest for
+  a direct leaf call). A CPU-reader ingest (`read_surface_gifti` on an
+  8-worker pool + H2D, byte-identical output) measured 0.56 s/subject
+  against nvCOMP's 0.17 s (2026-09-18). `test_gifti_readers.py` pins the
+  device reader byte-equal to the CPU backend's reader at the
+  `(T, n_lh+n_rh)` boundary.
+* `PackedProfileAccumulator` + `avg_profiles_from_accumulator`: the
+  accumulator is the leaf's `on_packed` hook, so every session is
+  folded into the `(V_h, D)` device sums from the slab the pack kernel
+  just wrote (`accum_packed_session_NhDb`, integer-exact fp32) — the
+  packed bytes never leave the GPU for the average and no subject is
+  held past its `.b2nd` write, whatever the cohort size. The finalize
+  scales in place, does one pinned D2H shared with the background
+  `.npy` writer, and hands the device means (`lh_avg_dev` /
+  `rh_avg_dev`) to subgraph 3. The disk-reading `avg_profiles_gpu`
+  feeds the same accumulator from decoded `.b2nd` files for cohorts run
+  subgraph by subgraph, and clears the device fields so the pool can
+  reclaim them.
 * `ini_params_gpu`: device means → concat + fp64 widen on device →
   row-demean+L2 (RawKernel) → `groupsum_csr_cupy` (parcel CSR, rows
-  summed in ascending order — bit-exact vs the numba kernel; the dense
-  one-hot dgemm is gone) → `colnorm_scale_cupy` (numpy's `sum(axis=0)`
+  summed in ascending order — bit-exact vs the numba kernel, no dense
+  one-hot dgemm) → `colnorm_scale_cupy` (numpy's `sum(axis=0)`
   order) → `epsil_input_rowdot_cupy` (one dot per row against its own
   parcel column; replaces the second dgemm plus its `(N, L)`
   intermediate and the gather) → scalar D2H for `invAd` (scipy Bessel
@@ -337,6 +332,15 @@ picks up the kernel-only wins (mesh CSR from `vertexNbors`,
 disk-mediated flow.
 
 ## Wall
+
+**2026-09-26, cohort host memory (40-subject reference cohort, driver step 1,
+gpu, prewarmed).** The cohort average is now accumulated on device
+inside the profile leaf (`on_packed`) instead of from pageable copies
+of every subject's packed slab retained until `avg_profiles` and
+re-uploaded: peak host working set 5.61 → 2.42 GiB. The wall was
+9.8 → 8.8 s on one run of each tree, which says "not slower" and no
+more (no noise band was measured); every step-1/2/3 artifact is
+bit-identical to merge-base 4cd6fe1.
 
 **Pre-2026-09 cohort numbers.** They predate the fused GPU chain
 measured in the single-subject table above; the per-subgraph GPU

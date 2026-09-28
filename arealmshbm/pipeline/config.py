@@ -73,8 +73,7 @@ PipelineMode = Literal["modeA_single", "modeA_batch", "modeB_train_prior"]
 PipelineVariant = Literal["gMSHBM", "cMSHBM", "dMSHBM"]
 _VALID_MODES = ("modeA_single", "modeA_batch", "modeB_train_prior")
 _VALID_VARIANTS = ("gMSHBM", "cMSHBM", "dMSHBM")
-_VALID_BACKENDS_STEP012 = ("cpu", "gpu")
-_VALID_BACKENDS_STEP3 = ("cpu", "gpu_elambda", "gpu_full", "gpu_sparse")
+_VALID_BACKENDS = ("cpu", "gpu")
 _VALID_NUM_CLUSTERS = (100, 200, 300, 400, 500, 600, 700, 800, 900, 1000)
 _VALID_EMB_FORMATS = ("npy", "mat", "both")
 _VALID_DTYPES = ("float32", "float64")
@@ -101,11 +100,7 @@ _VALID_SPLIT_FLAGS = ("0",)
 class Step0Knobs:
     """Step 0 internal knobs (mirror Step0Config algorithm fields).
 
-    ``enable_tf32`` is the step-scoped cuBLAS TF32 toggle (was
-    ``enable_tf32_step0`` at the top level until 2026-06; relocated
-    into this block so Mode A configs — which still include step0 —
-    naturally carry it, and so the catalog's ``step0.json`` owns the
-    field end-to-end rather than referring to a top-level field).
+    ``enable_tf32`` is the step-scoped cuBLAS TF32 toggle.
     Only ``fc_similarity`` dispatches through cuBLAS sgemm inside step0
     — other GPU leaves are unaffected. Has effect only when
     ``backend_step0 == 'gpu'``.
@@ -135,11 +130,10 @@ class Step1Knobs:
     """Step 1 leaf-default knobs (mirror step1_runners.* kwargs).
 
     Inclusion criterion: precision / iteration / radius knobs the user
-    is plausibly tuning between runs. Kernel-internal precision dtypes
-    (``run_generate_profiles.profile_dtype_reduce`` and
-    ``run_radius_mask.dtype``, both pinned at fp32 by validated CBIG
-    convention) are intentionally NOT exposed — the runners' positional
-    defaults stay authoritative for them.
+    is plausibly tuning between runs. The kernel-internal precision
+    dtype ``run_generate_profiles.profile_dtype_reduce`` (pinned at fp32
+    by validated CBIG convention) is intentionally NOT exposed — the
+    runner's positional default stays authoritative for it.
     """
     threshold: float
     split_flag: Literal["0"]
@@ -215,9 +209,8 @@ class PipelineConfig:
     # Per-step internal knob bundles. Required by mode:
     #   Mode A — step0 + step1 + step3 (step2 is None)
     #   Mode B — step0 + step1 + step2 + step3 (all non-None)
-    # The cuBLAS TF32 toggle lives INSIDE the step0 block
-    # (``step0.enable_tf32``; top-level until 2026-06). Step 2 has none:
-    # its GPU backend makes one cuBLAS call per run.
+    # The cuBLAS TF32 toggle lives inside the step0 block
+    # (``step0.enable_tf32``).
     step0: Step0Knobs
     step1: Step1Knobs
     step2: Optional[Step2Knobs]
@@ -237,9 +230,7 @@ _STEP2_KEYS = frozenset(Step2Knobs.__dataclass_fields__.keys())
 _STEP3_KEYS = frozenset(Step3Knobs.__dataclass_fields__.keys())
 
 # Campaign-spanning top-level keys, present in every mode. step{N}
-# block names are added per mode via _MODE_REQUIRED_BLOCKS. The
-# ``enable_tf32`` toggle lives INSIDE the step0 block (relocated
-# 2026-06), not at top level.
+# block names are added per mode via _MODE_REQUIRED_BLOCKS.
 _TOP_LEVEL_BASE_KEYS = frozenset({
     "schema_version", "mode", "variant", "num_clusters", "beta_scalar",
     "w", "c", "n_grad_components",
@@ -446,12 +437,6 @@ def _parse_step2(raw: Dict[str, Any]) -> Step2Knobs:
             f"pipeline_config.json: step2 must be an object "
             f"(got {type(raw).__name__})"
         )
-    if "enable_tf32" in raw:
-        raise ValueError(
-            "pipeline_config.json: step2.enable_tf32 was removed with the "
-            "dense CuPy step-2 port (2026-09); the 'gpu' backend has no "
-            "TF32 mode. Delete the key (step0.enable_tf32 stays)."
-        )
     _check_unknown_keys(raw, _STEP2_KEYS, "step2")
     return Step2Knobs(
         max_iter_inter=_need_in(raw, "step2", "max_iter_inter", int),
@@ -526,15 +511,8 @@ def _parse_step3(raw: Dict[str, Any]) -> Step3Knobs:
 # than mid-pipeline when the driver builds a Step{N}Config and
 # __post_init__ rejects.
 #
-# Reviewer round 2 flagged the "edit two places to add a range check"
-# duplication as drift risk and suggested a shared helper. We
-# considered it but kept the small (~10 lines/step) duplication
-# because the cleanest shared-helper factoring required
-# pipeline/config.py to import range-check functions from
-# step{N}_pipeline/, coupling the package layers in a way that hurts
-# more than the duplication saves. The two call sites of each check
-# are adjacent and the maintenance task is "change two nearby
-# functions when adding a range check" — low cognitive load.
+# Kept next to Step{N}Config.__post_init__ on purpose: importing those
+# range checks here would couple the packages.
 #
 # Note the threshold range check below is HARD — it's documented as
 # an exception to the advisory ``range_policy`` in
@@ -623,29 +601,6 @@ def read_pipeline_config(path: Path | str) -> PipelineConfig:
         )
 
     sv = raw.get("schema_version")
-    if sv == "1":
-        raise ValueError(
-            "pipeline_config.json: schema_version '1' is no longer supported. "
-            "Migrate to schema_version '2' — every per-step internal knob "
-            "must now be nested under step0 / step1 / step2 / step3 objects "
-            "AND explicitly set (v2 has no default fallback). See "
-            "projects/sample_modeB/pipeline_config.json (Mode B), "
-            "projects/sample_modeA_single/pipeline_config.json (Mode A, K=1), "
-            "or projects/sample_modeA_batch/pipeline_config.json (Mode A, K>=1) "
-            "for complete v2 examples; lib/hyperparameters/step{N}.json "
-            "lists the recommended starting value of each field. "
-            "v2 also (i) hard-restricts num_clusters to the Schaefer-2018 "
-            "atlas resolutions {100, 200, ..., 1000} — v1 silently let step1 "
-            "FileNotFoundError on any other N — (ii) rejects unknown keys "
-            "at parse time (including underscore-prefixed comment fields "
-            "like _comment / _notes / _todo; drop those before migrating), "
-            "(iii) is mode-aware about which step blocks must be present "
-            "(Mode A configs MUST NOT contain a step2 block; Mode B configs "
-            "MUST contain all four), and (iv) moves the cuBLAS TF32 toggle "
-            "from top-level ``enable_tf32_step0`` into the step0 block as "
-            "``step0.enable_tf32`` (``enable_tf32_step2`` has no v2 "
-            "equivalent: step 2's GPU backend has no TF32 mode)."
-        )
     if sv != "2":
         raise ValueError(
             f"pipeline_config.json: schema_version must be '2' (got {sv!r})"
@@ -688,17 +643,15 @@ def read_pipeline_config(path: Path | str) -> PipelineConfig:
     variant = _enum(raw, "variant", _VALID_VARIANTS)
     num_clusters = _enum(raw, "num_clusters", _VALID_NUM_CLUSTERS)
     beta_scalar = _need(raw, "beta_scalar", int, positive=True)
-    w = _need(raw, "w", int)
+    w = _need(raw, "w", int, positive=True)
     c = _need(raw, "c", int)
     n_grad_components = _need(raw, "n_grad_components", int, positive=True)
-    if w < 0:
-        raise ValueError(f"pipeline_config.json: w must be >= 0 (got {w})")
     if c < 0:
         raise ValueError(f"pipeline_config.json: c must be >= 0 (got {c})")
-    backend_step0 = _enum(raw, "backend_step0", _VALID_BACKENDS_STEP012)
-    backend_step1 = _enum(raw, "backend_step1", _VALID_BACKENDS_STEP012)
-    backend_step2 = _enum(raw, "backend_step2", _VALID_BACKENDS_STEP012)
-    backend_step3 = _enum(raw, "backend_step3", _VALID_BACKENDS_STEP3)
+    backend_step0 = _enum(raw, "backend_step0", _VALID_BACKENDS)
+    backend_step1 = _enum(raw, "backend_step1", _VALID_BACKENDS)
+    backend_step2 = _enum(raw, "backend_step2", _VALID_BACKENDS)
+    backend_step3 = _enum(raw, "backend_step3", _VALID_BACKENDS)
 
     if variant == "cMSHBM" and mode == "modeB_train_prior":
         raise NotImplementedError(
@@ -733,21 +686,6 @@ def read_pipeline_config(path: Path | str) -> PipelineConfig:
                 f"memory); got {n_grad_components}. Use "
                 f"backend_step2='cpu'."
             )
-
-    if variant == "cMSHBM" and backend_step3 == "gpu_sparse":
-        raise ValueError(
-            "pipeline_config.json: backend_step3='gpu_sparse' does not "
-            "implement cMSHBM's pre-E-step isolated-vertex removal. Use "
-            "'gpu_full' or 'cpu' for cMSHBM."
-        )
-
-    if w == 0 and backend_step3 == "gpu_sparse":
-        raise ValueError(
-            "pipeline_config.json: backend_step3='gpu_sparse' requires "
-            "w > 0. The candidate-set E-step only visits supp(theta), so "
-            "it matches the dense E-step only while the w*log(theta) term "
-            "is active; use 'gpu_full' or 'cpu' for w=0."
-        )
 
     # Step blocks: parse only those the mode requires. step2 is the
     # only one Mode A omits — that branch sets step2_knobs to None on

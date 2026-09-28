@@ -122,7 +122,7 @@ def _em_loop(
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Dense backends ('cpu' / 'gpu')
+# CPU ('cpu') backend
 # ─────────────────────────────────────────────────────────────────────
 def vmf_clustering_batch(
     Params: Dict[str, np.ndarray],
@@ -173,7 +173,7 @@ def em_body_sparse(
     """The EM body for one intra-EM iteration on the sparse backend.
 
     Same loop as :func:`vmf_clustering_batch`, driven through the §4
-    Session API instead of the dense duck-typed one:
+    Session API instead of the CPU Step2EmIterSession one:
 
     * no ``refresh_s_psi_sigma``: ``sigma`` / ``s_psi`` never leave the
       device, so the reset the caller did (``sess.reset_inter()``) is

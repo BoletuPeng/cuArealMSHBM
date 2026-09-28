@@ -38,14 +38,12 @@ from arealmshbm.step2_io import (
 # ─────────────────────────────────────────────────────────────────────
 # Reference normalize impl — test-only.
 #
-# Production no longer ships a host fp32-input normalize kernel: the
-# only in-tree normalize path is the fused bitpacked-input
+# The only in-tree normalize path is the fused bit-packed-input
 # ``_widen_normalize_bitpacked_to_f32_NTD_kernel`` in
-# ``arealmshbm/step2_io/load_subject_profiles.py``. This local 3-pass
-# numba kernel exists ONLY to validate that fused kernel by comparing
-# against the equivalent fp32-input demean + L2-norm. fp32 sequential
-# summation matches the bit-identical contract documented at the
-# production kernel.
+# ``arealmshbm/step2_io/load_subject_profiles.py``; this local 3-pass
+# kernel is its test oracle (fp32-input demean + L2-norm, fp32
+# sequential summation — the bit-identical contract documented at the
+# production kernel).
 # ─────────────────────────────────────────────────────────────────────
 @njit(cache=True, fastmath=False, boundscheck=False,
       error_model="numpy", parallel=True)

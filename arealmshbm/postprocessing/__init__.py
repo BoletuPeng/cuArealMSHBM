@@ -3,11 +3,11 @@
 Surface-label post-processing leaves used by step 3.
 
 Public API:
-    remove_isolated_surface_components(lh_labels, rh_labels, lh_mesh,
-                                       rh_mesh, abs_threshold=5)
-        — relabel each connected component of vertices sharing a parcel
-          label whose size is below ``abs_threshold``, by mode-vote of
-          its neighbours' labels.
+    remove_isolated_surface_components(labels, vertex_nbors, abs_threshold=5)
+        -> new_labels
+        — one hemisphere at a time: relabel each connected component of
+          vertices sharing a parcel label whose size is below
+          ``abs_threshold``, by mode-vote of its neighbours' labels.
 
 Used by the cMSHBM variant in two places:
     1. inside ``check_connectedness`` (per comp_iter), before the
@@ -17,7 +17,11 @@ Used by the cMSHBM variant in two places:
 
 Both invocations use ``abs_threshold`` configurable via
 ``Step3Config.cMSHBM_isolated_component_min_size`` (default 5). The
-gMSHBM and dMSHBM variants do not invoke this leaf.
+gMSHBM and dMSHBM variants do not invoke this leaf. The ``gpu``
+backend runs invocation 1 on device
+(:meth:`arealmshbm.check_connectedness.connectedness_gpu.ConnectednessGPU.remove_isolated`,
+bit-identical to this function); invocation 2 is this function on every
+backend.
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """

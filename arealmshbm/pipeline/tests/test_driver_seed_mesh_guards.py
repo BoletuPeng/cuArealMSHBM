@@ -1,11 +1,11 @@
 # Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
-"""The driver's early ``seed_mesh`` guards for the P-layout GPU backends
-(step 2 ``'gpu'``, step 3 ``'gpu_sparse'``).
+"""test_driver_seed_mesh_guards.py — the driver's early ``seed_mesh``
+guards for the P-layout ``'gpu'`` backends of step 2 and step 3.
 
 Both bake a compile-time ``ceil(D/8) <= 256`` limit,
 which only ``seed_mesh='fsaverage3'`` satisfies. Step 2's rule lives in
-``Step2Config.__post_init__`` and step 3's in the ``gpu_sparse`` session
-ctor — but neither sees ``seed_mesh`` (it comes from
+``Step2Config.__post_init__`` and step 3's in the packed-BOLD loader of
+the ``gpu`` backend — but neither sees ``seed_mesh`` (it comes from
 ``bold_inputs.json``) and both fire only after steps 0-1 (step 3: 0-2)
 have already burned minutes of wall time. ``Pipeline.__init__`` therefore
 re-checks it in ``_validate_inputs_vs_config``, alongside the other
@@ -45,7 +45,7 @@ def _write_project(root: Path, *, mode_a: bool, seed_mesh: str,
         json.dumps(cfg), encoding="utf-8")
     (project / "bold_inputs.json").write_text(json.dumps({
         "schema_version": "1",
-        "dataset_name": "sparse_guard_fixture",
+        "dataset_name": "seed_mesh_guard_fixture",
         "targ_mesh": "fsaverage6",
         "seed_mesh": seed_mesh,
         # Mode A wants exactly 1 subject, Mode B at least 2.
@@ -58,21 +58,23 @@ def _write_project(root: Path, *, mode_a: bool, seed_mesh: str,
     return project
 
 
-def test_step3_gpu_sparse_rejects_non_fsaverage3_mode_a(
+def test_step3_gpu_rejects_non_fsaverage3_mode_a(
         tmp_path: Path) -> None:
     project = _write_project(tmp_path, mode_a=True, seed_mesh="fsaverage4",
-                             backend_step3="gpu_sparse")
-    with pytest.raises(ValueError, match=r"backend_step3='gpu_sparse'.*"
-                                         r"seed_mesh='fsaverage3'"):
+                             backend_step3="gpu")
+    with pytest.raises(ValueError, match=r"backend_step3='gpu' requires.*"
+                                         r"seed_mesh='fsaverage3'.*"
+                                         r"Use backend_step3='cpu'"):
         Pipeline(project)
 
 
-def test_step3_gpu_sparse_rejects_non_fsaverage3_mode_b(
+def test_step3_gpu_rejects_non_fsaverage3_mode_b(
         tmp_path: Path) -> None:
     """Step 3 runs in Mode B too, so the guard must not be Mode-A only."""
     project = _write_project(tmp_path, mode_a=False, seed_mesh="fsaverage4",
-                             backend_step3="gpu_sparse")
-    with pytest.raises(ValueError, match=r"backend_step3='gpu_sparse'"):
+                             backend_step3="gpu")
+    with pytest.raises(ValueError, match=r"backend_step3='gpu' requires.*"
+                                         r"seed_mesh='fsaverage3'"):
         Pipeline(project)
 
 
@@ -96,7 +98,7 @@ def test_mode_a_ignores_backend_step2_gpu(tmp_path: Path) -> None:
 def test_fsaverage3_passes_both_guards(tmp_path: Path, mode_a: bool) -> None:
     """With the canonical seed mesh both guards are silent and
     construction succeeds."""
-    backends = {"backend_step3": "gpu_sparse"}
+    backends = {"backend_step3": "gpu"}
     if not mode_a:
         backends["backend_step2"] = "gpu"
     project = _write_project(tmp_path, mode_a=mode_a, seed_mesh="fsaverage3",

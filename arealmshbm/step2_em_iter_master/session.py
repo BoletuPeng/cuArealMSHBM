@@ -45,7 +45,6 @@ from ._kernels import (
 
 def _validate_session_ctor_args(
     *,
-    cls_name: str,
     mode: str,
     bold_loader,
     grad_loader,
@@ -62,19 +61,11 @@ def _validate_session_ctor_args(
 ) -> None:
     """Up-front validation of the :class:`Step2EmIterSession` ctor
     contract. Raises on the first mismatch; never mutates inputs.
-
-    ``cls_name`` threads the calling class's name into the cMSHBM
-    NotImplementedError message — preserved from the per-class ctors so
-    the user still sees which Session refused the mode.
-
-    Layout / dtype coercion (``np.ascontiguousarray`` / ``astype``) stays
-    in the per-class ctor: the CPU path lands the bytes in a host
-    scratch, the GPU path H2D's into a device cache, and the validator
-    has no business deciding which.
+    Layout / dtype coercion stays in the ctor.
     """
     if mode == "cMSHBM":
         raise NotImplementedError(
-            f"{cls_name}: mode='cMSHBM' is not wired (no "
+            "Step2EmIterSession: mode='cMSHBM' is not wired (no "
             "xyz-vMF path in the master kernel)."
         )
     if mode not in ("gMSHBM", "dMSHBM"):
@@ -107,7 +98,7 @@ def _validate_session_ctor_args(
     if mode == "gMSHBM":
         if grad_loader is None:
             raise ValueError("mode='gMSHBM' requires grad_loader")
-        # Mirror the per-class ctor's coercion exactly: gate on the raw
+        # Mirror the ctor's coercion exactly: gate on the raw
         # ``D_grad > 0`` (not ``int(D_grad) > 0``) so fractional inputs
         # produce the same effective value here as in the ctor's
         # ``self.D_grad`` assignment. Production passes positive ints so
@@ -260,8 +251,7 @@ class Step2EmIterSession:
         "_n_alive_count_N",        # (N,)   int32 — Phase D per-vertex alive count
         # Output scalar from last run_iter (per-subject cost).
         "_cost_S",
-        # Host mtc cache (for reset_s_t_nu_from_mtc — the GPU mirror
-        # caches on device; on CPU we hold a host reference).
+        # Host mtc cache for reset_s_t_nu_from_mtc.
         "_mtc_LD_cached",
     )
 
@@ -288,7 +278,6 @@ class Step2EmIterSession:
         max_iter_m: int = 50,
     ):
         _validate_session_ctor_args(
-            cls_name="Step2EmIterSession",
             mode=mode,
             bold_loader=bold_loader, grad_loader=grad_loader,
             num_sub=num_sub, N=N, T=T, D=D, D_grad=D_grad,
@@ -422,10 +411,9 @@ class Step2EmIterSession:
     def upload_initial_state(self, Params: Dict[str, np.ndarray]) -> None:
         """Stage initial Params into Session-owned scratch + rebind aliases.
 
-        On CPU this is the existing zero-copy aliasing: after this call
-        ``Params['s_t_nu']``, ``Params['s_lambda']``, and
-        ``Params['theta']`` ARE the Session-owned buffers (no per-iter
-        memcpy). The GPU mirror does an H2D instead.
+        Zero-copy aliasing: after this call ``Params['s_t_nu']``,
+        ``Params['s_lambda']``, and ``Params['theta']`` ARE the
+        Session-owned buffers (no per-iter memcpy).
         """
         _validate_initial_state_params(
             Params, self.S, self.T, self.N, self.L, self.D,
@@ -440,9 +428,8 @@ class Step2EmIterSession:
     def cache_mtc(self, mtc_LD: np.ndarray) -> None:
         """Cache the host ``mtc`` (L, D) used by :meth:`reset_s_t_nu_from_mtc`.
 
-        The CPU path holds a host reference (no copy); the GPU mirror
-        H2Ds the array to a device cache once. Same method name on both
-        classes; the pipeline calls it once after Session construction.
+        Holds a host reference (no copy); the pipeline calls it once
+        after Session construction.
         """
         mtc = np.ascontiguousarray(mtc_LD, dtype=np.float32)
         if mtc.shape != (self.L, self.D):
@@ -452,9 +439,8 @@ class Step2EmIterSession:
     def reset_s_t_nu_from_mtc(self) -> None:
         """In-place broadcast of cached mtc into ``s_t_nu``.
 
-        On CPU this writes the Session-owned ``_s_t_nu_A_STLD`` buffer
-        (= aliased ``Params['s_t_nu']``). The GPU mirror does the same
-        broadcast on device. Must call :meth:`cache_mtc` first.
+        Writes the Session-owned ``_s_t_nu_A_STLD`` buffer (= aliased
+        ``Params['s_t_nu']``). Must call :meth:`cache_mtc` first.
         """
         if self._mtc_LD_cached is None:
             raise RuntimeError(

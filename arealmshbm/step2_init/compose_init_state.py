@@ -15,7 +15,6 @@ Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """
 from __future__ import annotations
 
-import os
 from concurrent.futures import ThreadPoolExecutor
 from typing import Tuple
 
@@ -42,18 +41,8 @@ from ._kernels import (
 # pump ~190 MB of in-flight I/O — comfortably below the OS read-ahead
 # window. Going past 4 is empirically wasted (blosc2 decode CPU starts
 # to compete with the main-thread numba kernels at 24-core saturation).
-# Override via ``MSHBM_STEP2_INIT_PREFETCH_WORKERS`` env var.
 # ─────────────────────────────────────────────────────────────────────
-def _default_prefetch_workers() -> int:
-    env = os.environ.get("MSHBM_STEP2_INIT_PREFETCH_WORKERS")
-    if env:
-        try:
-            n = int(env)
-            if n >= 1:
-                return n
-        except ValueError:
-            pass
-    return 4
+_PREFETCH_WORKERS = 4
 
 
 def compose_init_state(bold_loader: SubjectProfileLoader,
@@ -131,8 +120,8 @@ def compose_init_state(bold_loader: SubjectProfileLoader,
     #     each load_into goes back to disk. We can't prefetch into a
     #     shared cache, but we CAN parallelize the per-sub
     #     disk-read+widen+normalize across worker scratches and run
-    #     argmax sequentially on the main thread. n_workers+1 (N, T, D)
-    #     fp32 scratch slabs (~3.85 GB transient at fsa6/T=6/n=4) —
+    #     argmax sequentially on the main thread. n_workers (N, T, D)
+    #     fp32 scratch slabs (~3.1 GB transient at fsa6/T=6/n=4) —
     #     released when compose_init_state returns.
     #
     # The widen+normalize kernel itself is numba-parallel (24-thread
@@ -150,10 +139,9 @@ def compose_init_state(bold_loader: SubjectProfileLoader,
     cache_mode = getattr(bold_loader, "cache_mode", None)
     has_prefetch = (cache_mode == "eager_bitpacked"
                     and hasattr(bold_loader, "prefetch_packed"))
-    n_workers_req = _default_prefetch_workers()
-    n_workers = min(n_workers_req, S)
+    n_workers = min(_PREFETCH_WORKERS, S)
 
-    if has_prefetch and n_workers > 1:
+    if has_prefetch:
         # ── Path A: bitpacked-cache prefetch + warm widen+argmax ──
         bold_scratch_NTD = np.empty((N, T, D), dtype=np.float32)
         with ThreadPoolExecutor(
@@ -178,11 +166,14 @@ def compose_init_state(bold_loader: SubjectProfileLoader,
                     bold_scratch_NTD, g_mu_f32,
                     hard_label_SN[s], medial_SN[s],
                 )
-    elif n_workers > 1:
+    else:
         # ── Path B: per-worker scratch + parallel full-decode ──
-        # n_workers+1 scratches: up to n_workers in-flight reads, one
-        # active for main-thread argmax. Slot recycling via free-stack.
-        n_slots = n_workers + 1
+        # One (N, T, D) fp32 scratch per worker. A slot is handed back
+        # to the free-stack after the main-thread argmax and only then
+        # is the next decode submitted into it, so at most n_workers
+        # scratches are ever live: n_workers-1 decoding while one is
+        # being argmaxed.
+        n_slots = n_workers
         scratches = [np.empty((N, T, D), dtype=np.float32)
                      for _ in range(n_slots)]
         free_slots = list(range(n_slots))
@@ -218,15 +209,6 @@ def compose_init_state(bold_loader: SubjectProfileLoader,
                         _decode_into, next_to_submit + 1, new_slot,
                     )
                     next_to_submit += 1
-    else:
-        # Degenerate path (n_workers=1 or S=1). One scratch, sequential
-        # load + argmax. Preserved for tests and the env-var override.
-        bold_scratch_NTD = np.empty((N, T, D), dtype=np.float32)
-        for s in range(S):
-            bold_loader.load_into(s + 1, bold_scratch_NTD)
-            profile_to_hard_labels_kernel(
-                bold_scratch_NTD, g_mu_f32, hard_label_SN[s], medial_SN[s],
-            )
 
     # Step 2 — compose. np.zeros is calloc-backed → most pages stay
     # lazy (unmapped) since the kernel sparse-writes (only S*N ≈ 246k

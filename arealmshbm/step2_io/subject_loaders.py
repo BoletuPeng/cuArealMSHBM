@@ -21,7 +21,7 @@ the manifest, the loader raises at construction.
 BOLD: per-subject bitpacked ``.b2nd`` (only on-disk format supported).
 
 Gradient: per-hemi ``.npy`` (preferred, step0 output) or per-hemi
-``.mat`` (legacy CBIG output); the loader sniffs the suffix on the
+``.mat`` (CBIG MATLAB output); the loader sniffs the suffix on the
 cohort.json path and routes accordingly.
 
 Both loaders return per-subject **internal-layout** arrays matching
@@ -48,12 +48,12 @@ import numpy as np
 from arealmshbm.data_io.cohort import (
     CohortManifest, resolve_path,
 )
+from arealmshbm.data_io.fetch_data import read_gradient_emb
 from arealmshbm.data_io.profile_io import open_subject_profile_packed_tnd
 
 from .load_subject_profiles import (
     _widen_normalize_bitpacked_to_f32_NTD_kernel,
 )
-from .load_subject_gradient import _read_emb_100
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -386,9 +386,10 @@ class SubjectGradientLoader:
 
     Constructed from a :class:`CohortManifest` + ``project_dir``. Each
     subject's gradient paths come from ``gradient_lh`` / ``gradient_rh``
-    fields in the cohort. The loader sniffs the suffix to pick a
-    reader: ``.npy`` (preferred, step0 output) reads via ``np.load``;
-    ``.mat`` (legacy CBIG output) reads via ``_read_emb_100``.
+    fields in the cohort. Both ``.npy`` (step0 output) and ``.mat``
+    (CBIG MATLAB output) read through
+    :func:`arealmshbm.data_io.fetch_data.read_gradient_emb`; ``dims``
+    peeks the ``.npy`` header without loading the payload.
 
     Subject indexing is **1-based by position** in the manifest's
     ``subjects`` list.
@@ -469,8 +470,8 @@ class SubjectGradientLoader:
             self._dims_cache = (N_d, self.n_components)
             return self._dims_cache
         # .mat
-        lh = _read_emb_100(lh_p, self.n_components)
-        rh = _read_emb_100(rh_p, self.n_components)
+        lh = read_gradient_emb(lh_p, self.n_components)
+        rh = read_gradient_emb(rh_p, self.n_components)
         self._dims_cache = (int(lh.shape[0] + rh.shape[0]), self.n_components)
         return self._dims_cache
 
@@ -499,97 +500,23 @@ class SubjectGradientLoader:
             raise ValueError(
                 f"out shape {out.shape} != ({T}, {N}, {D_grad})")
 
+        self.read_stacked_into(s, out[0])
+        # Replicate across the T axis. T memcopies at ~20 GB/s; ~30 ms
+        # at fsa6/T=6 (negligible vs the GEMM cost downstream).
+        for t in range(1, T):
+            out[t] = out[0]
+
+    def read_stacked_into(self, s: int, out: np.ndarray) -> None:
+        """Write subject ``s``'s (1-based) ``(N, D_grad)`` gradient into
+        ``out``: the lh rows, then the rh rows.
+        """
+        N, D_grad = self.dims()
         lh_p, rh_p = self._grad_paths[s - 1]
-        if self.format == "npy":
-            lh = np.ascontiguousarray(
-                np.load(lh_p)[:, :D_grad], dtype=np.float32
-            )
-            rh = np.ascontiguousarray(
-                np.load(rh_p)[:, :D_grad], dtype=np.float32
-            )
-        else:
-            lh = _read_emb_100(lh_p, D_grad)
-            rh = _read_emb_100(rh_p, D_grad)
+        lh = read_gradient_emb(lh_p, D_grad)
+        rh = read_gradient_emb(rh_p, D_grad)
         if lh.shape[0] + rh.shape[0] != N:
             raise ValueError(
                 f"sub {s}: lh+rh rows {lh.shape[0]+rh.shape[0]} != N={N}"
             )
-        stacked = np.concatenate([lh, rh], axis=0)  # (N, D_grad)
-
-        # Replicate across the T axis. T memcopies at ~20 GB/s; ~30 ms
-        # at fsa6/T=6 (negligible vs the GEMM cost downstream).
-        for t in range(T):
-            out[t] = stacked
-
-
-# ─────────────────────────────────────────────────────────────────────
-# In-memory loader adapters — wrap a full (S, N, T, D) / (S, T, N, D_grad)
-# array in RAM as a streaming loader. Used by tests / benches that build
-# synthetic data in RAM without going through disk.
-# ─────────────────────────────────────────────────────────────────────
-class InMemoryProfileLoader:
-    """Adapter that wraps an in-memory ``(S, N, T, D)`` fp32 array as a
-    :class:`SubjectProfileLoader`. ``load_into(s, out)`` does one
-    ``np.copyto`` from ``arr[s-1]`` into ``out``. Useful for unit tests
-    + the numerical-match harness that already build a synthetic
-    BOLD stack in RAM.
-    """
-
-    def __init__(self, bold_SNTD: np.ndarray, num_session: int):
-        if bold_SNTD.ndim != 4:
-            raise ValueError(
-                f"bold_SNTD must be 4D (S, N, T, D); got {bold_SNTD.shape}")
-        if bold_SNTD.dtype != np.float32:
-            raise ValueError(
-                f"bold_SNTD must be fp32; got {bold_SNTD.dtype}")
-        self._arr = bold_SNTD
-        self.num_sub = int(bold_SNTD.shape[0])
-        self.num_session = int(num_session)
-        if self.num_session != int(bold_SNTD.shape[2]):
-            raise ValueError(
-                f"num_session {self.num_session} != bold_SNTD.shape[2] "
-                f"{bold_SNTD.shape[2]}")
-        self.format = "in_memory"
-
-    def dims(self) -> Tuple[int, int, int]:
-        S, N, T, D = self._arr.shape
-        return (int(N), int(T), int(D))
-
-    def load(self, s: int) -> np.ndarray:
-        return np.ascontiguousarray(self._arr[s - 1])
-
-    def load_into(self, s: int, out: np.ndarray) -> None:
-        np.copyto(out, self._arr[s - 1])
-
-
-class InMemoryGradientLoader:
-    """Adapter that wraps an in-memory ``(S, T, N, D_grad)`` fp32 array
-    as a :class:`SubjectGradientLoader`. Same contract — one
-    ``np.copyto`` per ``load_into`` call.
-    """
-
-    def __init__(self, grad_STND: np.ndarray, num_session: int):
-        if grad_STND.ndim != 4:
-            raise ValueError(
-                f"grad_STND must be 4D (S, T, N, D_grad); got {grad_STND.shape}")
-        if grad_STND.dtype != np.float32:
-            raise ValueError(
-                f"grad_STND must be fp32; got {grad_STND.dtype}")
-        self._arr = grad_STND
-        self.num_sub = int(grad_STND.shape[0])
-        self.num_session = int(num_session)
-        if self.num_session != int(grad_STND.shape[1]):
-            raise ValueError(
-                f"num_session {self.num_session} != grad_STND.shape[1] "
-                f"{grad_STND.shape[1]}")
-        self.format = "in_memory"
-
-    def dims(self) -> Tuple[int, int]:
-        S, T, N, D_grad = self._arr.shape
-        return (int(N), int(D_grad))
-
-    def load(self, s: int) -> np.ndarray:
-        return np.ascontiguousarray(self._arr[s - 1])
-
-    def load_into(self, s: int, out: np.ndarray) -> None:
-        np.copyto(out, self._arr[s - 1])
+        out[:lh.shape[0]] = lh
+        out[lh.shape[0]:] = rh

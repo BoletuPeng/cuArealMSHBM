@@ -12,8 +12,8 @@ device-stay one.
 
 Two rules: handing :func:`read_surface_gifti` the very pool whose
 worker is calling it would deadlock (detected, demoted to serial), and
-``allow_wrapped_b64=None`` (default) falls back to ``base64.b64decode``
-per refused chunk, so line-wrapped payloads still read. The decode's
+a chunk the strict base64 kernel refuses falls back to
+``base64.b64decode``, so line-wrapped payloads still read. The decode's
 own layout is ``(T, N)`` (one darray per row); ``time_major=True``
 returns it as is, the default transposes to ``(N, T)``.
 
@@ -30,17 +30,13 @@ from typing import List, Optional, Tuple, Union
 import numpy as np
 
 from arealmshbm.data_io._gifti_kernels import (
-    B64_ERR_LEN, B64_TABLE, b64_decode_strict, copy_row_f32, transpose_f32,
+    B64_TABLE, b64_decode_strict, copy_row_f32, transpose_f32,
 )
 
-# Optional Intel ISA-L zlib. Same gating pattern as fetch_data.py.
-# isal_zlib.decompress is a drop-in for stdlib zlib.decompress with
-# AVX/AVX-512 acceleration on the GIFTI chunks (~165 KB each, ~242
-# chunks per file).
-try:
-    from isal import isal_zlib as _zlib
-except ImportError:  # pragma: no cover — isal is in the env
-    import zlib as _zlib  # type: ignore[no-redef]
+# Intel ISA-L zlib: a drop-in for stdlib zlib.decompress with AVX /
+# AVX-512 inflate on the GIFTI chunks (~165 KB each, ~242 per file). A
+# hard dependency -- there is no stdlib fallback to a slower inflate.
+from isal import isal_zlib as _zlib
 
 PathLike = Union[str, Path]
 
@@ -72,23 +68,6 @@ _DA_OPEN = b"<DataArray"
 _DATA_OPEN = b"<Data>"
 _DATA_CLOSE = b"</Data>"
 _LEN_DATA_CLOSE = len(_DATA_CLOSE)
-
-
-def _decode_one_chunk(b64gz: bytes, n_expected: int) -> np.ndarray:
-    """base64 → isal-zlib decompress → (N,) fp32 view of the result.
-
-    Both decode steps release the GIL on inputs of this size (~165 KB),
-    so concurrent calls from a thread pool actually run in parallel.
-    """
-    raw = base64.b64decode(b64gz)
-    buf = _zlib.decompress(raw)
-    arr = np.frombuffer(buf, dtype=np.float32)
-    if arr.shape[0] != n_expected:
-        raise ValueError(
-            f"GIFTI darray length {arr.shape[0]} != expected {n_expected}; "
-            f"Dim0 disagrees with decoded byte count"
-        )
-    return arr
 
 
 def _scan_gifti_spans(data: bytes, path):
@@ -236,58 +215,27 @@ def _scan_gifti_spans(data: bytes, path):
 # ─────────────────────────────────────────────────────────────────────
 # CPU reader — GIL-free decode (numba base64 + isal + numba transpose)
 # ─────────────────────────────────────────────────────────────────────
-def _decode_chunk_range(
-    buf, starts, lens, stage, N, path,
-    t0, t1, allow_wrapped_b64,
-):
+def _decode_chunk_range(buf, starts, lens, stage, N, path, t0, t1):
     """Decode timepoints ``[t0, t1)`` into rows of the ``(T, N)`` stage.
 
     One scratch buffer per call, so concurrent tasks share no state.
+    The strict numba base64 kernel decodes a canonical single-line
+    payload in place; a chunk it refuses (line-wrapped, pretty-printed,
+    odd length) goes through ``base64.b64decode`` instead, which keeps
+    the accepted-input set of the pre-kernel reader.
     """
     if t1 <= t0:
         return
     scratch = np.empty(int(lens[t0:t1].max()) // 4 * 3 + 3, dtype=np.uint8)
     expected_bytes = N * 4
     for t in range(t0, t1):
-        if allow_wrapped_b64 is True:
-            # Permissive route: binascii silently strips whitespace.
+        n_raw = b64_decode_strict(
+            B64_TABLE, buf, int(starts[t]), int(lens[t]), scratch, 0)
+        if n_raw < 0:
             raw = _zlib.decompress(
                 base64.b64decode(bytes(buf[starts[t]:starts[t] + lens[t]])),
                 15, expected_bytes)
         else:
-            n_raw = b64_decode_strict(
-                B64_TABLE, buf, int(starts[t]), int(lens[t]), scratch, 0)
-            if n_raw < 0:
-                if allow_wrapped_b64 is None:
-                    # Auto (the default): a non-canonical chunk is
-                    # decoded the way the pre-kernel reader did, which
-                    # keeps the accepted-input set identical.
-                    raw = _zlib.decompress(
-                        base64.b64decode(
-                            bytes(buf[starts[t]:starts[t] + lens[t]])),
-                        15, expected_bytes)
-                    arr = np.frombuffer(raw, dtype=np.float32)
-                    if arr.shape[0] != N:
-                        raise ValueError(
-                            f"GIFTI darray length {arr.shape[0]} != expected "
-                            f"{N}; Dim0 disagrees with decoded byte count"
-                        )
-                    copy_row_f32(arr, stage, t)
-                    continue
-                if n_raw == B64_ERR_LEN:
-                    raise ValueError(
-                        f"GIFTI {path}: DataArray {t} <Data> payload length "
-                        f"{int(lens[t])} is not a multiple of 4 (invalid "
-                        f"base64)"
-                    )
-                raise ValueError(
-                    f"GIFTI {path}: DataArray {t} <Data> payload contains a "
-                    f"byte outside the base64 alphabet (line-wrapped or "
-                    f"otherwise non-canonical b64). ``allow_wrapped_b64`` "
-                    f"was set to False, which opts into the strict contract "
-                    f"the GPU reader enforces; the default (``None``) falls "
-                    f"back to ``base64.b64decode`` for such a chunk."
-                )
             raw = _zlib.decompress(memoryview(scratch)[:n_raw], 15,
                                    expected_bytes)
         arr = np.frombuffer(raw, dtype=np.float32)
@@ -356,7 +304,6 @@ def _await_or_run(futs, tasks):
 def read_surface_gifti(path: PathLike, *,
                        pool=None,
                        n_workers: Optional[int] = None,
-                       allow_wrapped_b64: Optional[bool] = None,
                        time_major: bool = False,
                        ) -> np.ndarray:
     """Read a surface BOLD ``.func.gii`` → ``(N, T) fp32`` host array
@@ -375,12 +322,6 @@ def read_surface_gifti(path: PathLike, *,
         Chunk sub-ranges to split the file into. ``None`` or ``1`` is
         the serial path (the default, and what the prefetchers use);
         with ``pool=None`` a private pool is created for the call.
-    allow_wrapped_b64 : bool or None, optional
-        ``None`` (default) uses the strict numba kernel and falls back
-        to ``base64.b64decode`` per refused chunk, so line-wrapped
-        payloads still read; ``True`` always uses ``base64.b64decode``;
-        ``False`` opts into the strict contract the GPU reader
-        enforces, raising on a non-alphabet byte.
     time_major : bool, optional
         Return ``(T, N)`` -- the decode's own layout, one darray per
         row -- and skip the transpose pass. Step 1 consumes BOLD
@@ -411,8 +352,7 @@ def read_surface_gifti(path: PathLike, *,
 
     if (pool is None and (n_workers is None or int(n_workers) <= 1)) or (
             pool is not None and _current_thread_belongs_to(pool)):
-        _decode_chunk_range(buf, starts, lens, stage, N, path,
-                            0, T, allow_wrapped_b64)
+        _decode_chunk_range(buf, starts, lens, stage, N, path, 0, T)
         if time_major:
             return stage
         transpose_f32(stage, out, 0, N)
@@ -432,7 +372,7 @@ def read_surface_gifti(path: PathLike, *,
         bounds = [int(round(k * T / nw)) for k in range(nw + 1)]
         tasks = [(_decode_chunk_range,
                   (buf, starts, lens, stage, N, path, bounds[k],
-                   bounds[k + 1], allow_wrapped_b64))
+                   bounds[k + 1]))
                  for k in range(nw)]
         _await_or_run([pool.submit(fn, *a) for fn, a in tasks], tasks)
         if time_major:

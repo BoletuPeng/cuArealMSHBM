@@ -47,7 +47,8 @@ case; both are used only where the caller casts anyway. Sparse
 variables keep the payload dtype on both routes.
 
 ``LAST_PATH`` records which route the last public call took
-(``'fast'`` / ``'scipy'``) for tests and timing reports.
+(``'fast'`` / ``'scipy'``, plus ``'h5py'`` for a MAT v7.3 file in
+:func:`read_sparse`) for tests and timing reports.
 
 Container layout (MAT v5, little-endian only): a 128-byte header, then
 a sequence of data elements. A top-level variable is either an
@@ -68,12 +69,9 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 
-# Optional Intel ISA-L zlib. Same gating pattern as gifti_io.py;
-# stdlib ``zlib.decompressobj`` is a drop-in for the walker's use.
-try:
-    from isal import isal_zlib as _zlib
-except ImportError:  # pragma: no cover — isal is in the env
-    import zlib as _zlib  # type: ignore[no-redef]
+# Intel ISA-L zlib for the walker's streaming inflate. A hard
+# dependency, as in gifti_io.py -- no stdlib fallback.
+from isal import isal_zlib as _zlib
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -552,7 +550,8 @@ def read_sparse(path: str | Path, name: str):
     MATLAB sparse (``mxSPARSE_CLASS``) is parsed straight out of its
     ``ir`` / ``jc`` / ``pr`` triplet — no dense intermediate, no nonzero
     scan. A dense-class variable is accepted too and returned as the csc
-    of its nonzeros, so hand-made mask files still work.
+    of its nonzeros, so hand-made mask files still work. A MAT v7.3
+    (HDF5) file is read through ``h5py`` (:func:`read_v73_sparse`).
     """
     global LAST_PATH
     import scipy.sparse as sp
@@ -580,8 +579,44 @@ def read_sparse(path: str | Path, name: str):
         LAST_PATH = "scipy"
 
     from scipy.io import loadmat
-    m = loadmat(str(p), squeeze_me=False)
+    try:
+        m = loadmat(str(p), squeeze_me=False)
+    except (NotImplementedError, ValueError):
+        import h5py
+        if not h5py.is_hdf5(str(p)):
+            raise
+        LAST_PATH = "h5py"
+        with h5py.File(p, "r") as f:
+            if nm_want not in f:
+                raise KeyError(f"{p}: variable {nm_want!r} not in the file")
+            return read_v73_sparse(f, nm_want)
     if nm_want not in m:
         raise KeyError(f"{p}: variable {nm_want!r} not in the file")
     v = m[nm_want]
     return sp.csc_matrix(v)
+
+
+def read_v73_sparse(f, key: str):
+    """Read one variable of an open MAT v7.3 ``h5py.File`` as a ``csc_matrix``.
+
+    MATLAB sparse is an HDF5 group holding the CSC ``data`` / ``ir`` /
+    ``jc`` arrays with the row count in its ``MATLAB_sparse`` attribute.
+    A dense dataset is stored transposed with respect to MATLAB and is
+    returned as the csc of its un-transposed values.
+    """
+    import h5py
+    import scipy.sparse as sp
+
+    obj = f[key]
+    if isinstance(obj, h5py.Group):
+        data = np.asarray(obj["data"]).ravel()
+        indices = np.asarray(obj["ir"]).ravel()
+        indptr = np.asarray(obj["jc"]).ravel()
+        n_rows_attr = obj.attrs.get("MATLAB_sparse")
+        if n_rows_attr is None:
+            raise ValueError(
+                f"v7.3 sparse {key!r}: missing MATLAB_sparse attribute")
+        n_rows = int(np.asarray(n_rows_attr).ravel()[0])
+        n_cols = int(indptr.shape[0]) - 1
+        return sp.csc_matrix((data, indices, indptr), shape=(n_rows, n_cols))
+    return sp.csc_matrix(np.asarray(obj).T)

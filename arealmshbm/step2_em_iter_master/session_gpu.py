@@ -21,33 +21,63 @@ from __future__ import annotations
 import math
 import time
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Iterable, Optional, Tuple
 
+import cupy as cp
 import numpy as np
-
-try:  # pragma: no cover - exercised only on CPU-only hosts
-    import cupy as cp
-except Exception:  # pragma: no cover
-    cp = None  # type: ignore
 
 from . import _kernels_gpu as K
 
 
 def _alloc_pinned(shape: Tuple[int, ...], dtype) -> np.ndarray:
-    """Page-locked host buffer (cheap, blocking D2H target)."""
+    """Page-locked host buffer from cupy's pinned pool (cheap, blocking
+    D2H target; the block stays cached in the pool after its last
+    reference dies)."""
     n = int(np.prod(shape)) if shape else 1
     nbytes = n * np.dtype(dtype).itemsize
     mem = cp.cuda.alloc_pinned_memory(nbytes)
     return np.frombuffer(mem, dtype, n).reshape(shape)
 
 
+def _alloc_pinned_unpooled(shape: Tuple[int, ...], dtype) -> np.ndarray:
+    """Page-locked host buffer outside cupy's pinned pool.
+
+    Exactly ``nbytes`` (the pool rounds a 72 MB slot up to 128 MiB) and
+    handed back to the OS when the array dies, instead of staying
+    page-locked in the pool for the rest of the process: ~8 ms to
+    allocate and ~5 ms to free per slot, paid once per Session.
+    """
+    n = int(np.prod(shape)) if shape else 1
+    nbytes = n * np.dtype(dtype).itemsize
+    mem = cp.cuda.PinnedMemoryPointer(cp.cuda.PinnedMemory(nbytes), 0)
+    return np.frombuffer(mem, dtype, n).reshape(shape)
+
+
+#: Page-locked slots the eager ingest decodes into ahead of the H2D (one
+#: subject each, 72 MB at fsaverage6 / T=6), and the width of both decode
+#: pools. blosc2 already decodes each subject on every core, so the ring
+#: only has to hide one subject's H2D + row statistics behind the next
+#: decode: on the 40-subject reference-cohort ingest depth 2 measured 1.91 s
+#: against 1.88 s at depths 4 and 8 (noise) and 1.96 s at depth 1 (no
+#: overlap).
+_INGEST_DEPTH = 2
+#: Fraction of available host RAM the stream-mode host cache may claim.
+_HOST_CACHE_FRACTION = 0.5
+
+
 class Step2SparseSession:
     """Device-resident step-2 EM session (Mode-B group prior).
 
-    The ctor and :meth:`_stream_subject` refill one pinned staging buffer
-    between H2D copies and fence it on the **current** stream, so every
-    kernel and copy this Session issues must run on the stream that is
-    current at the call.
+    The BOLD reaches the device through ``inputs.bold_reader`` and lives
+    where :meth:`_resolve_cache_mode` decides: the ``(S, T, N, Db)``
+    device cache (``eager_bitpacked``, filled by :meth:`_ingest_eager`
+    through a two-slot page-locked ring that is released afterwards) or
+    one device slot refilled per visit (``stream``, from the host cache
+    :meth:`_build_host_cache` sizes, else through the reader). Every
+    pinned slot is refilled between H2D copies and fenced on the
+    **current** stream, so every kernel and copy this Session issues
+    must run on the stream that is current at the call.
     """
 
     def __init__(
@@ -66,8 +96,6 @@ class Step2SparseSession:
         bold_cache_mode: str = "auto",
         bold_cache_safety_margin_gb: float = 4.0,
     ) -> None:
-        if cp is None:  # pragma: no cover
-            raise RuntimeError("cupy is required for backend='gpu'")
         t_ctor = time.perf_counter()
 
         lay = inputs.layout
@@ -119,8 +147,6 @@ class Step2SparseSession:
         self._bold_cache_mode = self._resolve_cache_mode(
             bold_cache_mode, bold_cache_safety_margin_gb)
 
-        pinned_bold = _alloc_pinned((T, N, Db), np.uint8)
-        self._pinned_bold = pinned_bold
         if self._bold_cache_mode == "eager_bitpacked":
             self._packed = cp.empty((S, T, N, Db), dtype=cp.uint8)
         else:
@@ -137,16 +163,16 @@ class Step2SparseSession:
 
         inv_D = np.float32(1.0) / np.float32(D)
         self._inv_D = inv_D
+        # Stream mode keeps one pinned staging slot and, budget allowing,
+        # a pageable host cache of every subject; eager mode keeps
+        # neither once the device cache is full.
+        self._pinned_bold: Optional[np.ndarray] = None
+        self._host_cache: Optional[np.ndarray] = None
         if self._bold_cache_mode == "eager_bitpacked":
-            for s in range(S):
-                inputs.bold_reader(s + 1, pinned_bold)
-                # ``set`` is asynchronous on the current stream and the source
-                # is page-locked, so the host must not refill the slot before
-                # the copy has landed.
-                self._packed[s].set(pinned_bold)
-                cp.cuda.get_current_stream().synchronize()
-                self._row_stats_into(s, s)
+            self._ingest_eager()
         else:
+            self._host_cache = self._build_host_cache()
+            self._pinned_bold = _alloc_pinned((T, N, Db), np.uint8)
             for s in range(S):
                 self._stream_subject(s)
                 self._row_stats_into(0, s)
@@ -283,8 +309,8 @@ class Step2SparseSession:
         packed_b = S * T * N * Db
         grad_b = (S * N * Dg * 4 + S * N * 4) if self.has_spatial else 0
         # Resident per-subject state.  The first two terms are s_t_nu +
-        # X_dot_sl and s_psi + sigma_psi; the rest are the S-scaled buffers the
-        # design's sizing rule used to omit (1.10 GiB at S=200 / L=300 /
+        # X_dot_sl and s_psi + sigma_psi; the rest are the S-scaled buffers
+        # (1.10 GiB at S=200 / L=300 /
         # D=1175 / N=81924 / P=586522): s_lambda, the intra-closure psi
         # ping-pong, the per-subject row stats and n_alive.
         state_b = (2 * S * T * L * D * 4 + 2 * S * L * D * 4
@@ -303,8 +329,9 @@ class Step2SparseSession:
         # only when the undrained reading is already short: draining can only
         # ADD free memory, so "it fits before the drain" implies "it fits after
         # it", and the drain is not cheap -- it costs ~8 ms here AND throws away
-        # the cached PINNED blocks, which makes the ctor's 104 MB of
-        # ``alloc_pinned`` a fresh cudaHostAlloc (~18 ms) on every Session.
+        # the cached PINNED blocks, which makes the ctor's pooled pinned
+        # staging (the gradient slot, stream mode's BOLD slot, the scalar
+        # mirrors) a fresh cudaHostAlloc on every Session.
         free_b = int(cp.cuda.Device().mem_info[0])
         if need > free_b:
             cp.get_default_memory_pool().free_all_blocks()
@@ -352,18 +379,78 @@ class Step2SparseSession:
                     self._row_inv[sslot], np.int64(n_rows), np.int32(D),
                     np.int32(Db), np.float32(self._inv_D)))
 
+    def _ingest_eager(self) -> None:
+        """Fill the ``(S, T, N, Db)`` device cache straight from the reader.
+
+        ``_INGEST_DEPTH`` worker threads decode subjects into as many
+        page-locked slots (the reader releases the GIL inside blosc2)
+        while this thread issues each finished slot's H2D and row
+        statistics; a slot is refilled only after its copy is fenced on
+        the current stream. The slots live outside cupy's pinned pool and
+        are released when this returns, so no host memory of the ingest
+        outlives it.
+        """
+        S, T, N, Db = self.S, self.T, self.N, self.Db
+        depth = min(_INGEST_DEPTH, S)
+        ring = [_alloc_pinned_unpooled((T, N, Db), np.uint8)
+                for _ in range(depth)]
+        reader = self._inputs.bold_reader
+        with ThreadPoolExecutor(max_workers=depth,
+                                thread_name_prefix="step2-bold-ingest") as ex:
+            pending = {s: ex.submit(reader, s + 1, ring[s % depth])
+                       for s in range(depth)}
+            for s in range(S):
+                pending.pop(s).result()
+                slot = ring[s % depth]
+                # ``set`` is asynchronous on the current stream and the
+                # source is page-locked: the slot must not be refilled
+                # before the copy has landed.
+                self._packed[s].set(slot)
+                cp.cuda.get_current_stream().synchronize()
+                self._row_stats_into(s, s)
+                if s + depth < S:
+                    pending[s + depth] = ex.submit(reader, s + depth + 1, slot)
+        del ring
+
+    def _build_host_cache(self) -> Optional[np.ndarray]:
+        """Stream mode's ``(S, T, N, Db)`` pageable host cache, or ``None``.
+
+        Built when it fits half of the available host RAM (``psutil``);
+        otherwise every visit decodes through the reader (two per
+        subject per EM iteration, ~45 ms each at fsaverage6 / T=6) and a
+        ``RuntimeWarning`` says so.
+        """
+        import psutil
+        S, T, N, Db = self.S, self.T, self.N, self.Db
+        need = S * T * N * Db
+        budget = int(_HOST_CACHE_FRACTION * psutil.virtual_memory().available)
+        if need > budget:
+            warnings.warn(
+                f"step2 gpu: the stream-mode host BOLD cache "
+                f"({need / 2**30:.2f} GiB) exceeds half of the available "
+                f"host RAM ({budget / 2**30:.2f} GiB); every subject visit "
+                f"decodes from disk instead.", RuntimeWarning, stacklevel=3)
+            return None
+        cache = np.empty((S, T, N, Db), dtype=np.uint8)
+        reader = self._inputs.bold_reader
+        with ThreadPoolExecutor(max_workers=min(_INGEST_DEPTH, S),
+                                thread_name_prefix="step2-bold-cache") as ex:
+            list(ex.map(lambda s: reader(s + 1, cache[s]), range(S)))
+        return cache
+
     def _stream_subject(self, s: int) -> None:
         """Make subject ``s``'s packed bytes resident (stream mode).
 
-        Pure H2D: the row statistics of every subject were computed once in the
-        constructor and stay device-resident, so a residency change costs one
-        72 MB copy and nothing else.
+        The row statistics of every subject were computed once in the
+        constructor and stay device-resident, so a residency change costs
+        one 72 MB copy from the host cache (a disk decode first when no
+        cache fit) and nothing else.
         """
         if self._bold_cache_mode == "eager_bitpacked":
             return
         if self._resident_s == s:
             return
-        cache = self._inputs.packed_host
+        cache = self._host_cache
         if cache is not None:
             np.copyto(self._pinned_bold, cache[s])
         else:

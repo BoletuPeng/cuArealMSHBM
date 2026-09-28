@@ -2,20 +2,12 @@
 of bit-packed BOLD profiles.
 
 The bit-packed ``.b2nd`` is the only on-disk BOLD format produced by
-step-1's generate_profiles. Step-3 consumers come in two flavors:
-
-  * **gpu_full** — packed bytes flow straight to device; the fused
-    ``_normalize_bold_NTD_from_packed`` CUDA kernel
-    (``arealmshbm/vmf_clustering/vmf_clustering_gpu.py``) does
-    unpack + demean + L2-norm in one device pass.
-  * **cpu / gpu_elambda** — packed bytes are unpacked + normalized on
-    host via :func:`unpack_normalize_packed_NTD_host` here, which the
-    CPU :class:`VmfClusteringSession` calls from its ``__init__``.
-
-Both the host (this module) and the device (the fused
-``_normalize_bold_NTD_from_packed`` CUDA kernel) produce numerically
-equivalent ``(N, T, D)`` fp32 BOLD buffers; the only choice is *where*
-the unpack+normalize runs.
+step-1's generate_profiles. The step-3 ``cpu`` backend unpacks +
+normalizes it on host via :func:`unpack_normalize_packed_NTD_host`
+here, which :class:`VmfClusteringSession` calls from its ``__init__``.
+(The ``gpu`` backend never materialises the unpacked BOLD: it keeps the
+packed bytes on device and works from per-row statistics, see
+:mod:`arealmshbm.m_step.m_step_gpu`.)
 
 Upstream invariant — **the kernel does not take a ``mw_full`` kwarg**.
 MW rows MUST be zero in the packed input. The authoritative
@@ -29,8 +21,8 @@ upstream MW-zero pass would get demeaned, L2-normalized vectors at
 MW rows downstream, which is silently wrong (a contract violation,
 not kernel misbehavior). The legal call sites are:
 
-* :func:`arealmshbm.data_io.fetch_data.fetch_data` → CPU/GPU
-  :class:`VmfClusteringSession{CUDA}` ctors (production).
+* :func:`arealmshbm.data_io.fetch_data.fetch_data` →
+  :class:`VmfClusteringSession` ctor (production).
 * Tests in :mod:`arealmshbm.data_io.tests.test_bitpacked_norm` that
   explicitly construct a packed buffer; these pin the zero-row
   contract via :func:`test_all_zero_packed_row_stays_zero`.

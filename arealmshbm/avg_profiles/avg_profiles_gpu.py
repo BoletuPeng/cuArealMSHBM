@@ -1,41 +1,34 @@
 """avg_profiles_gpu.py
 
 GPU supercall for averaging RSFC profiles across (subject × session).
-Per-subject bitpacked ``.b2nd`` decode stays CPU-side (blosc2
-LZ4+bitshuffle has no GPU counterpart); the accumulator and final scale
-live on device, and the fused bit-unpack + accumulate happens in a
-CUDA RawKernel.
+The accumulator and the final scale live on device; the fused
+bit-unpack + accumulate is the CUDA RawKernel
+``accum_packed_session_NhDb`` over packed bytes — one block per hemi
+vertex, threads stride over D_bytes, each thread owns its 8 bits, so
+there are no atomics.
 
-Lifetime of GPU buffers:
-    * Decode a subject on host (full ``(T, N, ⌈D/8⌉) uint8`` ndarray).
-    * H2D the whole packed subject once per S iter.
-    * Stream per-session: launch ``accum_packed_session_NhDb`` for lh
-      and rh — one block per hemi vertex, threads stride over D_bytes;
-      each thread owns its 8 bits → no atomics.
-    * After loop: ``acc *= 1/n`` (single ufunc).
-    * D2H once at the end into a *pinned* host buffer; the ``.npy``
-      pair write runs on a background 2-thread pool over that same
-      buffer (no second host copy).
+Two ways in:
 
-Two entry points:
+    ``PackedProfileAccumulator`` — the step-1 GPU chain's way. Built
+        once per cohort (``step1_runners.make_avg_accumulator``) and
+        handed to the fused profile leaf as its ``on_packed`` hook, so
+        every session is folded in from the device slab the pack kernel
+        just wrote: the packed bytes never leave the GPU for the
+        average, and no subject is held past its .b2nd write.
+        ``avg_profiles_from_accumulator`` then scales in place, does one
+        pinned D2H shared with the background ``.npy`` writer, and
+        returns the device means (``lh_avg_dev`` / ``rh_avg_dev``) that
+        ``generate_ini_params_gpu`` consumes directly, so the fp32 means
+        never round trip through host memory on the critical path.
 
-    ``avg_profiles_gpu(...)``            — disk-reading supercall, same
-        signature/contract as the CPU twin. Discovers + decodes the
-        per-subject ``.b2nd`` set, delegates, joins the writer, and
-        DROPS the device accumulators before returning (``lh_avg_dev``
-        / ``rh_avg_dev`` are ``None``) so the caller's
-        ``free_all_blocks()`` can reclaim them -- this entry point has
-        no device-side consumer.
-
-    ``avg_profiles_from_packed_gpu(...)`` — memory-side twin. Takes the
-        packed ``(T, N, ⌈D/8⌉)`` uint8 slabs the caller already holds
-        (host numpy or cupy), skips the ``.b2nd`` round trip, and
-        returns while the ``.npy`` writer is still running so the
-        caller can overlap ``ini_params`` / ``radius_mask`` with it.
-        The result carries the device fp32 means (``lh_avg_dev`` /
-        ``rh_avg_dev``) that ``generate_ini_params_gpu`` consumes
-        directly, so the fp32 means never round trip through host
-        memory on the critical path.
+    ``avg_profiles_gpu(...)`` — disk-reading supercall, same
+        signature/contract as the CPU twin. Decodes the per-subject
+        ``.b2nd`` set on host (blosc2 LZ4+bitshuffle has no GPU
+        counterpart), uploads one subject at a time into the same
+        accumulator, joins the writer, and DROPS the device
+        accumulators before returning (``lh_avg_dev`` / ``rh_avg_dev``
+        are ``None``) so the caller's ``free_all_blocks()`` can reclaim
+        them -- this entry point has no device-side consumer.
 
 cupy is imported at module top — this file is only loaded via the
 lazy ``from .avg_profiles_gpu import …`` line in the dispatch branch,
@@ -48,7 +41,7 @@ from __future__ import annotations
 
 from dataclasses import replace as _dc_replace
 from pathlib import Path
-from typing import Optional, Sequence, Tuple
+from typing import Optional, Tuple
 
 import cupy as cp
 import numpy as np
@@ -131,9 +124,10 @@ def _accum_packed_session_device(
 ) -> None:
     """Launch the per-session packed-accumulate kernel.
 
-    Both inputs must be device-resident and C-contig. Shape checks
-    surface mismatches at the launch boundary instead of letting them
-    silently misindex inside the kernel.
+    The launch boundary and the one validation layer: dtype, shape
+    agreement and C-contiguity are checked here (the kernel indexes raw
+    rows), so :meth:`PackedProfileAccumulator.add` only checks the joint
+    lh|rh slab's layout before splitting it.
     """
     if packed_NhDb_dev.dtype != cp.uint8:
         raise ValueError(
@@ -142,6 +136,12 @@ def _accum_packed_session_device(
     if acc_VhD_dev.dtype != cp.float32:
         raise ValueError(
             f"acc_VhD_dev must be fp32; got {acc_VhD_dev.dtype}"
+        )
+    if not (packed_NhDb_dev.flags.c_contiguous
+            and acc_VhD_dev.flags.c_contiguous):
+        raise ValueError(
+            "packed_NhDb_dev and acc_VhD_dev must be C-contiguous: the "
+            "kernel indexes raw rows"
         )
     V_h, D_bytes = packed_NhDb_dev.shape
     Va, Da = acc_VhD_dev.shape
@@ -182,149 +182,163 @@ def _pinned_host_buffer(shape: Tuple[int, int],
     return np.frombuffer(mem, dtype=dtype, count=n).reshape(shape)
 
 
-def _as_packed_device(arr, V_lh: int, V_rh: int, D: int, idx: int):
-    """Validate + (if host) upload one subject's packed slab.
+class PackedProfileAccumulator:
+    """Device sums of set bits over every packed session fed to :meth:`add`.
 
-    Accepts a host numpy array (H2D'd here, one transfer) or an
-    already-device cupy array (used in place). Every shape / dtype /
-    contiguity precondition of :func:`_accum_packed_session_device` is
-    checked once per subject, with the subject index in the message.
+    ``lh`` / ``rh`` are the ``(V_lh, D)`` / ``(V_rh, D)`` fp32 sums and
+    ``n_pairs`` counts the (subject, session) slabs folded in. :meth:`add`
+    has the fused profile leaf's ``on_packed`` signature, so an instance
+    is handed straight to ``generate_subject_profiles_gpu(on_packed=acc.add)``
+    and every session is accumulated from the device slab the pack
+    kernel just wrote.
+
+    Session structure. Every subject feeds its ``num_sess`` sessions in
+    slot order ``0 .. num_sess-1`` -- the leaf's loop and the disk
+    path's -- so ``sess_index`` must equal ``n_pairs % num_sess`` at
+    every call: a subject that packs fewer or more sessions than the
+    cohort's ``num_sess`` is caught at the call that breaks the order,
+    not averaged in. ``n_subjects`` is the number of complete subjects.
+
+    Streams. The zero-fill is complete when the constructor returns,
+    :meth:`add` launches on the stream current at the call (the leaf's
+    compute stream) and the finalize waits for the whole device before
+    scaling, so the feeder may use any stream. One feeder at a time:
+    ``n_pairs`` is a host counter and the kernel's ``+=`` is not atomic
+    across concurrent launches.
+
+    Numerics: identical to the CPU supercall. Every summand is exactly
+    0.0f or 1.0f and partial sums stay far below 2**24, so the fp32
+    accumulation is integer-exact and order-free -- folding a session in
+    the moment it is packed gives the same bits as the CPU's
+    subject-by-subject loop over the .b2nd files.
     """
-    D_bytes = (int(D) + 7) // 8
-    N = int(V_lh) + int(V_rh)
-    on_device = isinstance(arr, cp.ndarray)
-    probe = arr if on_device else np.asarray(arr)
-    if probe.ndim != 3:
-        raise ValueError(
-            f"avg_profiles_from_packed_gpu: subject {idx} must be 3-D "
-            f"(T, N, ceil(D/8)); got shape {probe.shape}"
-        )
-    if probe.dtype != np.uint8:
-        raise ValueError(
-            f"avg_profiles_from_packed_gpu: subject {idx} must be uint8; "
-            f"got {probe.dtype}"
-        )
-    if probe.shape[1] != N:
-        raise ValueError(
-            f"avg_profiles_from_packed_gpu: subject {idx} has N="
-            f"{probe.shape[1]} but the mesh yields V_lh+V_rh={N}"
-        )
-    if probe.shape[2] != D_bytes:
-        raise ValueError(
-            f"avg_profiles_from_packed_gpu: subject {idx} last axis "
-            f"({probe.shape[2]}) != ceil(D/8) ({D_bytes}) for D={D}"
-        )
-    if not probe.flags["C_CONTIGUOUS"]:
-        raise ValueError(
-            f"avg_profiles_from_packed_gpu: subject {idx} must be C-contiguous"
-        )
-    return probe if on_device else cp.asarray(probe)
+
+    def __init__(self, V_lh: int, V_rh: int, D: int, num_sess: int) -> None:
+        V_lh, V_rh, D, num_sess = int(V_lh), int(V_rh), int(D), int(num_sess)
+        if V_lh <= 0 or V_rh <= 0 or D <= 0 or num_sess <= 0:
+            raise ValueError(
+                f"PackedProfileAccumulator: V_lh={V_lh}, V_rh={V_rh}, D={D}, "
+                f"num_sess={num_sess} must all be positive")
+        self.V_lh, self.V_rh, self.D = V_lh, V_rh, D
+        self.num_sess = num_sess
+        self.D_bytes = (D + 7) // 8
+        self.lh = cp.zeros((V_lh, D), dtype=cp.float32)
+        self.rh = cp.zeros((V_rh, D), dtype=cp.float32)
+        # ``cp.zeros`` is an asynchronous memset on the current stream; a
+        # feeder on another, non-blocking stream could otherwise fold a
+        # session in before the zeros land and lose it to them.
+        cp.cuda.get_current_stream().synchronize()
+        self.n_pairs = 0
+        self._finalized = False
+
+    @property
+    def n_subjects(self) -> int:
+        """Complete subjects folded in so far (``n_pairs // num_sess``)."""
+        return self.n_pairs // self.num_sess
+
+    def add(self, sess_index: int, packed_NDb_dev) -> None:
+        """Fold one session's ``(V_lh + V_rh, ceil(D/8))`` uint8 device
+        slab in, on the current stream. ``sess_index`` is the leaf's
+        session slot and must be the one due next for the current
+        subject."""
+        if self._finalized:
+            raise RuntimeError(
+                "PackedProfileAccumulator.add: the mean was already taken "
+                "(avg_profiles_from_accumulator); nothing can be added now")
+        due = self.n_pairs % self.num_sess
+        if int(sess_index) != due:
+            raise ValueError(
+                f"PackedProfileAccumulator.add: session slot {sess_index} "
+                f"arrived where {due} was due (subject {self.n_subjects + 1}, "
+                f"num_sess={self.num_sess}): every subject must feed sessions "
+                f"0..{self.num_sess - 1} in order")
+        a = packed_NDb_dev
+        if not isinstance(a, cp.ndarray):
+            raise ValueError(
+                f"PackedProfileAccumulator.add: slab must be a cupy ndarray; "
+                f"got {type(a).__name__}")
+        if a.ndim != 2 or int(a.shape[0]) != self.V_lh + self.V_rh:
+            raise ValueError(
+                f"PackedProfileAccumulator.add: slab shape {tuple(a.shape)} "
+                f"!= (V_lh+V_rh, ceil(D/8)) = "
+                f"{(self.V_lh + self.V_rh, self.D_bytes)}")
+        # dtype, byte width and contiguity are checked at the launch
+        # boundary, on the lh half first -- the rh half shares them, so
+        # nothing is folded in when they are wrong.
+        _accum_packed_session_device(a[:self.V_lh], self.lh, self.D)
+        _accum_packed_session_device(a[self.V_lh:], self.rh, self.D)
+        self.n_pairs += 1
 
 
-def avg_profiles_from_packed_gpu(
-    packed_subjects: Sequence[np.ndarray],
-    D: int,
+def avg_profiles_from_accumulator(
+    acc: PackedProfileAccumulator,
     targ_mesh: str,
     seed_mesh: str,
     out_dir,
     *,
     save: bool = True,
-    verbose: bool = False,
 ) -> AvgProfilesResult:
-    """Average already-in-memory packed profiles on device.
+    """Turn the device sums into the cohort mean and start the ``.npy`` write.
 
-    Memory-side twin of :func:`avg_profiles_gpu`: instead of
-    discovering + decoding the ``.b2nd`` set it takes the packed slabs
-    the caller already holds (step-1 ``generate_profiles`` output, or a
-    ``read_subject_profile_packed_tnd`` load) and runs the identical
-    device accumulation via :func:`_accum_packed_session_device`.
+    ``acc`` must have been built for ``targ_mesh`` (its hemi sizes are
+    checked) and fed complete subjects only: at least one, the last one
+    with all ``num_sess`` sessions. The mean is taken IN PLACE on
+    ``acc.lh`` / ``acc.rh`` -- they become the result's ``lh_avg_dev``
+    / ``rh_avg_dev`` -- and exactly once: a second call on the same
+    accumulator raises instead of dividing the means by ``n_pairs``
+    again, and ``acc.add`` refuses further sessions. The device is
+    synchronised first, so the feeder's stream may still be running its
+    last folds when this is called.
 
-    Parameters
-    ----------
-    packed_subjects : sequence of ``(T, N, ceil(D/8))`` uint8 C-contig
-        arrays -- host numpy (H2D'd here, one transfer per subject) or
-        cupy (used in place). One entry per subject; all entries must
-        share the same ``(T, N, ceil(D/8))``.
-    D : int -- unpacked cell count (``D_unpacked`` from the .b2nd vlmeta).
-    targ_mesh, seed_mesh : mesh names -- size the hemis and name the
-        output ``.npy`` pair.
-    out_dir : project root; the pair lands at
-        ``profiles/avg_profile/{lh,rh}_<targ>_roi<seed>_avg_profile.npy``.
-    save : when True (default) the ``.npy`` pair write is *started* on a
-        background pool and the result carries a ``writer`` handle --
-        the caller MUST call ``result.writer.wait()`` before exiting.
-        When False nothing is written, ``writer`` is ``None``, and the
-        result's paths name where the pair *would* live.
+    ``save=True`` (default) starts the ``.npy`` pair write on a
+    background pool and the result carries a ``writer`` handle the
+    caller MUST ``wait()`` before exiting; ``save=False`` writes nothing
+    (``writer`` is ``None``) though the result names the canonical
+    paths.
 
-    Returns
-    -------
-    :class:`AvgProfilesResult` carrying the host fp32 means (``lh_avg``
-    / ``rh_avg``, living in the pinned D2H buffer -- do not mutate
-    before ``writer.wait()``), the device fp32 means (``lh_avg_dev`` /
-    ``rh_avg_dev``, feed straight into
-    ``generate_ini_params_gpu(precomputed_*_avg_dev=...)``), and the
-    write handle.
-
-    Numerics: identical to the CPU supercall. Every summand is exactly
-    0.0f or 1.0f and partial sums stay far below 2**24, so the fp32
-    accumulation is integer-exact and order-free.
+    Returns the :class:`AvgProfilesResult` with the host fp32 means
+    (``lh_avg`` / ``rh_avg``, living in the pinned D2H buffer -- do not
+    mutate before ``writer.wait()``), the device means, and the handle.
     """
+    if acc._finalized:
+        raise RuntimeError(
+            "avg_profiles_from_accumulator: the mean was already taken from "
+            "this accumulator; build a new one for another cohort")
     if "fsaverage" not in targ_mesh:
         raise ValueError(
-            f"avg_profiles_from_packed_gpu: only fsaverage* targ_mesh "
-            f"supported, got {targ_mesh!r}."
-        )
-    subs = list(packed_subjects)
-    if not subs:
-        raise ValueError("avg_profiles_from_packed_gpu: packed_subjects is empty")
-    D = int(D)
-    if D <= 0:
-        raise ValueError(f"avg_profiles_from_packed_gpu: D must be > 0; got {D}")
+            f"avg_profiles_from_accumulator: only fsaverage* targ_mesh "
+            f"supported, got {targ_mesh!r}.")
+    if acc.n_pairs <= 0:
+        raise ValueError(
+            "avg_profiles_from_accumulator: no session was accumulated")
+    if acc.n_pairs % acc.num_sess != 0:
+        raise ValueError(
+            f"avg_profiles_from_accumulator: the last subject is incomplete "
+            f"({acc.n_pairs % acc.num_sess} of num_sess={acc.num_sess} "
+            f"sessions were folded in)")
+    V_lh, V_rh = _hemi_vert_counts(targ_mesh)
+    if (V_lh, V_rh) != (acc.V_lh, acc.V_rh):
+        raise ValueError(
+            f"avg_profiles_from_accumulator: accumulator hemi sizes "
+            f"({acc.V_lh}, {acc.V_rh}) != {targ_mesh!r} ({V_lh}, {V_rh})")
     out_dir = Path(out_dir)
     if save:
         (out_dir / "profiles" / "avg_profile").mkdir(parents=True, exist_ok=True)
 
-    V_lh, V_rh = _hemi_vert_counts(targ_mesh)
-
-    lh_acc_dev = cp.zeros((V_lh, D), dtype=cp.float32)
-    rh_acc_dev = cp.zeros((V_rh, D), dtype=cp.float32)
-
-    n_pairs = 0
-    T0 = None
-    for idx, arr in enumerate(subs):
-        arr_dev = _as_packed_device(arr, V_lh, V_rh, D, idx)
-        T = int(arr_dev.shape[0])
-        if T0 is None:
-            T0 = T
-        elif T != T0:
-            raise ValueError(
-                f"avg_profiles_from_packed_gpu: subject {idx} has T={T} "
-                f"but subject 0 has T={T0}"
-            )
-        for t in range(T):
-            # Indexed inline: a loop-local name for the session view
-            # would outlive the loop and keep ``arr_dev``'s block alive
-            # across the next subject's upload.
-            _accum_packed_session_device(arr_dev[t][:V_lh], lh_acc_dev, D)
-            _accum_packed_session_device(arr_dev[t][V_lh:], rh_acc_dev, D)
-            n_pairs += 1
-        # Free the device slab as soon as it is folded in when we own it
-        # (host input), so peak device usage stays at one subject.
-        if arr_dev is not arr:
-            del arr_dev
-        if verbose:
-            print(f"current subject:{idx + 1}")
-
-    inv_n = cp.float32(1.0 / float(n_pairs))
-    lh_acc_dev *= inv_n
-    rh_acc_dev *= inv_n
+    # The folds ran on the feeder's stream (the leaf drains its own; a
+    # direct caller may not have): wait for the device before scaling.
+    cp.cuda.Device().synchronize()
+    inv_n = cp.float32(1.0 / float(acc.n_pairs))
+    acc.lh *= inv_n
+    acc.rh *= inv_n
+    acc._finalized = True
 
     # Single D2H into pinned memory; the writer thread reads that same
     # buffer, so there is exactly one host copy of each hemi.
-    lh_acc = _pinned_host_buffer((V_lh, D), np.float32)
-    rh_acc = _pinned_host_buffer((V_rh, D), np.float32)
-    lh_acc_dev.get(out=lh_acc)
-    rh_acc_dev.get(out=rh_acc)
+    lh_acc = _pinned_host_buffer((V_lh, acc.D), np.float32)
+    rh_acc = _pinned_host_buffer((V_rh, acc.D), np.float32)
+    acc.lh.get(out=lh_acc)
+    acc.rh.get(out=rh_acc)
 
     lh_out, rh_out = _avg_paths(out_dir, targ_mesh, seed_mesh)
     writer: Optional[BackgroundWriteHandle] = None
@@ -336,7 +350,7 @@ def avg_profiles_from_packed_gpu(
     return AvgProfilesResult(
         lh_path=lh_out, rh_path=rh_out,
         lh_avg=lh_acc, rh_avg=rh_acc,
-        lh_avg_dev=lh_acc_dev, rh_avg_dev=rh_acc_dev,
+        lh_avg_dev=acc.lh, rh_avg_dev=acc.rh,
         writer=writer,
     )
 
@@ -355,12 +369,14 @@ def avg_profiles_gpu(
     that the per-vertex accumulator lives on device.
 
     Disk-reading entry point: discovers + decodes the per-subject
-    ``.b2nd`` set, then delegates to
-    :func:`avg_profiles_from_packed_gpu`. The ``.npy`` pair write is
-    joined before returning, so this call keeps its historical
-    synchronous contract (``result.writer`` is already ``done``).
+    ``.b2nd`` set, uploads one subject at a time into a
+    :class:`PackedProfileAccumulator` and finishes through
+    :func:`avg_profiles_from_accumulator`. The ``.npy`` pair write is
+    joined before returning, so this call is synchronous
+    (``result.writer`` is already ``done``).
 
-    Memory contract (differs from the memory-side twin on purpose):
+    Memory contract (differs from :func:`avg_profiles_from_accumulator`
+    on purpose):
 
     * ``lh_avg_dev`` / ``rh_avg_dev`` are ``None``. Nothing downstream
       of this entry point consumes device buffers -- the disk path
@@ -368,7 +384,7 @@ def avg_profiles_gpu(
       the host arrays -- so retaining the two ``(V_h, D)`` fp32
       accumulators (~385 MB together at fsa6 / Schaefer-400) would just
       pin device memory that ``cp.get_default_memory_pool()
-      .free_all_blocks()`` could otherwise reclaim. The delegate's
+      .free_all_blocks()`` could otherwise reclaim. The accumulator's
       result is rebuilt with those fields cleared and its own reference
       dropped, so the last reference dies here.
     * ``lh_avg`` / ``rh_avg`` ARE the pinned D2H landing buffers (one
@@ -391,22 +407,27 @@ def avg_profiles_gpu(
 
     V_lh, V_rh = _hemi_vert_counts(targ_mesh)
 
-    sub_paths, packed_arrs, _T0, _N0, _D0_bytes, D0 = _discover_and_decode_subjects(
+    sub_paths, packed_arrs, T0, _N0, _D0_bytes, D0 = _discover_and_decode_subjects(
         out_dir, targ_mesh, seed_mesh, num_sub, num_sess, V_lh, V_rh, verbose,
     )
-    if verbose:
-        for sub, _p in sub_paths:
+
+    acc = PackedProfileAccumulator(V_lh, V_rh, D0, T0)
+    for (sub, _p), arr in zip(sub_paths, packed_arrs):
+        arr_dev = cp.asarray(arr)            # one H2D per subject
+        for t in range(T0):
+            acc.add(t, arr_dev[t])
+        del arr_dev                          # peak device usage: one subject
+        if verbose:
             print(f"current subject:{sub}")
 
-    res = avg_profiles_from_packed_gpu(
-        packed_arrs, D0, targ_mesh, seed_mesh, out_dir,
-        save=True, verbose=False,
+    res = avg_profiles_from_accumulator(
+        acc, targ_mesh, seed_mesh, out_dir, save=True,
     )
     res.writer.wait()
     # Drop the device accumulators: no consumer on this path, and the
-    # frozen dataclass cannot be mutated in place. ``del res`` removes
-    # the only other reference, so the cupy blocks become reclaimable
-    # by ``free_all_blocks()`` as soon as we return.
+    # frozen dataclass cannot be mutated in place. ``del res`` / ``del
+    # acc`` remove the only other references, so the cupy blocks become
+    # reclaimable by ``free_all_blocks()`` as soon as we return.
     out = _dc_replace(res, lh_avg_dev=None, rh_avg_dev=None)
-    del res
+    del res, acc
     return out

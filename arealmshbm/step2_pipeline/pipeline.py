@@ -172,8 +172,8 @@ class Step2Pipeline:
         # terminal ``done`` emit lives in
         # ``Pipeline._run_step2_train_prior`` (driver wrapper) AFTER the
         # ``prior_dst.exists()`` artifact check — see :meth:`run` for
-        # the rationale. ``progress=None`` → standalone unit tests and
-        # legacy regression scripts; storing a disabled emitter rather
+        # the rationale. ``progress=None`` → standalone unit tests;
+        # storing a disabled emitter rather
         # than ``None`` keeps every emit call site branchless (no
         # per-call ``is not None`` guard), matching the step0/1/3 stage
         # pipelines' pattern.
@@ -661,8 +661,7 @@ class Step2Pipeline:
             f"  P={inputs.layout.P} of N*L={inputs.N * inputs.layout.L} "
             f"({100.0 * inputs.layout.P / max(1, inputs.N * inputs.layout.L):.2f}%)  "
             f"(N, T, D) = ({inputs.N}, {inputs.T}, {inputs.D})  "
-            f"D_grad={inputs.D_grad}  "
-            f"packed_host={'yes' if inputs.packed_host is not None else 'no'}"
+            f"D_grad={inputs.D_grad}"
         )
         self._log(
             f"  load_inputs done in {self.timings['load_inputs']:.2f}s"
@@ -753,12 +752,9 @@ class Step2Pipeline:
         )
         self.timings["session_ctor"] = time.perf_counter() - t_ctor
         if cfg.verbose:
-            mode_resolved = getattr(sess, "bold_cache_mode", None)
-            if mode_resolved is None:
-                mode_resolved = getattr(sess, "_bold_cache_mode", "unknown")
             self._log(
                 f"  GPU BOLD cache mode: requested={cfg.bold_cache_mode!r} "
-                f"resolved={mode_resolved!r}"
+                f"resolved={sess.bold_cache_mode!r}"
             )
 
         # Device-side init: K1 (hard labels + compose) + log_theta +

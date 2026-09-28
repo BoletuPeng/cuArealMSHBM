@@ -7,18 +7,13 @@ buffer, and each session's packed slab leaves the GPU straight into its
 final place in the whole-subject pinned block while the .b2nd write
 runs on a background thread.
 
-Ingest has two forms and the compute has one. With
-``nvidia-nvcomp-cu12`` installed the sessions arrive from
+Ingest is
 :func:`~arealmshbm.data_io.gifti_bold_gpu.iter_subject_bold_gpu`
-(``raw_sessions=True``: GPU bytescan + base64 + batched Deflate);
-without it they arrive from the CPU reader
-(:func:`~arealmshbm.data_io.gifti_io.read_surface_gifti` on a small
-thread pool, assembled into pinned staging and H2D'd). Both accept
-the same files (canonical single-line base64) and hand
-:func:`compute_subject_profiles_gpu` the same ``(T, n_lh + n_rh)``
-fp32 device buffer -- byte-for-byte the same, pinned by
-``data_io/tests/test_gifti_readers.py`` -- so the packed output does
-not depend on which one ran; the result reports which did.
+(GPU bytescan + base64 + batched nvCOMP Deflate), which hands
+:func:`compute_subject_profiles_gpu` one ``(T, n_lh + n_rh)`` fp32
+device buffer per run. ``nvidia-nvcomp-cu12`` is a hard dependency of
+this path: a missing or unloadable install is an ``ImportError``, never
+a slower reader.
 
 Public API:
 
@@ -37,14 +32,10 @@ Public API:
     prewarm_generate_profiles_gpu(bold_paths=None)
         Idempotent first-call cost (NVRTC, cuBLAS, nvCOMP, blosc2).
 
-    release_pinned_staging()
-        Return every pooled pinned D2H block to the driver.
-
-Sessions of differing length are supported. The nvCOMP reader wants
-one ``T`` per call, so on that ingest the subject is driven as a chain
-of calls split on the GIFTI ``NumberOfDataArrays`` header (one call
-when ``T`` is uniform, which is the production case); the CPU-reader
-ingest reads a pair at a time and needs no split.
+Sessions of differing length are supported. The reader wants one
+``T`` per call, so the subject is driven as a chain of calls split on
+the GIFTI ``NumberOfDataArrays`` header (one call when ``T`` is
+uniform, which is the production case).
 
 Semantics: per-run zscore, sum over runs, ``* 1/n_runs``, one
 threshold over the joint ``lh|rh`` array, ``>=`` binarize, medial wall
@@ -59,12 +50,11 @@ the kernel's per-column result depends only on that column's values,
 ``T`` and the block size -- never on ``N``, which only enters the
 addressing. So normalising all ``n_full`` columns once and gathering
 the seed columns out of the result is bit-identical to the
-"gather, then zscore the (T, K) copy" order the retired per-session
-leaf used. The degenerate-column and ``+-0.0`` conventions of the two
-kernels are documented in :mod:`._kernels_gpu`; neither is observable
-after the ``>=`` compare.
-``tests/test_subject_profiles_gpu.py`` pins both against a
-transcription of that retired formulation.
+"gather, then zscore the (T, K) copy" order ``_reference_packed``
+(the per-session oracle) uses. The degenerate-column and ``+-0.0``
+conventions of the two kernels are documented in :mod:`._kernels_gpu`;
+neither is observable after the ``>=`` compare.
+``tests/test_subject_profiles_gpu.py`` pins both against that oracle.
 
 cupy is imported at module top -- this file is only reachable through
 the GPU entry points below, so the CPU path never pays for it.
@@ -85,72 +75,16 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import cupy as cp
 import numpy as np
 
-from ..data_io.gifti_io import read_surface_gifti
+from ..data_io.gifti_bold_gpu import (
+    iter_subject_bold_gpu,
+    prewarm_subject_bold_gpu,
+)
 from ._kernels_gpu import (
     binarize_mwzero_pack_cupy,
     threshold_top_fraction_exact_cupy,
     zscore_unit_norm_columns_zerovar_cupy,
 )
 from .profiles import _icosphere_nverts, _read_censor_vector, _read_lines
-
-
-
-# ─────────────────────────────────────────────────────────────────────
-# Pinned D2H staging pool (the packed buffer is the same size for every
-# subject of a cohort, so blocks recycle)
-# ─────────────────────────────────────────────────────────────────────
-_PINNED_LOCK = threading.Lock()
-_PINNED_FREE: List = []          # [(mem, nbytes)], LIFO
-_PINNED_KEEP = 2                 # blocks retained across subjects
-
-
-def _acquire_pinned(nbytes: int):
-    """``(uint8 view, token)`` -- a pinned host block you must release.
-
-    A pool rather than one cached block: the subject's packed bytes are
-    D2H'd into it and then read by the background .b2nd writer, so the
-    NEXT subject's D2H must not be allowed to land in the same memory
-    while that writer is still going. The token is released by
-    :meth:`SubjectProfilesResult.wait`, which joins the writer first,
-    so the ordering is enforced rather than assumed.
-
-    Never blocks: an empty pool allocates. At most :data:`_PINNED_KEEP`
-    blocks are retained on release, so a caller that forgets to release
-    leaks bounded memory instead of deadlocking.
-
-    Best fit, not first fit: two block sizes circulate per subject (this
-    packed block and, on the CPU-reader ingest, the ``(T, n_full)`` fp32
-    staging block), and first fit would hand the larger one to the
-    smaller request and then re-allocate the larger every other
-    subject.
-    """
-    nbytes = int(nbytes)
-    with _PINNED_LOCK:
-        best = -1
-        for i, (_mem, cap) in enumerate(_PINNED_FREE):
-            if cap >= nbytes and (best < 0 or cap < _PINNED_FREE[best][1]):
-                best = i
-        if best >= 0:
-            mem, cap = _PINNED_FREE.pop(best)
-            return (np.frombuffer(mem, dtype=np.uint8, count=nbytes),
-                    (mem, cap))
-    mem = cp.cuda.alloc_pinned_memory(nbytes)
-    return (np.frombuffer(mem, dtype=np.uint8, count=nbytes),
-            (mem, nbytes))
-
-
-def _release_pinned(token) -> None:
-    if token is None:
-        return
-    with _PINNED_LOCK:
-        if len(_PINNED_FREE) < _PINNED_KEEP:
-            _PINNED_FREE.append(token)
-
-
-def release_pinned_staging() -> None:
-    """Give every pooled pinned D2H block back to the driver."""
-    with _PINNED_LOCK:
-        del _PINNED_FREE[:]
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -226,7 +160,8 @@ def compute_subject_profiles_gpu(sessions: Iterable,
                                   censor: Optional[Dict] = None,
                                   stream=None,
                                   out: Optional[np.ndarray] = None,
-                                  on_session=None):
+                                  on_session=None,
+                                  on_packed=None):
     """Fused per-subject FC-profile compute, one D2H for the subject.
 
     Parameters
@@ -236,9 +171,9 @@ def compute_subject_profiles_gpu(sessions: Iterable,
         ``runs`` is either one ``(T, n_full) fp32`` C-contiguous device
         buffer (single-run session -- what
         :func:`~arealmshbm.data_io.gifti_bold_gpu.iter_subject_bold_gpu`
-        with ``raw_sessions=True`` yields) or a sequence of them, one
-        per run. Consumed lazily, so a generator lets ingest of session
-        ``g+1`` overlap the compute of session ``g``.
+        yields) or a sequence of them, one per run. Consumed lazily,
+        so a generator lets ingest of session ``g+1`` overlap the
+        compute of session ``g``.
         Columns ``[0, n_lh)`` are lh, ``[n_lh, n_full)`` rh.
     n_sess : int
         Number of sessions, i.e. the packed buffer's first-axis size.
@@ -279,6 +214,18 @@ def compute_subject_profiles_gpu(sessions: Iterable,
         whole-subject copy at the end; ``out`` is the same fully
         populated array either way by the time this returns (the last
         copy is joined before it does).
+    on_packed : callable, optional
+        ``on_packed(sess_index, packed_dev)``, called on THIS thread
+        right after session ``sess_index``'s pack kernel is issued,
+        with the ``(n_full, ceil(K/8))`` uint8 DEVICE slab it wrote --
+        a view into the leaf's whole-subject device buffer, valid for
+        the call only. The compute stream is current, so kernels the
+        callee launches queue behind the pack and read the finished
+        slab without a sync; the leaf drains that stream before it
+        returns, so their results are complete by then. Step 1's
+        ``PackedProfileAccumulator.add`` folds each session into the
+        cohort average this way, without the bytes ever leaving the
+        GPU.
 
     Returns
     -------
@@ -394,6 +341,8 @@ def compute_subject_profiles_gpu(sessions: Iterable,
                 binarize_mwzero_pack_cupy(corr_sum, mw_d, float(t),
                                           packed_dev[si])
                 del corr_sum
+                if on_packed is not None:
+                    on_packed(si, packed_dev[si])
                 # D2H of just this session's packed slab, straight into
                 # its final place in ``out``: the per-session copy IS the
                 # whole-subject array, so nothing is copied twice. Async
@@ -459,19 +408,18 @@ class SubjectProfilesResult:
     """Handle returned by :func:`generate_subject_profiles_gpu`.
 
     ``.packed`` is the ``(n_sess, N, ceil(K/8)) uint8`` host array,
-    ``.K`` the unpacked seed count, ``.out_path`` the .b2nd that
-    ``.wait()`` joins on (``None`` when no write was asked for), and
-    ``.ingest`` which decode fed the compute -- ``'nvcomp'`` or
-    ``'cpu-reader'`` -- for the runner's per-subject line; nothing in
-    ``.packed`` depends on it.
+    ``.K`` the unpacked seed count and ``.out_path`` the .b2nd that
+    ``.wait()`` joins on (``None`` when no write was asked for).
 
-    ``.packed`` lives in a pooled **pinned** block that ``.wait()``
-    hands back, so it is valid until you call ``.wait()`` and then
-    start another subject; copy it if you need it beyond that. Calling
-    ``.wait()`` is what makes the next subject's D2H safe -- it joins
-    the writer that is reading this block before releasing it. It is
-    idempotent on success, so calling it twice is fine; on a failed
-    write every call re-raises the writer's exception.
+    ``.packed`` is a **pinned** host block from CuPy's pinned pool. It
+    returns to that pool when its last reference dies -- this handle,
+    the writer's slab views, anything you keep -- so it is valid for
+    as long as you hold it, and the next subject can never be D2H'd
+    into memory a writer is still reading. Pinned memory is scarce,
+    though: a cohort loop should drop it before the next subject
+    (``run_generate_profiles`` does). ``.wait()`` joins the
+    writer; it is idempotent on success, so calling it twice is fine;
+    on a failed write every call re-raises the writer's exception.
 
     Because the .b2nd is written chunk-by-chunk as the sessions land,
     by the time you get this handle the writer is normally down to the
@@ -487,39 +435,30 @@ class SubjectProfilesResult:
     traceback, and the on-disk file is missing or truncated either way.
     """
 
-    __slots__ = ("packed", "K", "out_path", "ingest", "_future", "_token",
-                 "_exc")
+    __slots__ = ("packed", "K", "out_path", "_future", "_exc")
 
-    def __init__(self, packed, K: int, out_path, future: Optional[Future],
-                 token=None, *, ingest: str):
+    def __init__(self, packed, K: int, out_path, future: Optional[Future]):
         self.packed = packed
         self.K = int(K)
         self.out_path = out_path
-        self.ingest = str(ingest)
         self._future = future
-        self._token = token
         self._exc: Optional[BaseException] = None
         if future is not None:
             future.add_done_callback(_warn_if_write_failed)
 
     def wait(self):
-        """Join the background .b2nd write, then release the pinned
-        block ``.packed`` borrows. The writer's exception is latched and
-        re-raised by EVERY call, not only the first: a late joiner must
-        not read a failed write as a finished one."""
-        try:
-            if self._future is not None:
-                fut, self._future = self._future, None
-                try:
-                    fut.result()
-                except BaseException as exc:
-                    self._exc = exc
-                    raise
-            elif self._exc is not None:
-                raise self._exc
-        finally:
-            _release_pinned(self._token)
-            self._token = None
+        """Join the background .b2nd write. The writer's exception is
+        latched and re-raised by EVERY call, not only the first: a late
+        joiner must not read a failed write as a finished one."""
+        if self._future is not None:
+            fut, self._future = self._future, None
+            try:
+                fut.result()
+            except BaseException as exc:
+                self._exc = exc
+                raise
+        elif self._exc is not None:
+            raise self._exc
         return self.out_path
 
     def __del__(self):                  # pragma: no cover - GC timing
@@ -540,7 +479,7 @@ class SubjectProfilesResult:
                     f"{getattr(self, 'out_path', None)} was discarded "
                     "while its .b2nd write was still running; call "
                     ".wait() (or use it as a context manager) so write "
-                    "errors are raised and the pinned block is reused.",
+                    "errors are raised.",
                     RuntimeWarning, stacklevel=1)
         except BaseException:           # interpreter shutdown
             pass
@@ -742,7 +681,7 @@ def _t_hint(path) -> Optional[int]:
 def _t_blocks(pairs: Sequence[Tuple[str, str]]) -> List[Tuple[int, int]]:
     """Split ``pairs`` into maximal ``[lo, hi)`` runs of equal-T pairs.
 
-    ``read_subject_bold_gpu`` requires every file of ONE call to share
+    ``iter_subject_bold_gpu`` requires every file of ONE call to share
     ``T`` (it decodes a whole group into one ``(T, n_full)`` buffer per
     session and checks T across groups). Real cohorts have sessions of
     different length, so the subject is driven as a chain of calls, one
@@ -765,108 +704,6 @@ def _t_blocks(pairs: Sequence[Tuple[str, str]]) -> List[Tuple[int, int]]:
             blocks.append((lo, i))
             lo = i
     return blocks
-
-
-# CPU-reader ingest: 8 decode workers (the isal_zlib saturation
-# plateau, same as ``Step1BoldPrefetcher``) and up to 4 pairs submitted
-# ahead of the one being consumed -- ramped up from one, so the first
-# pair has the pool to itself and the compute starts after one file's
-# decode rather than after four pairs contending for it.
-_HOST_INGEST_WORKERS = 8
-_HOST_INGEST_PAIRS_AHEAD = 4
-
-
-def _host_ingest_sessions(pairs: Sequence[Tuple[str, str]],
-                          n_lh: int, n_rh: int):
-    """``(pair_index, (T, n_lh + n_rh) fp32 device buffer)``, in order.
-
-    The stand-in for
-    :func:`~arealmshbm.data_io.gifti_bold_gpu.iter_subject_bold_gpu`
-    with ``raw_sessions=True`` when nvCOMP is absent, and contract-
-    identical to it: no NaN cleaning, no medial drop, lh in columns
-    ``[0, n_lh)``, and the same accepted input -- the reader runs with
-    ``allow_wrapped_b64=False``, so a line-wrapped payload is refused
-    here exactly as the device reader refuses it, rather than read on
-    one machine and rejected on another. The bytes are identical too:
-    ``read_subject_bold_gpu(raw_sessions=True)`` is pinned equal to the
-    CPU reader's time-major output in
-    ``data_io/tests/test_gifti_readers.py``, so the compute cannot tell
-    the two ingests apart.
-
-    Both hemispheres of up to :data:`_HOST_INGEST_PAIRS_AHEAD` pairs are
-    submitted ahead of the pair being assembled; the reader's base64 +
-    isal_zlib decode releases the GIL, so those workers overlap the
-    caller's GPU compute. The pair is assembled into a pooled pinned
-    block (:func:`_acquire_pinned`, so the H2D is a true async copy and
-    the pages are not faulted in per session) and released once the
-    copy is synchronised -- before the yield, since the consumer reads
-    the buffer from its own compute stream, which has no ordering
-    dependency on this thread's. Same contract as
-    ``iter_subject_bold_gpu``: what is yielded is already there, usable
-    from any stream.
-
-    Runs on the :func:`_threaded` producer thread, which has already
-    pinned the device; the H2D stream is that thread's cached one
-    (:func:`_thread_stream`), not a fresh stream per subject.
-    """
-    n_full = int(n_lh) + int(n_rh)
-    h2d = _thread_stream()
-    with ThreadPoolExecutor(max_workers=_HOST_INGEST_WORKERS,
-                            thread_name_prefix="profile-gifti") as pool:
-        inflight: "deque" = deque()
-        nxt = 0
-        ahead = 1
-        try:
-            while nxt < len(pairs) or inflight:
-                while nxt < len(pairs) and len(inflight) < ahead:
-                    lh_p, rh_p = pairs[nxt]
-                    inflight.append((
-                        nxt, lh_p, rh_p,
-                        pool.submit(read_surface_gifti, lh_p,
-                                    time_major=True, allow_wrapped_b64=False),
-                        pool.submit(read_surface_gifti, rh_p,
-                                    time_major=True, allow_wrapped_b64=False)))
-                    nxt += 1
-                ahead = min(ahead + 1, _HOST_INGEST_PAIRS_AHEAD)
-                i, lh_p, rh_p, lh_fut, rh_fut = inflight.popleft()
-                lh = lh_fut.result()            # (T, n_lh) fp32 host
-                rh = rh_fut.result()            # (T, n_rh) fp32 host
-                if int(lh.shape[1]) != int(n_lh):
-                    raise ValueError(
-                        f"{lh_p}: Dim0 {int(lh.shape[1])} != n_lh "
-                        f"{int(n_lh)}")
-                if int(rh.shape[1]) != int(n_rh):
-                    raise ValueError(
-                        f"{rh_p}: Dim0 {int(rh.shape[1])} != n_rh "
-                        f"{int(n_rh)}")
-                if int(lh.shape[0]) != int(rh.shape[0]):
-                    raise ValueError(
-                        f"lh/rh time-axis mismatch: {lh_p} has "
-                        f"T={int(lh.shape[0])}, {rh_p} has "
-                        f"T={int(rh.shape[0])}")
-                T = int(lh.shape[0])
-                flat, token = _acquire_pinned(T * n_full * 4)
-                try:
-                    buf = flat.view(np.float32).reshape(T, n_full)
-                    buf[:, :n_lh] = lh
-                    buf[:, n_lh:] = rh
-                    del lh, rh
-                    with h2d:
-                        dev = cp.empty((T, n_full), dtype=cp.float32)
-                        dev.set(buf)
-                    h2d.synchronize()
-                    del buf, flat
-                finally:
-                    _release_pinned(token)
-                yield i, dev
-                del dev
-        finally:
-            # Abandoned early (a consumer-side raise): un-started reads
-            # are dropped rather than paid for; the pool's shutdown
-            # still joins whatever is already running.
-            for _i, _lp, _rp, a, b in inflight:
-                a.cancel()
-                b.cancel()
 
 
 def _session_censor(project_dir: Path, sub: str, sess: str, n_runs: int):
@@ -896,7 +733,8 @@ def generate_subject_profiles_gpu(project_dir,
                                    targ_mesh: str,
                                    threshold=0.1,
                                    split_flag: str = "0",
-                                   write: bool = True) -> SubjectProfilesResult:
+                                   write: bool = True,
+                                   on_packed=None) -> SubjectProfilesResult:
     """Ingest + fused compute + .b2nd write for one subject.
 
     Parameters
@@ -926,24 +764,23 @@ def generate_subject_profiles_gpu(project_dir,
         one D2H at the end) though ``.out_path`` is still reported. A
         failure of that write is raised by ``.wait()``; a result dropped
         without ``.wait()`` reports it as a ``RuntimeWarning`` instead.
+    on_packed : callable, optional
+        Forwarded to :func:`compute_subject_profiles_gpu`: called with
+        each session's finished packed DEVICE slab the moment it is
+        packed (the step-1 cohort average is accumulated through it).
 
     Notes
     -----
-    Ingest is chosen here, once, from
-    :func:`~arealmshbm.data_io._nvcomp_batched.nvcomp_available`: the
-    batched device decode when nvCOMP is installed, the CPU GIFTI
-    reader (:func:`_host_ingest_sessions`) otherwise. Same accepted
-    files, same bytes, same compute, same artifacts -- only where the
-    DEFLATE runs, which the result reports as ``.ingest`` and the
-    runner prints with the subject's timing.
+    Ingest is the batched nvCOMP device decode
+    (:func:`~arealmshbm.data_io.gifti_bold_gpu.iter_subject_bold_gpu`);
+    without ``nvidia-nvcomp-cu12`` it raises ``ImportError``.
 
-    Runs may differ in length. ``read_subject_bold_gpu`` requires one
-    ``T`` per call, so on the nvCOMP ingest the subject is driven as a
-    chain of reader calls split on the ``NumberOfDataArrays`` header
-    hint (:func:`_t_blocks`) -- a single call, and therefore a single
-    uninterrupted ingest pipeline, whenever every run has the same
-    ``T``, which is the production case. Only the block boundaries cost
-    a pipeline bubble.
+    Runs may differ in length. ``iter_subject_bold_gpu`` requires one
+    ``T`` per call, so the subject is driven as a chain of reader calls
+    split on the ``NumberOfDataArrays`` header hint (:func:`_t_blocks`)
+    -- a single call, and therefore a single uninterrupted ingest
+    pipeline, whenever every run has the same ``T``, which is the
+    production case. Only the block boundaries cost a pipeline bubble.
 
     Every kernel is issued on a module-owned non-blocking compute
     stream (:func:`_thread_stream`) so the ingest's decode stream can
@@ -956,7 +793,6 @@ def generate_subject_profiles_gpu(project_dir,
     """
     import queue as _queue
 
-    from ..data_io import _nvcomp_batched
     from ..data_io.profile_io import profile_path
 
     if str(split_flag) != "0":
@@ -1006,26 +842,17 @@ def generate_subject_profiles_gpu(project_dir,
 
     dev_id = int(cp.cuda.runtime.getDevice())
 
-    if _nvcomp_batched.nvcomp_available():
-        ingest = "nvcomp"
-        from ..data_io.gifti_bold_gpu import iter_subject_bold_gpu
-        blocks = _t_blocks(pairs)
+    blocks = _t_blocks(pairs)
 
-        def _flat():
-            # One reader call per equal-T block (one call for a uniform
-            # subject). Chaining keeps pair order, which is all _grouped
-            # relies on -- the per-call session index is ignored.
-            for lo, hi in blocks:
-                for item in iter_subject_bold_gpu(
-                        pairs[lo:hi], n_lh=n_lh, n_rh=n_rh,
-                        raw_sessions=True,
-                        group_sessions=_INGEST_GROUP_SESSIONS):
-                    yield item
-    else:
-        ingest = "cpu-reader"
-
-        def _flat():
-            return _host_ingest_sessions(pairs, n_lh, n_rh)
+    def _flat():
+        # One reader call per equal-T block (one call for a uniform
+        # subject). Chaining keeps pair order, which is all _grouped
+        # relies on -- the per-call session index is ignored.
+        for lo, hi in blocks:
+            for item in iter_subject_bold_gpu(
+                    pairs[lo:hi], n_lh=n_lh, n_rh=n_rh,
+                    group_sessions=_INGEST_GROUP_SESSIONS):
+                yield item
 
     def _grouped():
         """Regroup the reader's flat per-run stream into sessions."""
@@ -1046,12 +873,18 @@ def generate_subject_profiles_gpu(project_dir,
         out_path = profile_path(project_dir, sub, targ_mesh, seed_mesh)
     out_path = Path(out_path)
 
-    # Pinned destination for the subject's D2H. The pool hands back a
-    # block no live writer is reading (see _acquire_pinned).
+    # Pinned destination for the subject's D2H, from CuPy's pinned
+    # pool. The block goes back to that pool only when its last
+    # reference dies -- the result's ``.packed``, the writer's slab
+    # views -- so the next subject's D2H cannot land in memory a writer
+    # is still reading, and a cohort loop that drops each result
+    # recycles one block.
     n_sess = len(sess_ids)
     K_hint = int(seed_idx.size)
     D_bytes = (K_hint + 7) // 8
-    flat, token = _acquire_pinned(n_sess * n_full * D_bytes)
+    nbytes = n_sess * n_full * D_bytes
+    flat = np.frombuffer(cp.cuda.alloc_pinned_memory(nbytes),
+                         dtype=np.uint8, count=nbytes)
     packed_out = flat.reshape(n_sess, n_full, D_bytes)
 
     # The .b2nd is written a session at a time, on the writer thread,
@@ -1073,7 +906,6 @@ def generate_subject_profiles_gpu(project_dir,
             # the job returns on the first sentinel it sees, and an
             # extra sentinel nobody reads is harmless.
             q.put(_WRITE_ABORT)
-            _release_pinned(token)
             raise
 
         def _enqueue(si, slab, evt, _put=q.put):
@@ -1086,26 +918,24 @@ def generate_subject_profiles_gpu(project_dir,
             _grouped(), n_sess=n_sess, n_full=n_full,
             seed_idx=seed_idx, mw_mask=mw, threshold=threshold,
             censor=censor or None, stream=compute_stream,
-            out=packed_out, on_session=on_session)
+            out=packed_out, on_session=on_session, on_packed=on_packed)
         if fut is not None:
             # Inside the try so the except below still owns every path
             # between the compute call and the sentinel.
             q.put(_WRITE_DONE)
     except BaseException:
         if fut is not None:
-            # Stop the writer BEFORE the pinned block is recycled: it
-            # holds slab views of it. The queue is unbounded, so the
-            # sentinel is always accepted and the job always ends.
+            # Stop the writer so no half-written .b2nd is left behind.
+            # The queue is unbounded, so the sentinel is always accepted
+            # and the job always ends.
             stop.set()
             q.put(_WRITE_ABORT)
             try:
                 fut.result()
             except BaseException:
                 pass                    # the compute error is the story
-        _release_pinned(token)
         raise
-    return SubjectProfilesResult(packed, K, out_path, fut, token,
-                                 ingest=ingest)
+    return SubjectProfilesResult(packed, K, out_path, fut)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1115,9 +945,7 @@ _STREAM_TLS = threading.local()
 
 
 def _thread_stream():
-    """One cached non-blocking stream per thread: the compute loop's on
-    the consumer thread, the CPU-reader ingest's H2D on the producer
-    thread.
+    """One cached non-blocking compute stream per thread.
 
     Non-blocking so the ingest's decode stream is free to run group
     ``g+1`` while the compute chews on group ``g``; per-thread so two
@@ -1142,12 +970,9 @@ def prewarm_generate_profiles_gpu(bold_paths=None) -> None:
 
     Compiles the three RawKernels (zscore-zerovar, radix histogram,
     binarize+pack), creates the cuBLAS handle, imports blosc2 for the
-    writer, and -- when nvCOMP is what the ingest will use -- forwards
-    to
+    writer, and forwards to
     :func:`~arealmshbm.data_io.gifti_bold_gpu.prewarm_subject_bold_gpu`
-    (nvCOMP library load, GIFTI kernels, pinned staging). The CPU
-    reader has no device-side first-call cost, so on that ingest there
-    is nothing to warm.
+    (nvCOMP library load, GIFTI kernels, pinned staging).
 
     Idempotent and thread-safe; safe to run on a daemon thread during
     pipeline init. ``bold_paths`` is an optional sequence of
@@ -1182,20 +1007,14 @@ def prewarm_generate_profiles_gpu(bold_paths=None) -> None:
         cp.matmul(g, g)
         cp.cuda.get_current_stream().synchronize()
         del x, y, mw, packed, g
-        try:
-            from ..data_io.profile_io import _blosc2
-            _blosc2()
-        except ImportError:
-            pass
-        from ..data_io import _nvcomp_batched
-        if _nvcomp_batched.nvcomp_available():
-            from ..data_io.gifti_bold_gpu import prewarm_subject_bold_gpu
-            # Without paths we cannot size the pinned staging buffer,
-            # so ask for a token 1 MB -- the NVRTC compile, the nvCOMP
-            # ctypes load and the first cupy reduction are what matter,
-            # and the real allocation happens at ingest.
-            if bold_paths:
-                prewarm_subject_bold_gpu(bold_paths)
-            else:
-                prewarm_subject_bold_gpu(nbytes=1 << 20)
+        from ..data_io.profile_io import _blosc2
+        _blosc2()
+        # Without paths we cannot size the pinned staging buffer, so
+        # ask for a token 1 MB -- the NVRTC compile, the nvCOMP ctypes
+        # load and the first cupy reduction are what matter, and the
+        # real allocation happens at ingest.
+        if bold_paths:
+            prewarm_subject_bold_gpu(bold_paths)
+        else:
+            prewarm_subject_bold_gpu(nbytes=1 << 20)
         _PREWARM_DONE = True

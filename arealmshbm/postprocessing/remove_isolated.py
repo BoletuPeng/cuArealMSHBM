@@ -11,9 +11,8 @@ decisions are computed against the entry-state labels and written into
 a fresh copy, so they are order-invariant.
 
 Public API:
-    remove_isolated_surface_components(lh_labels, rh_labels, lh_mesh,
-                                       rh_mesh, abs_threshold=5)
-        -> (lh_labels_new, rh_labels_new)
+    remove_isolated_surface_components(labels, vertex_nbors, abs_threshold=5)
+        -> new_labels          (one hemisphere per call)
 
 Tie-break:
     ``mode`` of an int array breaks ties on the smallest value (MATLAB

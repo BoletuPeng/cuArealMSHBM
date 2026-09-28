@@ -8,10 +8,12 @@ OS page cache) and runs 2+ (warm) are visible separately.
 
 Stages reported (``Step2Pipeline.timings`` keys):
 
-    load        load_inputs            — cohort + BOLD + gradient + group.mat
-                                         + spatial mask → layout
+    load        load_inputs            — cohort + BOLD header / MW check +
+                                         gradient + group.mat + spatial mask
+                                         → layout (no per-subject BOLD decode)
     init        initialize_params      — ini_val + host bookkeeping
-    ctor        session_ctor           — device buffers + module compile
+    ctor        session_ctor           — device buffers + module compile +
+                                         the per-subject BOLD decode / H2D
     init_device init_device            — K1 init on device (gpu backend)
     em_total    em_total               — the accumulated EM-body wall; the
                                          per-EM-iteration mean uses

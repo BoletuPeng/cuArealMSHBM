@@ -25,17 +25,14 @@ offers the same two values.
 | `'cpu'` | numba master + host outer-EM leaves | **the reference** |
 | `'gpu'` | P-layout / bit-packed CuPy backend (`Step2SparseSession`) | CPU semantics on device; contract in [`step2_sparse_design.md`](step2_sparse_design.md). Requires `seed_mesh='fsaverage3'` (⌈D/8⌉ ≤ 256), `num_clusters ≤ 512`, `n_grad_components ≤ 11772` |
 
-The dense CuPy port that held `'gpu'` until 2026-09 (fp32 flush-to-zero
-`exp`, wrong at S=1, nondeterministic) was removed; `'gpu_sparse'`, the
-name this backend shipped under beside it, is rejected by both configs.
-
 ### `Params_Final.mat` format — unchanged, on every backend
 
 `Step2Pipeline._save_params` calls `_save.save_params_final` on both
 backends, so the file keeps the contract it has
 always had: `theta` a dense fp64 `(N, L)` block, container
-`do_compression=True`, byte-identical to the pre-`_save.py` inline saver
-(`test_save.py::test_dense_branch_matches_the_legacy_saver` compares
+`do_compression=True`, byte-identical to `scipy.io.savemat` of the
+transposed-mu fp64 dict
+(`test_save.py::test_dense_branch_matches_the_reference_saver` compares
 `bytes[128:]`). The `gpu` backend's `export_params()` returns a
 scipy `csc_matrix` and the writer densifies it.
 
@@ -121,9 +118,11 @@ into the fused widen+normalize numba kernel).
   kernel but reads the packed bytes off disk every call. No fp32 chunk-
   view intermediate is ever materialized.
 
-On binary 0/1 input the bit-packed kernel is **bit-identical** to the
-host fp32 `_normalize_session_inplace_kernel` (same fp32 accumulator
-order, integer popcount → fp32 mean is exact for D ≤ 2^24).
+On binary 0/1 input the bit-packed kernel is **bit-identical** to an
+fp32 unpack-then-demean/L2-normalise (same fp32 accumulator order,
+integer popcount → fp32 mean is exact for D ≤ 2^24); the 3-pass oracle
+is `_normalize_session_inplace_ref` in
+`step2_io/tests/test_subject_loaders.py`.
 
 Wall numbers: [`## Wall`](#wall) below.
 
@@ -135,11 +134,16 @@ Wall numbers: [`## Wall`](#wall) below.
 (default) picks `'eager_bitpacked'` when packed cache + gradient +
 `(S, T, L, D)` fp32 `s_t_nu` / `X_dot_sl` + `(S, P)` `s_lambda` + the
 iteration-1 scratch + the margin fit in free device memory, otherwise
-`'stream'`; an explicit `'eager_bitpacked'` that does not fit raises,
-and `'stream'` refills one pinned `(T, N, ⌈D/8⌉)` slot from a pageable
-host cache built once in `load_inputs_sparse` (two H2D visits per
-subject per EM iteration). There is no `(S, N, L)` `s_lambda` on this
-backend, so the dense port's real VRAM ceiling is gone.
+`'stream'`; an explicit `'eager_bitpacked'` that does not fit raises.
+`'eager_bitpacked'` fills the device cache straight from the loader's
+per-subject reader through a 2-slot page-locked ring (outside cupy's
+pinned pool) that is released afterwards — no host memory of the
+cohort outlives the constructor. `'stream'` refills one
+pinned `(T, N, ⌈D/8⌉)` slot per visit (two H2D visits per subject per
+EM iteration) from a pageable host cache the Session builds when it
+fits half of the available host RAM (`psutil`), else through the
+reader with a `RuntimeWarning`. There is no `(S, N, L)` `s_lambda` on
+this backend.
 
 Bit-packing convention: LSB-first along D (cell `d` → bit `(d & 7)` of
 byte `(d >> 3)`), matching `numpy.packbits` with `bitorder='little'`.
@@ -296,6 +300,8 @@ arealmshbm/
 ├── step2_pipeline/                        # top-level Python entry
 │   ├── config.py                          Step2Config dataclass (g/dMSHBM only)
 │   ├── pipeline.py                        Step2Pipeline lifecycle (g/dMSHBM)
+│   ├── _save.py                           save_params_final (Params_Final.mat)
+│   ├── profile.py                         per-stage timing profile
 │   └── vmf_clustering_batch.py            ⟨A⟩ thin wrapper around the
 │                                          fused EM-iter master; loops
 │                                          max_iter_em iters + EM-conv test
@@ -324,14 +330,14 @@ arealmshbm/
 ├── step2_io/                              # data I/O leaves
 │   ├── load_group_mtc.py                  group.mat (mtc / epsil / labels)
 │   ├── load_subject_profiles.py           per-subject (N, D, T) BOLD profiles
-│   ├── load_subject_gradient.py           per-subject (N, 100, T) diffusion emb
 │   ├── sparse_layout.py                   Step2Layout — CSR/CSC over P ('gpu')
 │   └── sparse_inputs.py                   Step2SparseInputs + its loader ('gpu')
 │
 ├── step2_init/                            # init-phase leaves
-│   ├── init_s_lambda.py                   L8 — per-subject one-hot init
+│   ├── _kernels.py                        numba init kernels
 │   ├── boundary_mask.py                   L9 — block-diagonal (g/dMSHBM)
-│   └── init_theta.py                      post-init theta computation
+│   └── compose_init_state.py              L8 — fused per-subject argmax +
+│                                          theta + s_lambda init
 │
 └── step2_em_outer/                        # outer-EM closed-form leaves
     ├── intra_subject_var_loop.py          L17 — s_psi + sigma while-loop
@@ -362,18 +368,18 @@ skips spatial entirely.
 Bench `testdata/step2_bench/proj` (S=1) and `proj2` (S=2): sub-001 (+002),
 fsaverage6 `N=81924`, `T=6`, `D=1175`, `L=300`, gMSHBM `beta=5`.
 RTX 5090 Laptop (82 SMs, 24 GB), cupy 13.6 / NVRTC 12.9, warm =
-in-process runs 2+ after a prewarm. The instrumented numbers below were
-taken with the per-kernel cuda-event timers the Session carried at the
-time (~8-12 % of `em_total`, since retired — see the uninstrumented
-range alongside).
+in-process runs 2+ after a prewarm. The instrumented numbers below
+include per-kernel cuda-event timers (~8-12 % of `em_total`; the
+uninstrumented range is alongside). The middle column is the dense CuPy
+port measured on the same bench (2026-09-03).
 
-| | `'gpu'` | retired dense port | `'cpu'` | speedup vs dense / cpu |
+| | `'gpu'` | dense GPU port | `'cpu'` | speedup vs dense / cpu |
 |---|---:|---:|---:|---:|
 | S=1 warm `run()` | **0.32-0.36 s** (0.320 [0.311, 0.329] n=7 in one session; 0.357 [0.330, 0.392] in a later, warmer one; uninstrumented 0.32-0.37) | 6.9 s | 71 s | ×19-21 / ×200 |
 | S=2 warm `run()` | **0.59-0.64 s** (0.589 [0.580, 0.599] and 0.640 [0.634, 0.646], n=5 each, two sessions) | 14.0 s | 103 s | ×22-24 / ×160-175 |
 
 (The dense-port / `cpu` columns are the pre-rewrite baselines recorded
-in [`step2_sparse_design.md`](step2_sparse_design.md) §0; the sparse
+in [`step2_sparse_design.md`](step2_sparse_design.md) §0; the `'gpu'`
 column was re-measured 2026-09-03 on the final HEAD, after the F3 kernel
 pass — K3/K6 0.80/0.77 → 0.34/0.35 ms per launch, `init_hard_labels`
 22.9 → 8.5 ms, K7 39 → 25 ms, every change bit-identical in output.)
@@ -382,6 +388,19 @@ Per-stage, warm, S=1 → S=2: `load_inputs` 0.100 → 0.174 s ·
 `session_ctor` 0.058 → 0.086 s · `init_device` 0.009 → 0.017 s ·
 `em_total` 0.118 → 0.234 s · `closure_total` 0.019 → 0.063 s ·
 `save` 0.006-0.010 s.
+
+2026-09-27 (same bench, warm, n=5, merge-base 4cd6fe1 → this tree):
+the BOLD decode moved from the loader into the Session and blosc2 now
+decompresses straight into the page-locked slot (`get_slice_numpy`,
+63 → 47 ms per subject at fsaverage6 / T=6, no intermediate copy), so
+`load_inputs.profiles` / `session_ctor` read 80 / 58 ms → 22 / 89 ms
+at S=1 and 151 / 82 ms → 22 / 173 ms at S=2 (sums 138 → 111 ms and
+233 → 195 ms). What it buys: no pageable host copy of the cohort in
+`eager_bitpacked`, and nothing of the ingest stays page-locked (the
+two ring slots are released; cupy's pinned pool would have kept each
+72 MB slot as a 128 MiB block) — 40-subject reference-cohort step 2 (driver,
+gpu, prewarmed) peak host working set 4.12 → 1.30 GiB at 15.8 → 15.0 s
+wall on one run of each tree ("not slower"; no noise band measured).
 
 EM iterations: S=1 `inter=10`, 42 `run_iter` calls, **~3.1 ms/EM-iter**
 (≈ 2.5 ms excluding the one-shot iteration-1 K7 dense pass, ~25 ms,
@@ -397,9 +416,9 @@ first-inter `Record` rel **3.99e-6** (bar ≤ 5e-3), `iter_inter` 10 == 10.
 S=2 argmax flips **0**, dead-alive **168 vs 168**, `kappa` **0.0**,
 first-inter `Record` rel **1.38e-6**. Two `gpu` runs are `np.array_equal`
 on every saved field at both S (theta compared as its csc triplet).
-Downstream: step 3 (`gpu_full`, sub-001) run from the sparse-GPU prior
+Downstream: step 3 (dense GPU EM, sub-001) run from the `'gpu'` prior
 produces **exactly the same labels** as from the CPU prior (0 of 73 641
-cortex vertices differ); the retired dense port's prior differed on 4 758
+cortex vertices differ); the dense step-2 port's prior differed on 4 758
 (93.5 % agreement). `epsil` max-rel ~1.0 vs CPU at S=1/S=2 is the
 ill-conditioned `invAd(dim, R→1)` and has no downstream effect.
 
@@ -420,8 +439,8 @@ harness that is not shipped here.
 CPU backend, per-variant `em_total` at `max_iter_inter=2` (2026-05-20,
 internal step-2 profile run): gMSHBM 778.33 s, dMSHBM 562.12 s
 (`load_inputs` 0.62 s, `initialize_params.compose` 11.17 s). The
-retired dense CuPy port measured 101.49 s / 75.93 s on the same runs,
-and 373.94 s for the gMSHBM step at production `inter=10` in the
+dense CuPy port measured 101.49 s / 75.93 s on the same runs, and
+373.94 s for the gMSHBM step at production `inter=10` in the
 40-subject Mode-B end-to-end log. The `'gpu'` backend on this tree:
 16.5 s for the 40-subject Mode-B step 2 at `inter=10` (2026-09-07
 end-to-end run, all-GPU backends), and 4.1 s for the 10-subject cohort
@@ -442,7 +461,7 @@ variants runs through an internal profiling harness not shipped here.
 | In-memory `Params.s_t_nu`, `Params.s_psi`, `Params.mu`, `Params.theta` | fp32 | matches step 1 / step 3 convention |
 | `Params.kappa`, `Params.sigma`, `Params.epsil` | fp32 (1, L) | scalars per parcel |
 | `Cdln`, `invAd` reductions | fp64 internally | reuses existing helpers |
-| `Params.s_lambda` storage | **fp32** | Storage is fp32 (halves the s_lambda footprint vs the legacy fp64 design — 52 GB → 26 GB at S=200). The fp64 precision needed for the E-step softmax's β=5000 subnormal tier is preserved on a per-subject (N, L) fp64 scratch buffer inside Phase D + E.1 only; the row-normalized result casts back down to fp32 storage. |
+| `Params.s_lambda` storage | **fp32** | Storage is fp32 (halves the s_lambda footprint vs fp64 storage — 52 GB → 26 GB at S=200). The fp64 precision needed for the E-step softmax's β=5000 subnormal tier is preserved on a per-subject (N, L) fp64 scratch buffer inside Phase D + E.1 only; the row-normalized result casts back down to fp32 storage. |
 
 The fp32 / fp64 boundary at the softmax seam is implemented inside
 [`arealmshbm/step2_em_iter_master/_kernels.py`](../arealmshbm/step2_em_iter_master/_kernels.py)
@@ -457,7 +476,7 @@ the fp32→fp64 promotion to actually occur).
 | Module | Reused by | Notes |
 |---|---|---|
 | `em_stop_criterion/_cdln.py` (`_cdln_single`) | E-step phase D of the EM-iter master | Cdln, general D, 5-term Debye |
-| `m_step/_invad.py` (`invad`) | L17, L18 (outer-EM closure) | invAd with Banerjee + Newton. Inside the EM-iter master we use a numba inline of the Banerjee asymptotic branch (`invad_numba`) — for D ≥ 200 the bessel polish never activates. |
+| `m_step/_invad.py` (`invad_numba`) | L17, L18 (outer-EM closure), the EM-iter master; `dev_invad` in `step2_em_iter_master/_kernels_gpu.py` is its device form | Banerjee init, log-Bessel probe, secant polish in the root branch (κ0 below ~880 at D ≈ 1175, e.g. iter 1 m=1), asymptotic fallback. Agrees with step 3's host `invad` (scipy secant) to ~4e-4 rel in the root branch. Stock CBIG's local `invAd` computes this root / asymptotic value, discards it and returns its warm start `outu` (κ0), so neither port function is the MATLAB value. |
 | `initialize_concentration/` | init Params | Bessel-root κ init |
 | `data_io/load_avg_mesh.py` | mesh | MARS_label |
 | `data_io/load_spatial_mask.py` | boundary_mask build | already returns Tuple |

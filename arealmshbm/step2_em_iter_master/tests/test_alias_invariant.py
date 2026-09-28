@@ -19,18 +19,10 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from arealmshbm.step2_em_iter_master import (
-    Step2EmIterSession, warmup_em_iter_master,
-)
-from arealmshbm.step2_io import (
-    InMemoryGradientLoader,
+from arealmshbm.step2_em_iter_master import Step2EmIterSession
+from arealmshbm.step2_em_iter_master.tests._loaders import (
     InMemoryProfileLoader,
 )
-
-
-@pytest.fixture(scope="module", autouse=True)
-def _warmup():
-    warmup_em_iter_master()
 
 
 def _build_session():

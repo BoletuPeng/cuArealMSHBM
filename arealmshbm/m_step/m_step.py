@@ -296,9 +296,9 @@ class MStepSession:
                   np.ascontiguousarray(np.asarray(sigma).ravel(),
                                         dtype=np.float32))
         # Kappa is a scalar throughout the M-step — every iter calls
-        # ``invad`` to produce ONE fp64 value; the (L,) buffer the prior
-        # implementation used to materialize was always uniform. Track
-        # the scalar in a Python local; rebuild the (L,) at exit.
+        # ``invad`` to produce ONE fp64 value, so an (L,) buffer would
+        # always be uniform. Track the scalar in a Python local; rebuild
+        # the (L,) at exit.
         # Precondition: kappa_init is uniform across L (the production
         # caller — vmf_clustering — always seeds with
         # ``ini_val * np.ones(L)`` and the M-step itself only ever

@@ -15,22 +15,21 @@ transform and then delegate to ``compute_diffusion_map`` /
 ``compute_diffusion_map_gpu`` (defined in :mod:`.diffusion_map` /
 :mod:`.diffusion_map_gpu`), which implement the same
 partial-Lanczos algorithm on the symmetric similar matrix; the GPU
-mirror runs the matvecs on cuBLAS. The step-0 pipeline routes the
-repaired variants by default (selected via ``Step0Config.backend``).
+mirror runs the matvecs on cuBLAS. The step-0 pipeline calls the
+repaired variants (``Step0Config.backend`` picks CPU or GPU).
 The repair: CBIG fed a normalised *distance* matrix into the
 diffusion map, which expects an *affinity*; the production path
 prepends the canonical ``A = exp(-D / D.max())`` transform first.
 
 Precision policy:
     CPU path runs fp64 internally (scipy eigsh is fp64-only for the
-    Lanczos workspace anyway). GPU path runs **fp32** by default —
+    Lanczos workspace anyway). GPU path runs **fp32** —
     the affinity matrix ``exp(-D/D.max())`` is bounded in (0, 1] so
     the alpha-normalised symmetric similar matrix has well-controlled
     dynamic range; on the fsa6 down-sphere (N=12962) every one of the
     top 100 diffusion components matches the fp64 reference to
-    |cos| = 1.0000. ``working_dtype=cp.float64`` is still selectable
-    for audit. The returned ``emb`` is cast to fp32 in both cases to
-    match the MATLAB GT artifact.
+    |cos| = 1.0000. The returned ``emb`` is cast to fp32 in both cases
+    to match the MATLAB GT artifact.
 
 Sign ambiguity:
     Eigenvectors are defined up to a sign: ``(lambda, psi)`` and

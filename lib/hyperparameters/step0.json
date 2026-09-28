@@ -23,7 +23,7 @@
       "source": "arealmshbm/pipeline/config.py (Step0Knobs.enable_tf32)",
       "conditional": "backend_step0 == 'gpu'",
       "description": "Opt-in TF32 cuBLAS sgemm math mode for step0 (affects fc_similarity only).",
-      "notes": "~15% step0 speedup with minor fp32 precision drift. Relocated from top-level ``enable_tf32_step0`` into the step0 block in 2026-06 — the field belongs in the step that consumes it, and the relocation lines the step0.json catalog file up with the actual config namespace."
+      "notes": "~15% step0 speedup with minor fp32 precision drift."
     },
     {
       "key": "step0.sub_FC",
@@ -133,7 +133,7 @@
       "default": false,
       "source": "arealmshbm/step0_pipeline/config.py (Step0Config.save_edge_density)",
       "description": "Persist edge_density.npy (cortex-only fp32 watershed boundary count) to disk.",
-      "notes": "Step-0 intermediate with no production downstream reader (subgraph B consumes it in-memory). Only the internal CPU-vs-GPU diff harness reads the disk artifact. Default false since 2026-06."
+      "notes": "Step-0 intermediate with no production downstream reader (subgraph B consumes it in-memory). Only the internal CPU-vs-GPU diff harness reads the disk artifact."
     }
   ]
 }

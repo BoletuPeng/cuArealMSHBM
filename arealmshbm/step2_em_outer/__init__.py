@@ -20,7 +20,7 @@ called fp64 from inside the kernels via the shared CPU helpers
 
 Also re-exports two in-place ``@njit`` reset kernels used by the
 outer pipeline (``reset_s_t_nu_from_mtc_STLD``,
-``reset_s_psi_from_mtc_SLD``) and the JIT-warmup entry point.
+``reset_s_psi_from_mtc_SLD``).
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """
@@ -31,7 +31,6 @@ from .intra_em_cost import intra_em_cost_step2
 from ._kernels import (
     reset_s_t_nu_from_mtc_STLD,
     reset_s_psi_from_mtc_SLD,
-    warmup_step2_em_outer,
 )
 
 __all__ = [
@@ -40,5 +39,4 @@ __all__ = [
     "intra_em_cost_step2",
     "reset_s_t_nu_from_mtc_STLD",
     "reset_s_psi_from_mtc_SLD",
-    "warmup_step2_em_outer",
 ]

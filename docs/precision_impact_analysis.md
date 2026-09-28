@@ -15,8 +15,7 @@ parcellations.
 
 This doc captures the framework + reference case study from the
 2026-05-21 session, where we evaluated enabling TF32 + fp32 softmax on
-step2's then-GPU master kernel (the dense CuPy port, since retired — see
-the status note on the case study).
+step2's GPU master kernel of that date (a dense CuPy port).
 
 ## Why the four layers exist
 
@@ -62,14 +61,10 @@ canonical readout.
 
 ## Case study — TF32 + fp32 softmax on step2 only
 
-> **Status (2026-09-09):** the code this case study measured — step 2's
-> dense CuPy port (fp32 softmax) and the step-2 TF32 scope with its
-> `step2.enable_tf32` knob — was removed; `backend_step2='gpu'` is now the
-> P-layout session (fp64 softmax, no TF32 path;
-> [`step2_sparse_design.md`](step2_sparse_design.md)). The case study stays
-> as the worked example of the four-layer method. The re-run recipe at the
-> end no longer applies to step 2: `NVIDIA_TF32_OVERRIDE=1` would only
-> touch step 0's sgemms.
+> Measured 2026-05-21 on step 2's dense CuPy port of that date (fp32
+> softmax + TF32); kept as the worked example of the four-layer method.
+> The current step-2 `gpu` backend is fp64-softmax with no TF32 scope
+> ([`step2_sparse_design.md`](step2_sparse_design.md)).
 
 ### Setup
 

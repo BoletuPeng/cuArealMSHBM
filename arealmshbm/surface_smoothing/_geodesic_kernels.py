@@ -42,9 +42,10 @@ Algorithm structure (mirrors GeodesicHelper.cxx):
      with the cutoff ``maxdist``. Frozen-vertex skipping uses the
      ``marked`` array exactly as in the C++ source.
 
-  4. Heap is an indexed binary min-heap implemented in flat int32/fp64
-     arrays (numba has no heapq). Decrease-key is supported by storing
-     a per-vertex heap-position back-reference.
+  4. Heap is the indexed binary min-heap of
+     :mod:`arealmshbm.graph_distance._heap` over flat int32/fp64 arrays
+     (numba has no heapq), with decrease-key through a per-vertex
+     heap-position back-reference.
 
 The mathematical object computed is the polyhedral geodesic distance —
 the actual shortest path along the mesh surface (the same continuous
@@ -68,6 +69,10 @@ from __future__ import annotations
 
 import numpy as np
 import numba as nb
+
+from arealmshbm.graph_distance._heap import (
+    _heap_decrease, _heap_pop, _heap_push,
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -349,81 +354,6 @@ def build_layer2_neighbors(verts: np.ndarray, faces: np.ndarray):
 # ─────────────────────────────────────────────────────────────────────────
 # Numba: bounded modified-Dijkstra with both neighbor layers.
 # ─────────────────────────────────────────────────────────────────────────
-@nb.njit(cache=True, fastmath=False, boundscheck=False)
-def _heap_push(heap_node, heap_dist, heap_pos, heap_size, node, dist):
-    """Push (node, dist) onto the binary min-heap. Returns new size."""
-    i = heap_size
-    heap_node[i] = node
-    heap_dist[i] = dist
-    heap_pos[node] = i
-    # sift up
-    while i > 0:
-        parent = (i - 1) >> 1
-        if heap_dist[parent] > heap_dist[i]:
-            # swap
-            pn = heap_node[parent]; pd = heap_dist[parent]
-            heap_node[parent] = heap_node[i]; heap_dist[parent] = heap_dist[i]
-            heap_node[i] = pn;                heap_dist[i] = pd
-            heap_pos[heap_node[parent]] = parent
-            heap_pos[heap_node[i]] = i
-            i = parent
-        else:
-            break
-    return heap_size + 1
-
-
-@nb.njit(cache=True, fastmath=False, boundscheck=False)
-def _heap_pop(heap_node, heap_dist, heap_pos, heap_size):
-    """Pop minimum. Returns (top_node, new_size). Caller already read top."""
-    last = heap_size - 1
-    if last == 0:
-        heap_pos[heap_node[0]] = -1
-        return heap_size - 1
-    # move last to top
-    heap_pos[heap_node[0]] = -1
-    heap_node[0] = heap_node[last]
-    heap_dist[0] = heap_dist[last]
-    heap_pos[heap_node[0]] = 0
-    new_size = last
-    # sift down
-    i = 0
-    while True:
-        l = 2 * i + 1
-        r = 2 * i + 2
-        smallest = i
-        if l < new_size and heap_dist[l] < heap_dist[smallest]:
-            smallest = l
-        if r < new_size and heap_dist[r] < heap_dist[smallest]:
-            smallest = r
-        if smallest == i:
-            break
-        sn = heap_node[smallest]; sd = heap_dist[smallest]
-        heap_node[smallest] = heap_node[i]; heap_dist[smallest] = heap_dist[i]
-        heap_node[i] = sn;                  heap_dist[i] = sd
-        heap_pos[heap_node[smallest]] = smallest
-        heap_pos[heap_node[i]] = i
-        i = smallest
-    return new_size
-
-
-@nb.njit(cache=True, fastmath=False, boundscheck=False)
-def _heap_decrease(heap_node, heap_dist, heap_pos, idx_in_heap, new_dist):
-    """Decrease-key at heap position idx_in_heap to new_dist."""
-    i = idx_in_heap
-    heap_dist[i] = new_dist
-    while i > 0:
-        parent = (i - 1) >> 1
-        if heap_dist[parent] > heap_dist[i]:
-            pn = heap_node[parent]; pd = heap_dist[parent]
-            heap_node[parent] = heap_node[i]; heap_dist[parent] = heap_dist[i]
-            heap_node[i] = pn;                heap_dist[i] = pd
-            heap_pos[heap_node[parent]] = parent
-            heap_pos[heap_node[i]] = i
-            i = parent
-        else:
-            break
-
-
 @nb.njit(cache=True, fastmath=False, boundscheck=False)
 def bounded_dijkstra_smooth(
     root,

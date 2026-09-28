@@ -1,7 +1,7 @@
 # Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
-"""Correctness gate for the Δ-stepping GPU solver — the only GPU solver
-for ``gradient_geodesic_distance`` since 2026-09 — plus the dispatcher's
-precondition contracts.
+"""Correctness gate for the Δ-stepping GPU solver for
+``gradient_geodesic_distance``, plus the dispatcher's precondition
+contracts.
 
 The oracle is the batched pull-based Bellman-Ford that Δ-stepping
 replaced, transcribed into this file (kernels, host loop and the same
@@ -309,8 +309,8 @@ def test_zero_gradient_field():
 
 
 def test_high_valence_rejected():
-    """A slot count above the packed edge table's is a hard limit, not a
-    routing decision — there is no second solver."""
+    """A slot count above the packed edge table's is a hard limit of the
+    solver."""
     from arealmshbm.graph_distance._kernels_gpu import EDGE_SLOTS
     n, m = 64, EDGE_SLOTS + 4
     vn = np.zeros((n, m), dtype=np.int32)
@@ -325,9 +325,7 @@ def test_high_valence_rejected():
 def test_oversized_mesh_rejected():
     """Past ``MAX_N`` the frontier bitmasks outgrow the kernel's static
     shared-memory budget; refused at the module build, before any
-    ``(N, N)`` allocation. (The bound used to be the int16 worklist's
-    32768; the widened worklist is pinned bit-identical to the oracle
-    at N=33642 in ``docs/step0_flow_and_subgraphs.md``.)"""
+    ``(N, N)`` allocation."""
     from arealmshbm.graph_distance._kernels_gpu import MAX_N
     n = MAX_N + 32
     idx = np.arange(n)
@@ -366,19 +364,6 @@ def test_negative_gradient_rejected():
     nan[1] = np.float32("nan")
     with pytest.raises(ValueError, match="non-negative"):
         _run(vn, nan)
-
-
-def test_numpy_entry_point_matches_device():
-    """The numpy-in/numpy-out wrapper must agree with the device path."""
-    import cupy as cp
-    from arealmshbm.graph_distance import gradient_geodesic_distance_gpu
-    rng = np.random.default_rng(23)
-    vn = _torus_grid(8, 9)
-    n = vn.shape[0]
-    grad = rng.random(n, dtype=np.float32)
-    verts = rng.random((n, 3)).astype(np.float32)
-    host = gradient_geodesic_distance_gpu(verts, vn, grad)
-    assert np.array_equal(host, cp.asnumpy(_run(vn, grad)))
 
 
 def _asym_ring(n: int, n_chords: int, m_slots: int = 6, seed: int = 0):

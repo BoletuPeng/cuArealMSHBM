@@ -89,7 +89,7 @@ def _build_minimal_session(
         row_idx=row_idx, col_idx=col_idx,
         dim=2, num_clusters=L, num_session=T,
         w=50.0, c=10.0, beta=beta,
-        backend="cpu", D_unpacked=D,
+        D_unpacked=D,
         variant_spec=VariantSpec.from_pipeline_type("dMSHBM"),
     )
     return sess, packed
@@ -167,7 +167,7 @@ def test_session_rejects_fp32_bold() -> None:
             col_idx=np.array([0, 1], dtype=np.int64),
             dim=2, num_clusters=L, num_session=T,
             w=50.0, c=10.0, beta=np.ones(L, dtype=np.float64),
-            backend="cpu", D_unpacked=D,
+            D_unpacked=D,
             variant_spec=VariantSpec.from_pipeline_type("dMSHBM"),
         )
 
@@ -190,6 +190,6 @@ def test_session_rejects_T_mismatch() -> None:
             col_idx=np.array([0, 1], dtype=np.int64),
             dim=2, num_clusters=L, num_session=T_arg,
             w=50.0, c=10.0, beta=np.ones(L, dtype=np.float64),
-            backend="cpu", D_unpacked=D,
+            D_unpacked=D,
             variant_spec=VariantSpec.from_pipeline_type("dMSHBM"),
         )

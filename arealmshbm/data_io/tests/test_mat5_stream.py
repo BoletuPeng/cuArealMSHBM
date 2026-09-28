@@ -12,10 +12,6 @@ the mx CLASS dtype, i.e. ``loadmat(mat_dtype=True)`` semantics — is
 pinned by ``test_narrowed_payload_is_widened_to_the_class_dtype``
 against a hand-built container, since ``savemat`` never narrows.
 
-``isal`` is optional: one test loads a private copy of the module with
-``isal`` masked and one runs the whole fast path on stdlib ``zlib``,
-asserting the same bytes come back.
-
 An optional bench-backed test (``MSHBM_STEP2_BENCH_DIR``, default
 ``testdata/step2_bench``) checks the two real step-2 inputs — the
 ``group.mat`` whose 22 MB ``lambda`` the walker skips, and the
@@ -297,55 +293,6 @@ def test_empty_name_set_is_a_noop(tmp_path: Path) -> None:
     p = tmp_path / "v5.mat"
     _fixture(p, compress=True)
     assert ms.read_fields(p, set()) == {}
-
-
-# ─────────────────────────────────────────────────────────────────────
-# isal is optional: stdlib zlib is the fallback
-# ─────────────────────────────────────────────────────────────────────
-def test_module_falls_back_to_stdlib_zlib_without_isal(monkeypatch) -> None:
-    """A machine with no ``isal`` must still import and read the fast path.
-
-    Loaded as a private copy so the cached module (and the step-3 reader
-    that imports its primitives) is untouched.
-    """
-    import importlib.util
-    import sys
-    import zlib
-
-    monkeypatch.setitem(sys.modules, "isal", None)   # -> ImportError
-    spec = importlib.util.spec_from_file_location("_mat5_no_isal", ms.__file__)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    assert mod._zlib is zlib
-
-
-@pytest.mark.parametrize("compress", [True, False])
-def test_stdlib_zlib_gives_identical_values(tmp_path: Path,
-                                            compress: bool,
-                                            monkeypatch) -> None:
-    """``zlib.decompressobj()`` is a drop-in for the walker's inflate."""
-    import zlib
-
-    p = tmp_path / f"nozlib_{int(compress)}.mat"
-    _fixture(p, compress=compress)
-    want = {"a_f64", "b_f32", "c_i32", "row"}
-    ref = ms.read_fields(p, want)
-    assert ms.LAST_PATH == "fast"
-    ref_names = ms.walk_names(p)
-    ref_sparse = ms.read_sparse(p, "s_sparse")
-
-    monkeypatch.setattr(ms, "_zlib", zlib)
-    got = ms.read_fields(p, want)
-    assert ms.LAST_PATH == "fast"
-    assert set(got) == want
-    for k in sorted(want):
-        assert got[k].dtype == ref[k].dtype, k
-        assert got[k].tobytes() == ref[k].tobytes(), k
-    assert ms.walk_names(p) == ref_names
-    assert ms.LAST_PATH == "fast"
-    got_sparse = ms.read_sparse(p, "s_sparse")
-    assert ms.LAST_PATH == "fast"
-    assert (got_sparse != ref_sparse).nnz == 0
 
 
 # ─────────────────────────────────────────────────────────────────────

@@ -15,13 +15,7 @@ Public API:
 
 Precision policy:
     Storage and arithmetic are fp32 throughout; this matches MATLAB's
-    ``single`` everywhere downstream of MRIread. End-to-end
-    bit-equality vs the historical converted-NIFTI route was verified
-    on real YS sub-001 data before the NIFTI mirror was retired —
-    every numerical pipeline artifact (profile.b2nd, avg_profile,
-    gradients, parcellation labels) matched bit-for-bit when step0
-    runs on CPU (GPU eigsh has intrinsic non-determinism that affects
-    both BOLD sources identically).
+    ``single`` everywhere downstream of MRIread.
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """

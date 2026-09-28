@@ -9,7 +9,7 @@ Public API:
                             cleans, and reduces in one (N, L) sweep.
     matlab_ratio_converged — shared MATLAB-faithful ratio convergence
                             helper. Also called by ``intra_em`` and by
-                            the ``gpu_full`` / ``gpu_sparse`` EM bodies.
+                            the ``gpu`` EM body.
     convergence_test      — CPU stop_em / cost_em bookkeeping around it.
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
@@ -35,7 +35,7 @@ def matlab_ratio_converged(update_cost: float, cost: float,
 
     Default threshold mirrors MATLAB's epsilon (1e-4). Single site for
     the rule: the CPU inner EM test, the outer ``intra_em`` loop, and
-    the ``gpu_full`` / ``gpu_sparse`` EM bodies all call it.
+    the ``gpu`` EM body all call it.
     """
     with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
         ratio = float(np.abs((np.float64(update_cost) - np.float64(cost))
@@ -51,8 +51,7 @@ def convergence_test(update_cost,
 
     Single-subject pipeline: ``update_cost`` and ``cost`` are scalars
     (Python ``float`` / 0-d / shape ``(1,)`` / ``(1, 1)``). Multi-element
-    arrays are an error — passing one (e.g. an old multi-subject GT
-    replay) used to silently take ``arr[0]``.
+    arrays are an error.
 
     NaN-as-converged: ``NaN > 1e-4`` is False, so NaN ratios are treated
     as converged (matches MATLAB).
@@ -197,7 +196,7 @@ class EMStopSession:
                 V_temp: np.ndarray,
                 cost: np.ndarray,
                 iter_em: int,
-                ) -> Tuple[float, int, Optional[np.ndarray], np.ndarray, np.ndarray]:
+                ) -> Tuple[float, int, Optional[np.ndarray], np.ndarray]:
         """Run the full block. Mode A only — S axis dropped from inputs.
 
         Inputs:
@@ -216,12 +215,10 @@ class EMStopSession:
             cost                : (1, 1) or (1,) any float dtype.
             iter_em             : int.
         Returns:
-            (update_cost, stop_em, cost_em, log_lambda_prop_view, scv_view).
+            (update_cost, stop_em, cost_em, scv_view).
             ``update_cost`` is a Python float (fp64). ``cost_em`` is
-            ``None`` unless ``stop_em == 1``. ``log_lambda_prop_view`` is
-            always ``None`` (the fused kernel never materializes the
-            (N, L) llp intermediate). ``scv_view`` is a view of the
-            session's cached cleaned-scv buffer (overwritten on the
+            ``None`` unless ``stop_em == 1``. ``scv_view`` is a view of
+            the session's cached cleaned-scv buffer (overwritten on the
             next call).
         """
         s_lam = self._stage_s_lambda(s_lambda)
@@ -257,20 +254,12 @@ class EMStopSession:
         update_cost_scalar = float(self._update_cost_buf[0])
 
         # Step 5: convergence test (single-subject). Pass the fp64
-        # scalar directly — the prior implementation wrapped it in a
-        # fp32 array which dropped ~7 fp32 ULPs of precision for no
-        # reason. ``convergence_test`` accepts Python scalars.
+        # scalar directly; ``convergence_test`` accepts Python scalars.
         stop_em, cost_em = convergence_test(update_cost_scalar, cost,
                                             iter_em=int(iter_em))
 
-        # ``_log_lambda_prop`` is no longer materialized in the fused path.
-        # The super-call only consumes the cleaned spatial_connect_vmf
-        # (it propagates the NaN/Inf cleanup back into outer state); the
-        # llp view returned by the prior implementation had no consumer
-        # outside diagnostic / validate scripts. Return None to signal
-        # absence; super-call's existing ``_llp`` capture is unused.
         return (update_cost_scalar, stop_em, cost_em,
-                None, self._spatial_connect_vmf)
+                self._spatial_connect_vmf)
 
     def _stage_s_lambda(self, s_lambda: np.ndarray) -> np.ndarray:
         a = np.asarray(s_lambda)

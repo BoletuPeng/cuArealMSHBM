@@ -42,7 +42,9 @@ class BenchFixture:
     def __init__(self, project_dir: Path, S: int, mode: str = "gMSHBM"):
         from arealmshbm.data_io.profile_io import read_subject_profile_packed_tnd
         from arealmshbm.step2_io.sparse_inputs import Step2SparseInputs
-        from arealmshbm.step2_io.sparse_layout import build_step2_layout_dense
+        from arealmshbm.step2_io.tests._layout_oracle import (
+            build_step2_layout_dense,
+        )
         from arealmshbm.step2_pipeline import Step2Config, Step2Pipeline
 
         cfg = Step2Config(

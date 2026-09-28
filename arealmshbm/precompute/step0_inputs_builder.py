@@ -62,9 +62,8 @@ import numpy as np
 def build_step0_inputs(cfg) -> "Step0Inputs":
     """Run the full precomputation, returning a CPU-only ``Step0Inputs``.
 
-    Equivalent to the original ``Step0Pipeline.load_inputs`` body —
-    factored out so the cache builder CLI and the live-rebuild fallback
-    share one source of truth. GPU mirrors are NOT built here (the
+    Shared by the cache builder CLI and the tier-3 live rebuild in
+    ``Step0Pipeline.load_inputs``. GPU mirrors are NOT built here (the
     production path wraps the cached output via ``_build_gpu_mirrors``
     when ``cfg.backend == 'gpu'``).
     """
@@ -102,15 +101,15 @@ def build_step0_inputs(cfg) -> "Step0Inputs":
 
     # --- fsaverage6 sphere meshes (full resolution) ---
     # Dev-only raw read: the runtime loader (load_avg_mesh) is asset-only
-    # and no longer parses raw FreeSurfer surfaces. This builder is the
+    # and does not parse raw FreeSurfer surfaces. This builder is the
     # build-side recipe, so it reads the sphere geometry + cortex.label
     # directly (synthesizing MARS_label) to bake the shipped step0 cache
     # from a CBIG checkout.
     import nibabel.freesurfer.io as fsio
 
     def _read_sphere(hemi: str):
-        """Sphere geometry + cortex.label → MARS_label, the build-side
-        equivalent of the retired ``load_avg_mesh(..., "sphere")`` read.
+        """Sphere geometry + cortex.label → MARS_label, read from the raw
+        FreeSurfer sources.
         Both files live under the CBIG flat layout
         ``<surf_root>/<mesh>/{surf,label}/``.
         """

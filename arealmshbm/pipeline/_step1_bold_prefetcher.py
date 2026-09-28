@@ -18,8 +18,7 @@ catches up.
 Decode is ``read_surface_gifti(time_major=True)`` on 8 workers (the
 isal_zlib saturation plateau), which releases the GIL and so overlaps
 the leaf. The GPU leaf never uses this prefetcher: it owns the whole
-subject and drives its own ingest (batched nvCOMP, or the same CPU
-reader on its own pool when nvCOMP is absent).
+subject and drives its own batched nvCOMP ingest.
 
 Memory at fsa6 / T=240 / 1 run/sess: ~79 MB per session;
 lookahead=8 ≈ 632 MB of host buffers inflight.

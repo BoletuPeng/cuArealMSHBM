@@ -44,8 +44,8 @@ class AvgProfilesResult:
     the fp32 means directly instead of re-reading the .npy files.
 
     ``lh_avg_dev`` / ``rh_avg_dev`` are the device-resident fp32
-    ``(V_h, D)`` accumulators (cupy arrays) when the memory-side GPU
-    supercall (``avg_profiles_from_packed_gpu``) produced this result
+    ``(V_h, D)`` accumulators (cupy arrays) when
+    ``avg_profiles_from_accumulator`` produced this result
     — ``generate_ini_params_gpu`` consumes them via
     ``precomputed_{lh,rh}_avg_dev`` so the fp32 means never round trip
     through host memory. They are ``None`` on the CPU path AND on the

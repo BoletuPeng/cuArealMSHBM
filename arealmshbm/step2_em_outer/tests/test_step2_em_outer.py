@@ -2,9 +2,7 @@
 
 Synthetic tests for the three outer-EM closed-form leaves under
 ``arealmshbm.step2_em_outer``. All tests here are self-contained (no
-external data dependency). A set of MATLAB-GT validation functions
-(``test_L16/L17/L18_against_matlab_gt``) used to live alongside these;
-they were retired when the pipeline decoupled from MATLAB.
+external data dependency).
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """

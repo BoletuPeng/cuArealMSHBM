@@ -11,8 +11,6 @@ import zlib
 import numpy as np
 import pytest
 
-from arealmshbm.data_io._nvcomp_batched import nvcomp_available
-
 try:
     import cupy as _cp
     import nvidia.nvcomp as _nvcomp
@@ -28,52 +26,40 @@ def _batch():
     return get_deflate_batch()
 
 
-def test_nvcomp_available_returns_a_bool():
-    """The driver calls this to pick the ingest backend; it must not raise."""
-    assert isinstance(nvcomp_available(), bool)
-    assert nvcomp_available() is nvcomp_available()
-
-
-@pytest.mark.parametrize("exc", [OSError, AttributeError, RuntimeError])
-def test_nvcomp_available_false_when_the_binding_cannot_be_built(exc):
-    """Locating the library is not the same as being able to bind it.
-
-    ``ctypes.CDLL`` raises ``OSError`` and a missing symbol raises
-    ``AttributeError`` — neither is the ``ImportError`` the step-1
-    callers catch, so probing only ``_find_library()`` promised a
-    backend that then failed hard instead of falling back.
-    """
+@pytest.fixture
+def uncached_binding():
+    """Forget the process-wide binding for one test, restore it after."""
     from arealmshbm.data_io import _nvcomp_batched as nb
-
-    def _boom():
-        raise exc("nvCOMP binding is broken")
-
     saved = dict(nb._CACHE)
     nb._CACHE.clear()
-    real = nb.DeflateBatch
-    try:
-        nb.DeflateBatch = _boom
-        assert nb.nvcomp_available() is False
-        assert nb._CACHE["avail"] is False, "the verdict must be cached"
-    finally:
-        nb.DeflateBatch = real
-        nb._CACHE.clear()
-        nb._CACHE.update(saved)
+    yield nb
+    nb._CACHE.clear()
+    nb._CACHE.update(saved)
+
+
+def test_missing_nvcomp_is_an_import_error_with_the_install_hint(
+        uncached_binding, monkeypatch):
+    """No probe, no fallback: the public entry point either returns the
+    binding or raises ``ImportError`` naming the package to install."""
+    import sys
+    monkeypatch.setitem(sys.modules, "nvidia.nvcomp", None)
+    with pytest.raises(ImportError, match="nvidia-nvcomp-cu12"):
+        uncached_binding.get_deflate_batch()
 
 
 @pytest.mark.skipif(not _GPU, reason=_GPU_WHY)
-def test_nvcomp_available_probes_the_real_constructor():
-    """True must mean ``get_deflate_batch()`` actually works."""
-    from arealmshbm.data_io import _nvcomp_batched as nb
+def test_unloadable_nvcomp_is_an_import_error_with_the_install_hint(
+        uncached_binding, monkeypatch):
+    """Installed but not loadable (a wheel for another CUDA runtime, a
+    partial install) is the same hard error, not a bare ``OSError``."""
+    import ctypes
 
-    saved = dict(nb._CACHE)
-    nb._CACHE.clear()
-    try:
-        assert nb.nvcomp_available() is True
-        assert nb._CACHE.get("b") is not None
-    finally:
-        nb._CACHE.clear()
-        nb._CACHE.update(saved)
+    def _boom(path):
+        raise OSError("[Errno 126] The specified module could not be found")
+
+    monkeypatch.setattr(ctypes, "CDLL", _boom)
+    with pytest.raises(ImportError, match="nvidia-nvcomp-cu12"):
+        uncached_binding.get_deflate_batch()
 
 
 @pytest.mark.skipif(not _GPU, reason=_GPU_WHY)

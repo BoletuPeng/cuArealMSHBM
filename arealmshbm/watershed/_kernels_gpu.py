@@ -154,7 +154,7 @@ void watershed_main(
         const float* __restrict__ em,           // (K, N) row-major
         const float* __restrict__ hiter,        // (n_h,)
         int n_h,
-        const int* __restrict__ neighbors_rn,   // (R, N) int32 row-major — TRANSPOSED!
+        const int* __restrict__ neighbors_rn,   // (R, N) int32 row-major - TRANSPOSED!
         int R,
         int N,
         int* __restrict__ label,                // (K, N) inout
@@ -169,11 +169,11 @@ void watershed_main(
     unsigned char* ws_k = ws + (size_t)k * (size_t)N;
     int* prop_k = proposal + (size_t)k * (size_t)N;
 
-    // Neighbor table is (R, N) row-major — adjacent threads reading
+    // Neighbor table is (R, N) row-major - adjacent threads reading
     // neighbors_rn[r][v_thread] = neighbors_rn[r * N + v_thread] hit
-    // stride-1, fully coalesced per warp transaction. Compared to the
-    // prior (N, R) layout (24-byte stride between threads, scattered)
-    // this halves HBM transactions on the 6-neighbor lookup hot path.
+    // stride-1, fully coalesced per warp transaction. An (N, R) layout
+    // would put a 24-byte stride between threads and double the HBM
+    // transactions on the 6-neighbor lookup hot path.
     for (int ih = 0; ih < n_h; ih++) {
         const float h = hiter[ih];
 

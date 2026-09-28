@@ -1,8 +1,6 @@
 """test_step2_io.py — synthetic self-tests for ``load_group_mtc``.
 
-These tests are fully self-contained (no external data dependency). A
-MATLAB-GT bytewise-equality check used to live here too; it was retired
-when the pipeline decoupled from MATLAB.
+These tests are fully self-contained (no external data dependency).
 
 Run:
     python -m pytest arealmshbm/step2_io/tests/ -v

@@ -305,7 +305,7 @@ def compute_profile_arrays(seed_mesh: str,
         )
     # Backend-mismatch guard: ``precomputed_bold_runs`` is public, so a
     # caller can hand this CPU leaf device buffers (e.g. straight out of
-    # ``read_subject_bold_gpu``). They would reach the numba kernel below
+    # ``iter_subject_bold_gpu``). They would reach the numba kernel below
     # and fail deep in numpy's fancy-index / @ overloads with an opaque
     # error. Surface a named TypeError at the boundary.
     # ``type(...).__module__`` avoids a cupy import on CPU-only systems.

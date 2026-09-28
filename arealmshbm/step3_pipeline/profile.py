@@ -62,15 +62,8 @@ def profile_backend(sub: str, backend: str, *,
     """Run one (subject, backend) configuration and report timings.
 
     Returns a dict suitable for cross-backend comparison, or None if
-    the backend is unavailable (cupy missing for GPU runs).
+    the subject's project_dir is missing.
     """
-    if backend.startswith("gpu"):
-        try:
-            import cupy  # noqa: F401
-        except ImportError:
-            _info(f"[skip {backend}] cupy not installed")
-            return None
-
     project_dir = Path(args.project_root) / sub
     if not project_dir.exists():
         _info(f"[skip {backend}] project_dir missing: {project_dir}")
@@ -114,12 +107,10 @@ def profile_backend(sub: str, backend: str, *,
     last_stage_breakdown: Dict[str, float] = {}
     last_iters: Dict[str, int] = {}
     for r in range(runs):
-        # Recreate the Pipeline between runs so the cupy memory pool
-        # actually releases blocks. The prior in-place reset
-        # (``pipe._inputs = None; ...; pipe.load_inputs()``) only dropped
-        # Python references — the cupy default pool keeps free blocks
-        # for reuse, so peak GPU usage accumulated across ``--runs N``.
-        # ``close()`` is what calls ``free_all_blocks()``.
+        # Recreate the Pipeline between runs so ``close()`` frees the
+        # cupy pool (``free_all_blocks()``); dropping Python references
+        # alone leaves free blocks in the pool, so peak GPU usage would
+        # accumulate across ``--runs N``.
         if r > 0:
             pipe.close()
             pipe = Step3Pipeline(cfg)
@@ -174,8 +165,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--subject", default="sub-001")
     p.add_argument("--backends", nargs="*",
-                   default=["cpu", "gpu_full"],
-                   choices=["cpu", "gpu_elambda", "gpu_full", "gpu_sparse"])
+                   default=["cpu", "gpu"],
+                   choices=["cpu", "gpu"])
     p.add_argument("--project-root", default=str(_DEFAULT_PROJECT_ROOT))
     p.add_argument("--mesh", default="fsaverage6")
     p.add_argument("--w", type=float, default=50.0)

@@ -34,8 +34,7 @@ def _densify(x):
     in-tree step-2 writer always densifies), in which case ``scipy.io.loadmat``
     hands this reader a ``csc_array``/``csc_matrix`` and
     ``np.ascontiguousarray`` on one of those raises ``ValueError:
-    setting an array element with a sequence``. Mirrors
-    ``load_spatial_mask._to_dense``.
+    setting an array element with a sequence``.
     """
     return x.toarray() if hasattr(x, "toarray") else x
 

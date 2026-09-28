@@ -86,7 +86,7 @@ void binarize_mwzero_pack_KV_to_VDb(
     unsigned int byte = 0u;
 
     // MW vertex -> emit a zero byte. This enforces the writer-side
-    // contract _apply_mw_zero used to enforce on host, but in the
+    // contract _apply_mw_zero enforces on the host path, but in the
     // packed-byte representation directly.
     if (mw_v[v] == 0u) {
         const int k_base = kb * 8;
@@ -191,10 +191,9 @@ def binarize_mwzero_pack_cupy(corr_KxV: cp.ndarray,
 # ---------------------------------------------------------------------
 # Per-column zscore + L2-unit-norm
 # ---------------------------------------------------------------------
-# The reduction tree is the one the retired ``zscore_unit_norm_columns``
-# kernel used -- same block size, same fp64 accumulators, same pairing
-# -- transcribed into
-# ``tests/test_subject_profiles_gpu.py``'s oracle so the equality stays
+# The reduction tree is the one of the ``zscore_unit_norm_columns``
+# oracle kernel in ``tests/test_subject_profiles_gpu.py`` -- same block
+# size, same fp64 accumulators, same pairing -- so the equality stays
 # pinned. The only difference is what gets written when the column has
 # no usable variance -- i.e. when
 # ``!(post_sumsq > 0.0) || !isfinite((float)(1/sqrt(post_sumsq)))``,
@@ -203,7 +202,7 @@ def binarize_mwzero_pack_cupy(corr_KxV: cp.ndarray,
 # NaN), and the fp32 overflow of a near-constant column of very small
 # magnitude (post_sumsq positive but < ~8.6e-78):
 #
-#   retired      inv_norm = +inf  ->  column becomes NaN / +-inf
+#   oracle       inv_norm = +inf  ->  column becomes NaN / +-inf
 #                                 ->  every corr entry that touches it
 #                                     is non-finite
 #                                 ->  ``cp.nan_to_num`` sweeps the whole
@@ -267,9 +266,9 @@ void zscore_unit_norm_columns_zerovar(const float* __restrict__ x,
         // post_sumsq can be a perfectly ordinary positive double and
         // still send 1/sqrt(post_sumsq) past FLT_MAX (it does for
         // post_sumsq < ~8.6e-78, i.e. a near-constant column of
-        // magnitude ~1e-38). The legacy kernel stored the resulting
-        // +inf and let ``cp.nan_to_num`` mop up downstream; this one
-        // has no such backstop, so the overflow must be caught here or
+        // magnitude ~1e-38). The oracle stores the resulting +inf and
+        // relies on ``cp.nan_to_num`` downstream; this one has no such
+        // backstop, so the overflow must be caught here or
         // it would leak NaN into the corr and the selector.
         float inv_f = (float)(1.0 / sqrt(post_sumsq));
         int ok = (post_sumsq > 0.0) && isfinite(inv_f);
@@ -299,7 +298,7 @@ def zscore_unit_norm_columns_zerovar_cupy(x_TxN: cp.ndarray,
                                            out_TxN: cp.ndarray) -> None:
     """Per-column zscore + L2-unit-norm; degenerate columns -> exact 0.
 
-    Non-degenerate columns come out bit-identical to the retired
+    Non-degenerate columns come out bit-identical to the oracle's
     ``inv_norm = +inf`` formulation (same reduction tree); degenerate
     ones -- no variance, a non-finite value anywhere in the column, or
     an ``inv_norm`` that overflows fp32 -- are written as exact

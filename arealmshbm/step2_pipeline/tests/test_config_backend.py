@@ -9,9 +9,7 @@ enum membership, the rejection message and the catalog's own copy of the
 enum, so a future rename cannot silently demote a GPU run to CPU, and
 the three static kernel limits of the GPU backend (seed mesh,
 ``num_clusters``, ``n_grad_components``) are refused at config time
-rather than after step 0/1. ``'gpu_sparse'``, the name the P-layout
-backend shipped under while the dense CuPy port still held ``'gpu'``,
-is rejected like any other unknown spelling — no alias.
+rather than after step 0/1.
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """
@@ -35,7 +33,7 @@ def _cfg(**kw) -> Step2Config:
 
 # ── backend enum ──
 def test_backend_enum_is_exactly_the_two_values() -> None:
-    assert _VALID_BACKENDS == {"cpu", "gpu"}
+    assert set(_VALID_BACKENDS) == {"cpu", "gpu"}
 
 
 @pytest.mark.parametrize("backend", ["cpu", "gpu"])
@@ -47,18 +45,10 @@ def test_backend_default_is_cpu() -> None:
     assert _cfg().backend == "cpu"
 
 
-@pytest.mark.parametrize("backend", ["gpu_dense", "gpu_sparse"])
-def test_unknown_backend_rejected(backend: str) -> None:
-    """``'gpu_sparse'`` was the P-layout backend's name while the dense
-    CuPy port held ``'gpu'``; it is not an alias now."""
+def test_unknown_backend_rejected() -> None:
+    """A backend name outside the enum fails loudly rather than falling
+    back to a working backend."""
     with pytest.raises(ValueError, match="backend must be one of"):
-        _cfg(backend=backend)
-
-
-def test_no_alias_for_a_wrong_spelling() -> None:
-    """No aliases: a config written against a name that does not exist
-    must fail loudly rather than fall back to a working backend."""
-    with pytest.raises(ValueError):
         _cfg(backend="cuda")
 
 
@@ -118,7 +108,7 @@ def test_gpu_rejects_more_grad_components_than_connect_u_takes() -> None:
 # ── the catalog still describes the driver-facing enum ──
 def test_catalog_backend_step2_values_unchanged() -> None:
     """``PipelineConfig.backend_step2`` offers the same two values as
-    step0/step1 (``_VALID_BACKENDS_STEP012`` is shared by the three)."""
+    every other step (``_VALID_BACKENDS`` is shared by all four)."""
     repo = Path(__file__).resolve().parents[3]
     catalog = repo / "lib" / "hyperparameters" / "step2.json"
     with open(catalog, "r", encoding="utf-8") as f:
@@ -127,5 +117,5 @@ def test_catalog_backend_step2_values_unchanged() -> None:
     assert entry["values"] == ["cpu", "gpu"]
     assert entry["default"] == "cpu"
 
-    from arealmshbm.pipeline.config import _VALID_BACKENDS_STEP012
-    assert set(_VALID_BACKENDS_STEP012) == {"cpu", "gpu"}
+    from arealmshbm.pipeline.config import _VALID_BACKENDS as _PIPELINE_BACKENDS
+    assert set(_PIPELINE_BACKENDS) == {"cpu", "gpu"}

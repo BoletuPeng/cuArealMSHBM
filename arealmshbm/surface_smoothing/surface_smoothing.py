@@ -18,9 +18,9 @@ Hot-path strategy:
       result depends only on ``(mesh-prep, roi, sigma)``, all of which
       are subject-invariant for a fixed mesh + cfg.smooth_sigma. The
       pipeline calls this once per hemi at ``load_inputs`` and caches
-      the resulting ``(gather_W, inv_weight_sum)`` on ``Step0Inputs``.
-      Previously the gather was rebuilt every ``iter_a`` call
-      (~3× per subject), redoing 74k Dijkstras for the same answer.
+      the resulting ``(gather_W, inv_weight_sum)`` on ``Step0Inputs``,
+      so the ``iter_a`` calls (~3× per subject) do not redo 74k
+      Dijkstras for the same answer.
     * Per call, :func:`cifti_smoothing` does only a SpMV + per-row
       normalize on the cached gather — bandwidth-bound and fast.
 

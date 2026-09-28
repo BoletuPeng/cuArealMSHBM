@@ -28,24 +28,15 @@ from .graph_distance import gradient_geodesic_distance
 
 
 def __getattr__(name):
-    # Lazy import for the GPU variants so ``cupy`` stays a soft
+    # Lazy import for the GPU entry point so ``cupy`` stays a soft
     # dependency on CPU-only environments.
-    if name in ("gradient_geodesic_distance_gpu",
-                "gradient_geodesic_distance_gpu_device"):
-        from .graph_distance_gpu import (
-            gradient_geodesic_distance_gpu,
-            gradient_geodesic_distance_gpu_device,
-        )
-        return {
-            "gradient_geodesic_distance_gpu": gradient_geodesic_distance_gpu,
-            "gradient_geodesic_distance_gpu_device":
-                gradient_geodesic_distance_gpu_device,
-        }[name]
+    if name == "gradient_geodesic_distance_gpu_device":
+        from .graph_distance_gpu import gradient_geodesic_distance_gpu_device
+        return gradient_geodesic_distance_gpu_device
     raise AttributeError(name)
 
 
 __all__ = [
     "gradient_geodesic_distance",
-    "gradient_geodesic_distance_gpu",
     "gradient_geodesic_distance_gpu_device",
 ]

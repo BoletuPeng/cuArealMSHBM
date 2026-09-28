@@ -22,8 +22,9 @@ import numpy as np
 import pytest
 import scipy.sparse as sp
 
-from arealmshbm.step2_io import (
-    build_step2_layout,
+from arealmshbm.step2_io import build_step2_layout
+from arealmshbm.step2_io.sparse_layout import _finish
+from arealmshbm.step2_io.tests._layout_oracle import (
     build_step2_layout_dense,
     layouts_equal,
 )
@@ -98,13 +99,6 @@ def test_scatter_gather_round_trip() -> None:
     assert np.array_equal(lay.scatter(np.ones(lay.P, np.float64)), dense)
 
 
-def test_as_csr_matrix_is_the_mask() -> None:
-    lh, rh = _block_masks(13, 3, seed=2)
-    lay = build_step2_layout(lh, rh)
-    m = lay.as_csr_matrix()
-    assert np.array_equal(m.toarray(), _dense_from_blocks(lh, rh))
-
-
 def test_dtypes_and_int32() -> None:
     lh, rh = _block_masks(11, 3, seed=4)
     lay = build_step2_layout(lh, rh)
@@ -122,16 +116,16 @@ def test_non_binary_mask_rejected() -> None:
     lh[lh != 0] = 2.0
     with pytest.raises(ValueError, match="0/1 indicator"):
         build_step2_layout(lh, rh)
-    with pytest.raises(ValueError, match="0/1 indicator"):
-        build_step2_layout_dense(_dense_from_blocks(lh, rh))
 
 
 def test_cross_hemisphere_cell_rejected() -> None:
-    lh, rh = _block_masks(9, 3, seed=7)
-    dense = _dense_from_blocks(lh, rh)
-    dense[0, dense.shape[1] - 1] = 1.0          # LH vertex, RH parcel
+    """``build_step2_layout`` offsets the rh block, so it cannot emit a
+    cross-hemisphere cell; the shared ``_finish`` guard is driven
+    directly. LH vertex 0 sits in RH parcel 1."""
+    row_ptr = np.array([0, 1, 1, 2, 2])
+    col = np.array([1, 1])
     with pytest.raises(ValueError, match="cross-hemisphere"):
-        build_step2_layout_dense(dense)
+        _finish(4, 2, 2, 1, row_ptr, col)
 
 
 def test_mismatched_hemispheres_rejected() -> None:

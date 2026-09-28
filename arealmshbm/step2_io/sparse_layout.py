@@ -61,7 +61,7 @@ class Step2Layout:
     csc_row: np.ndarray
     csc_pidx: np.ndarray
 
-    # ── conversions used by tests / A-B scripts ──
+    # ── dense <-> P-order conversions ──
     def scatter(self, x_P: np.ndarray, fill: float = 0.0) -> np.ndarray:
         """CSR-order ``(P,)`` (or ``(..., P)``) → dense ``(..., N, L)``."""
         x = np.asarray(x_P)
@@ -73,14 +73,6 @@ class Step2Layout:
         """Dense ``(..., N, L)`` → CSR-order ``(..., P)``."""
         d = np.asarray(dense)
         return np.ascontiguousarray(d[..., self.p_row, self.col])
-
-    def as_csr_matrix(self, values: np.ndarray | None = None) -> sp.csr_matrix:
-        """The layout as an ``(N, L)`` scipy CSR matrix; ``values`` is the
-        P-order payload (fp32 ones when omitted)."""
-        vals = (np.ones(self.P, dtype=np.float32) if values is None
-                else np.asarray(values))
-        return sp.csr_matrix((vals, self.col, self.row_ptr),
-                             shape=(self.N, self.L))
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -179,48 +171,14 @@ def build_step2_layout(lh_mask: Any, rh_mask: Any) -> Step2Layout:
     return _finish(N, L, n_lh, L_lh, row_ptr, col)
 
 
-def build_step2_layout_dense(bm_NL: np.ndarray) -> Step2Layout:
-    """Reference builder from the dense ``(N, L)`` mask (tests only)."""
-    bm = np.asarray(bm_NL)
-    if bm.ndim != 2:
-        raise ValueError("boundary mask must be 2-D")
-    N, L = bm.shape
-    if N % 2 or L % 2:
-        raise ValueError("Step2Layout: N and L must be even (bilateral)")
-    n_lh, L_lh = N // 2, L // 2
-    nz = bm != 0
-    vals = bm[nz]
-    if vals.size and not np.all(vals == 1.0):
-        raise ValueError("Step2Layout: boundary mask must be a 0/1 indicator")
-    rows, cols = np.nonzero(nz)            # row-major → cols ascending per row
-    row_ptr = np.zeros(N + 1, dtype=np.int64)
-    row_ptr[1:] = np.cumsum(np.bincount(rows, minlength=N))
-    return _finish(N, L, n_lh, L_lh, row_ptr, cols.astype(np.int64))
-
-
-def layouts_equal(a: Step2Layout, b: Step2Layout) -> bool:
-    """True iff both layouts have the same shape scalars and the same
-    six index arrays (``np.array_equal``)."""
-    if (a.N, a.L, a.n_lh, a.L_lh, a.P) != (b.N, b.L, b.n_lh, b.L_lh, b.P):
-        return False
-    for f in ("row_ptr", "col", "p_row", "col_ptr", "csc_row", "csc_pidx"):
-        if not np.array_equal(getattr(a, f), getattr(b, f)):
-            return False
-    return True
-
-
 def layout_to_device(layout: Step2Layout) -> Dict[str, Any]:
-    """Upload the six index arrays; returns a plain dict (arrays + ints).
+    """Upload the six index arrays; returns a plain dict of them.
 
-    Keys: ``row_ptr, col, p_row, col_ptr, csc_row, csc_pidx`` (cupy int32) and
-    ``N, L, n_lh, L_lh, P`` (Python ints).
+    Keys: ``row_ptr, col, p_row, col_ptr, csc_row, csc_pidx`` (cupy int32).
     """
     import cupy as cp  # local import: CPU-only hosts can still build layouts
 
-    d: Dict[str, Any] = {
+    return {
         k: cp.asarray(getattr(layout, k))
         for k in ("row_ptr", "col", "p_row", "col_ptr", "csc_row", "csc_pidx")
     }
-    d.update(N=layout.N, L=layout.L, n_lh=layout.n_lh, L_lh=layout.L_lh,
-             P=layout.P)
-    return d

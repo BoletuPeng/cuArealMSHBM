@@ -5,11 +5,11 @@ GPU supercall for the step-1 vMF init-parameter leaf.
 Two ways in:
 
   * **device-resident** — the caller hands the fp32 ``(V_h, D)`` avg
-    profiles that ``avg_profiles_from_packed_gpu`` left on device
+    profiles that ``avg_profiles_from_accumulator`` left on device
     (``precomputed_lh_avg_dev`` / ``precomputed_rh_avg_dev``). Nothing
     round-trips through host memory: the lh/rh concat and the fp32→fp64
     widen happen in one device allocation.
-  * **host** — the historical path: ``.npy`` read (or in-memory host
+  * **host** — ``.npy`` read (or in-memory host
     arrays via ``precomputed_{lh,rh}_avg``), host concat, one H2D.
 
 From there everything up to the ε scalar is device-resident::

@@ -55,7 +55,7 @@ highlighting:
 
 | Leaf | Owner module | Used by |
 |---|---|---|
-| `remove_isolated_surface_components` | [`arealmshbm/postprocessing/remove_isolated.py`](../arealmshbm/postprocessing/remove_isolated.py) | cMSHBM only — twice (per comp_iter and at the end) |
+| `remove_isolated_surface_components` | [`arealmshbm/postprocessing/remove_isolated.py`](../arealmshbm/postprocessing/remove_isolated.py) | cMSHBM only — twice (per comp_iter and at the end); `gpu` runs the per-comp_iter one on device (`ConnectednessGPU.remove_isolated`, bit-identical) |
 | `compute_components_general` threshold | [`arealmshbm/check_connectedness/`](../arealmshbm/check_connectedness/) | gMSHBM (`>3`), cMSHBM (`>1`); the leaf returns the raw count, the calling glue applies the predicate |
 
 `Cdln`, `vmf_probability`, the M-step κ/ν update, `intra_em_cost`,
@@ -78,17 +78,17 @@ from it:
    templates, sets `beta_internal` (gMSHBM ×1000, cMSHBM ×1, dMSHBM 0),
    skips cohort.json's gradient fields when not gMSHBM (`fetch_data`
    accepts a `with_gradient: bool` flag).
-2. **`VmfClusteringSession.run`** — reads the spec at construction and
-   gates which sub-Sessions get built and which calls fire per iter.
-   Both the CPU path and `gpu_full` mirror the same gating from the
-   same spec; no per-variant Session subclass.
+2. **`VmfClusteringSession.run` (`cpu`) / `VmfClusteringSessionSparseCUDA`
+   (`gpu`, `vmf_clustering/vmf_clustering_gpu.py`)** — both read the
+   spec at construction and gate which sub-Sessions get built and which
+   calls fire per iter; no per-variant Session subclass.
 3. **`save_parcellation` / `derive_labels`** — applies the cMSHBM final
    `RemoveIsolatedSurfaceComponents(5)` cleanup; picks
    `..._beta<B>` vs `...` filename based on whether `beta` is set.
 
 The "no spatial prior" cases (dMSHBM both, cMSHBM connect) are
 implemented by feeding the existing fused E-step kernel zero `(N, L)`
-buffers in the corresponding slots — no new "no-prior" kernel is
+buffers (zero P-length buffers on `gpu`) in the corresponding slots — no new "no-prior" kernel is
 needed since `+ β·scv + sxv` with `β = 0` or zero buffers is already
 algebraically correct.
 

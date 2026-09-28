@@ -166,14 +166,13 @@ def generate_radius_mask_gpu(lh_labels: np.ndarray,
                               mesh: str,
                               radius,
                               out_dir,
-                              dtype: np.dtype = np.float32,
                               verbose: bool = True,
-                              cbig_code_dir: Optional[str] = None,
+                              atlas_dir: Optional[str] = None,
                               ) -> dict:
     """GPU port of :func:`radius_mask.generate_radius_mask`. Same output
     schema (``lh_boundary``, ``rh_boundary`` as csc_matrix in
-    ``spatial_mask_<mesh>.mat``). ``cbig_code_dir`` is an atlas-dir
-    override (legacy name) for the ``<mesh>/label/<hemi>.aparc.annot``
+    ``spatial_mask_<mesh>.mat``). ``atlas_dir`` is an atlas-dir
+    override for the ``<mesh>/label/<hemi>.aparc.annot``
     lookup; ``None`` ⇒ ``MSHBM_ATLAS_DIR``. Mesh geometry comes from the
     shipped avg_mesh bundles, not from here.
     """
@@ -182,8 +181,8 @@ def generate_radius_mask_gpu(lh_labels: np.ndarray,
 
     lh_mesh = load_avg_mesh("lh", mesh, "inflated")
     rh_mesh = load_avg_mesh("rh", mesh, "inflated")
-    lh_aparc = _read_aparc("lh", mesh, cbig_code_dir=cbig_code_dir)
-    rh_aparc = _read_aparc("rh", mesh, cbig_code_dir=cbig_code_dir)
+    lh_aparc = _read_aparc("lh", mesh, atlas_dir=atlas_dir)
+    rh_aparc = _read_aparc("rh", mesh, atlas_dir=atlas_dir)
 
     lh_labels = _coerce_labels(lh_labels)
     rh_labels = _coerce_labels(rh_labels)

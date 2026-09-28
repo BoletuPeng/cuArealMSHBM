@@ -69,12 +69,12 @@
     {
       "key": "w",
       "type": "integer",
-      "min": 0,
+      "min": 1,
       "max": 1000,
       "default": 50,
       "source": "arealmshbm/pipeline/config.py (PipelineConfig.w)",
       "description": "Group spatial prior log(theta) weight (step3 EM).",
-      "notes": "w=0 is not a prior-off switch: the dense backends still evaluate 0*log(theta)=NaN outside supp(theta), and backend_step3='gpu_sparse' rejects it."
+      "notes": "Must be > 0: the E-step's w*log(theta) term is undefined outside supp(theta) at w=0 (stock CBIG degenerates the same way)."
     },
     {
       "key": "c",

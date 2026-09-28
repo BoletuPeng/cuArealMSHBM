@@ -10,8 +10,9 @@ Given a feature dimension ``D`` and a mean cosine ``rbar`` in (0, 1),
 
 Numerical notes:
     * MATLAB ``besseli(nu, x)`` overflows fp64 around ``x ~ 700`` for
-      ``nu ~ 587`` (D=1175 case). MATLAB falls back to a closed-form
-      approximation when ``besseli`` returns ``Inf``/``NaN``/``0``.
+      ``nu ~ 587`` (D=1175 case). MATLAB's ``invAd`` computes a
+      closed-form approximation when ``besseli`` returns
+      ``Inf``/``NaN``/``0``.
     * We use ``scipy.special.ive`` (exponentially scaled
       ``exp(-|x|) * I_nu(x)``) and form the ratio
       ``ive(D/2, k) / ive(D/2-1, k)`` so the ``exp(-x)`` factors cancel
@@ -19,10 +20,11 @@ Numerical notes:
       (``kappa ~ 100..2000``).
     * The "is besseli pathological?" probe before fzero in MATLAB is
       reproduced via the unscaled ``iv`` (it overflows to ``Inf`` —
-      that's the same trigger MATLAB uses) so we take the same fallback
-      branch in the same regime. This is necessary for behaviour parity
-      because the saved ``epsil`` depends on whether MATLAB went down
-      the fzero or the closed-form path.
+      that's the same trigger MATLAB uses) so this port takes the
+      closed-form branch in the same regime. Every step-1 ``epsil``
+      measured on disk (151 ``group.mat`` files, 1126-4841) comes from
+      that branch, where this function and ``m_step._invad.invad`` are
+      bit-equal.
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """
@@ -59,14 +61,19 @@ def _ad(kappa: float, D: float) -> float:
 def invAd(D: float, rbar: float) -> float:
     """Inverse of ``A_d`` — vMF concentration estimate for mean cosine ``rbar``.
 
-    Mirrors MATLAB ``CBIG_ArealMSHBM_invAd``:
+    Computes what stock CBIG's local ``function [outu] = invAd(D, rbar)``
+    computes into ``out``:
 
         outu = (D-1)*rbar/(1-rbar^2) + D/(D-1)*rbar      # warm start
         if besseli(D/2-1, outu) is Inf/NaN/0:
-            return outu - D/(D-1)*rbar/2                  # closed form
+            out = outu - D/(D-1)*rbar/2                   # closed form
         else:
             try fzero on (A_d(k) - rbar) starting at outu
-            return fzero result if converged else closed form
+            out = fzero result if converged else closed form
+
+    MATLAB then returns ``outu`` (the warm start) and discards ``out``;
+    this function returns ``out`` (with a bracketed brentq in place
+    of fzero), so it is not the MATLAB return value.
 
     Parameters
     ----------

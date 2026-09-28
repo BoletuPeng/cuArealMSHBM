@@ -1,9 +1,7 @@
 """_save.py — ``Params_Final.mat`` writer for step 2 (every backend).
 
-Lifted out of ``Step2Pipeline._save_params`` so both the dense/CPU and
-the sparse GPU paths write through one function (design contract
-``docs/step2_sparse_design.md`` §6). ``pipeline.py`` keeps a one-line
-delegation.
+The one ``Params_Final.mat`` writer; every step-2 backend saves through
+it (design contract ``docs/step2_sparse_design.md`` §6).
 
 Two things happen here and nowhere else:
 
@@ -13,8 +11,8 @@ Two things happen here and nowhere else:
   also need transposing (``s_lambda``/``s_psi``/``s_t_nu``) are stripped
   by the caller, so ``mu`` is the only transpose.
 * **The ``theta`` container.** ``theta`` always lands as a dense fp64
-  ``(N, L)`` block in a ``do_compression=True`` container — the on-disk
-  contract this file has always had. CBIG's MATLAB
+  ``(N, L)`` block in a ``do_compression=True`` container (the on-disk
+  contract). CBIG's MATLAB
   ``CBIG_MSHBM_generate_individual_parcellation.m`` evaluates
   ``log(Params.theta)``, which MATLAB will not do on a sparse input, so
   a scipy-sparse ``theta`` (what the ``gpu`` backend's
@@ -42,7 +40,7 @@ def save_params_final(Params: Dict[str, Any], path: str | Path) -> None:
         keys (``s_lambda``, ``s_psi``, ``s_t_nu``).
     path : destination ``Params_Final.mat``; parent dirs are created.
 
-    Field conversions (unchanged from the original ``_save_params``):
+    Field conversions:
     float ndarrays → fp64; other ndarrays verbatim; ``int``/``float``/
     ``str`` verbatim; ``list`` → ``np.asarray``; anything else passed
     through to ``savemat`` untouched. ``mu`` is transposed ``(L, D) →
@@ -74,6 +72,5 @@ def save_params_final(Params: Dict[str, Any], path: str | Path) -> None:
             out[k] = v
 
     # Compression stays on: a 199 MB payload is not something to put on
-    # disk uncompressed, and this is the byte contract the legacy saver
-    # had.
+    # disk uncompressed.
     sio.savemat(p, {"Params": out}, do_compression=True, format="5")

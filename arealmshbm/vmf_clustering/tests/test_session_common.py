@@ -1,12 +1,11 @@
-"""test_session_common.py — pin the two shared validators that the CPU
-:class:`VmfClusteringSession` and GPU :class:`VmfClusteringSessionCUDA`
-constructors both call.
+"""test_session_common.py — pin the ctor validators in
+:mod:`arealmshbm.vmf_clustering._session_common`.
 
-Both validators live in :mod:`arealmshbm.vmf_clustering._session_common`
-and form the cross-backend "contract surface": if these accept an
-input on one backend, they must accept it on the other. A regression
-on either backend that drifts the contract gets caught here, not at
-the next E2E.
+``validate_variant_requirements`` is called by both the cpu
+:class:`VmfClusteringSession` and the gpu
+:class:`VmfClusteringSessionSparseCUDA` constructors;
+``validate_packed_bold_shape`` is the cpu session's packed-BOLD
+contract. A drift in either gets caught here, not at the next E2E.
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """

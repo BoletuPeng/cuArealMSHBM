@@ -1,11 +1,10 @@
 """test_bold_io.py — step0 BOLD reader (GIFTI-only).
 
 ``arealmshbm.bold_io.read_surface_bold`` is the step0 surface BOLD
-entry point. Since the NIFTI mirror was retired it is a thin
-``.func.gii``-only wrapper around
+entry point: a thin ``.gii``-only wrapper around
 :func:`arealmshbm.data_io.gifti_io.read_surface_gifti` plus the
 ``expected_n`` guard. These tests pin both the contract refusal
-(``.nii.gz`` paths must error) and the V-mismatch guard.
+(non-``.gii`` suffixes must error) and the V-mismatch guard.
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """
@@ -60,16 +59,6 @@ def test_read_surface_bold_expected_n_guard(tmp_path: Path):
     p.write_bytes(_synth_gifti(dim0=8, T=2))
     with pytest.raises(ValueError, match="expected_n"):
         read_surface_bold(p, expected_n=12345)
-
-
-def test_read_surface_bold_rejects_nii_gz(tmp_path: Path):
-    """The NIFTI path was retired — a ``.nii.gz`` argument must hit
-    an explicit refusal naming the suffix, not silently call into
-    nibabel or skip the GIFTI parser."""
-    p = tmp_path / "fake.nii.gz"
-    p.write_bytes(b"\x1f\x8b\x08\x00")  # gzip magic, doesn't matter
-    with pytest.raises(ValueError, match=r"\.gii"):
-        read_surface_bold(p, expected_n=8)
 
 
 def test_read_surface_bold_rejects_unknown_suffix(tmp_path: Path):

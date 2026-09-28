@@ -11,16 +11,20 @@ Reproduces the CPU chain
 plus the decision logic of
 ``arealmshbm.vmf_clustering.vmf_clustering._check_connectedness_step``
 (distributed mask, ``xyz_gamma += 1000``, ``max_connectedness`` /
-``max_components``).
+``max_components``), and -- when ``isolated_component_min_size`` is set
+(cMSHBM) -- the ``remove_isolated_surface_components`` pre-predicate that
+the CPU chain applies to the argmax labels before the components /
+distance test.
 
 Design
 ------
 * **No floating-point ``atomicAdd``.** The only float atomics are
   ``atomicMin`` / ``atomicMax`` done through int reinterpretation of
   non-negative floats -- exact and order-independent, so the backend is
-  run-to-run bit-reproducible. Integer ``atomicAdd`` (component counts,
-  bucket cursors) is exact; bucket *order* varies but every consumer is a
-  min/max over the bucket, which is order-independent.
+  run-to-run bit-reproducible. Integer ``atomicAdd`` / ``atomicExch``
+  (component counts, bucket cursors, the pre-predicate's member lists and
+  votes) are exact; bucket and list *order* varies but every consumer is
+  order-independent (a min/max over the bucket, a histogram).
 * **Connected components** use hook-to-min + pointer jumping
   (Soman/Kishore/Narayanan). Component ids are *root vertex indices*, so
   they differ from the CPU's encounter-order ids -- only the partition is
@@ -28,9 +32,11 @@ Design
   component membership for the distance) depend on the partition only.
   The loop runs entirely on device inside one cooperative-groups kernel
   (``grid.sync()``), so ``step()`` needs no host round-trip for the
-  convergence flag. A non-cooperative fallback (host-driven loop) is
-  compiled too and used when cooperative launch is unavailable; that
-  path costs extra D2H copies per call.
+  convergence flag. Cooperative launch is a requirement of this backend:
+  the device must support it, and CuPy compiles the kernel with
+  ``enable_cooperative_groups=True``, which links ``cudadevrt`` from the
+  CUDA toolkit (``CUDA_PATH``). A box without either fails at
+  construction; use ``backend_step3='cpu'`` there.
 * ``--fmad=false`` so ``dx*dx + dy*dy + dz*dz`` rounds like numba's
   non-contracted fp32 (the CPU kernel is ``fastmath=False``).
   ``--use_fast_math`` is never used; ``sqrtf`` stays IEEE
@@ -44,6 +50,7 @@ Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 from __future__ import annotations
 
 import threading
+from typing import Optional
 
 import numpy as np
 
@@ -54,7 +61,7 @@ _THREADS = 256
 _TILE = 256
 
 # ---------------------------------------------------------------------------
-# Module A -- connected components (compiled twice: cooperative + fallback)
+# Module A -- connected components (cooperative-groups kernel)
 # ---------------------------------------------------------------------------
 _CC_COOP_SRC = r'''
 #include <cooperative_groups.h>
@@ -105,53 +112,6 @@ extern "C" __global__ void k_cc_coop(const int* __restrict__ labels,
             comp[v] = c;
         }
         grid.sync();
-    }
-}
-'''
-
-_CC_PLAIN_SRC = r'''
-extern "C" __global__ void k_cc_init(int Ntot, int* comp, int* changed)
-{
-    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    const int stride = gridDim.x * blockDim.x;
-    for (int v = tid; v < Ntot; v += stride) comp[v] = v;
-    if (tid == 0) changed[0] = 0;
-}
-
-extern "C" __global__ void k_cc_hook(const int* __restrict__ labels,
-                                     const int* __restrict__ nbors,
-                                     int Ntot, int M1,
-                                     int* comp, int* changed)
-{
-    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    const int stride = gridDim.x * blockDim.x;
-    int loc = 0;
-    for (int v = tid; v < Ntot; v += stride) {
-        const int lv = labels[v];
-        const int pv = comp[v];
-        for (int k = 0; k < M1; ++k) {
-            const int u = nbors[k * Ntot + v];
-            if (u < 0) continue;
-            if (labels[u] != lv) continue;
-            const int pu = comp[u];
-            if (pu == pv) continue;
-            const int hi = pv > pu ? pv : pu;
-            const int lo = pv < pu ? pv : pu;
-            atomicMin(&comp[hi], lo);
-            loc = 1;
-        }
-    }
-    if (loc) changed[0] = 1;
-}
-
-extern "C" __global__ void k_cc_compress(int Ntot, int* comp)
-{
-    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    const int stride = gridDim.x * blockDim.x;
-    for (int v = tid; v < Ntot; v += stride) {
-        int c = comp[v];
-        while (comp[c] != c) c = comp[c];
-        comp[v] = c;
     }
 }
 '''
@@ -395,6 +355,94 @@ extern "C" __global__ void k_step(const float* __restrict__ eucli,
         else       { out2[0] = 0.0;   out2[1] = comp_th; }
     }
 }
+
+/* ---- cMSHBM pre-predicate: remove_isolated_surface_components on device ----
+   Runs on the hook-to-min partition of ``labels_in`` (``comp[v]`` is the
+   root vertex of v's component). ``k_ri_push`` threads every component's
+   members into a per-root linked list (``head[root]`` / ``next[v]``),
+   ``k_ri_small`` lists the roots of the components with fewer than ``thr``
+   members, and ``k_ri_relabel`` gives each of those one block: a shared-
+   memory histogram of the members' neighbours' labels (0 and the
+   component's own label excluded), the most frequent label wins, the
+   smallest on ties. Every vote reads ``labels_in``, the counts are
+   integers and the list / slot orders (which vary run to run) only
+   permute commutative operations, so the result is bit-identical to the
+   host function and run-to-run reproducible. O(size * M1 + L) per small
+   component, flat in ``thr``. */
+extern "C" __global__ void k_ri_push(const int* __restrict__ comp, int Ntot,
+                                     int* head, int* next)
+{
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int stride = gridDim.x * blockDim.x;
+    for (int v = tid; v < Ntot; v += stride) next[v] = atomicExch(&head[comp[v]], v);
+}
+
+extern "C" __global__ void k_ri_small(const int* __restrict__ head,
+                                      const int* __restrict__ next,
+                                      int Ntot, int thr, int* small, int* nsmall)
+{
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int stride = gridDim.x * blockDim.x;
+    for (int r = tid; r < Ntot; r += stride) {
+        int n = 0;                              /* head[r] < 0: r is not a root */
+        for (int v = head[r]; v >= 0 && n < thr; v = next[v]) ++n;
+        if (n > 0 && n < thr) small[atomicAdd(nsmall, 1)] = r;
+    }
+}
+
+extern "C" __global__ void k_ri_relabel(const int* __restrict__ labels_in,
+                                        const int* __restrict__ nbors,
+                                        const int* __restrict__ head,
+                                        const int* __restrict__ next,
+                                        const int* __restrict__ small,
+                                        const int* __restrict__ nsmall,
+                                        int Ntot, int M1, int L, int* labels_out)
+{
+    extern __shared__ int hist[];               /* L counts; label l at hist[l - 1] */
+    __shared__ unsigned long long s_best;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int n_warp = blockDim.x >> 5;
+    const int ns = nsmall[0];
+    for (int s = blockIdx.x; s < ns; s += gridDim.x) {
+        const int r = small[s];
+        const int self_label = labels_in[r];    /* the root is a member */
+        for (int p = threadIdx.x; p < L; p += blockDim.x) hist[p] = 0;
+        if (threadIdx.x == 0) s_best = 0ULL;
+        __syncthreads();
+        /* warp w takes every n_warp-th member, lane k that member's k-th slot */
+        int i = 0;
+        for (int v = head[r]; v >= 0; v = next[v], ++i) {
+            if (i % n_warp != warp) continue;
+            for (int k = lane; k < M1; k += 32) {
+                const int u = nbors[k * Ntot + v];
+                if (u < 0) continue;
+                const int c = labels_in[u];
+                if (c == 0 || c == self_label) continue;
+                atomicAdd(&hist[c - 1], 1);
+            }
+        }
+        __syncthreads();
+        /* key = (count, L - label): its max is the most frequent label, the
+           smallest one on ties */
+        unsigned long long mine = 0ULL;
+        for (int p = threadIdx.x; p < L; p += blockDim.x) {
+            const int h = hist[p];
+            if (h > 0) {
+                const unsigned long long key =
+                    ((unsigned long long)h << 32) | (unsigned long long)(L - 1 - p);
+                if (key > mine) mine = key;
+            }
+        }
+        if (mine) atomicMax(&s_best, mine);
+        __syncthreads();
+        if (s_best != 0ULL && threadIdx.x == 0) {   /* no candidate: label kept */
+            const int best = L - (int)(s_best & 0xffffffffULL);
+            for (int v = head[r]; v >= 0; v = next[v]) labels_out[v] = best;
+        }
+        __syncthreads();
+    }
+}
 '''
 
 
@@ -403,45 +451,38 @@ _MODULES = None
 
 
 def _compiled_modules():
-    """``(mod_main, mod_plain, mod_coop, k_cc_coop)`` — compiled once per process.
+    """``(mod_main, k_cc_coop)`` — compiled once per process.
 
     The step-3 stage pipeline builds one :class:`ConnectednessGPU` per
     subject on the LOAD thread while EM workers run on other streams, so
-    the NVRTC compiles and the cooperative-launch probe must not repeat
-    per instance. ``k_cc_coop`` is ``None`` when the probe launch fails.
-    Not keyed by device — this is a single-GPU deployment.
+    the NVRTC compiles must not repeat per instance. Not keyed by
+    device — this is a single-GPU deployment.
     """
     global _MODULES
     with _MODULES_LOCK:
         if _MODULES is not None:
             return _MODULES
+        dev = cp.cuda.Device()
+        if not dev.attributes['CooperativeLaunch']:
+            name = cp.cuda.runtime.getDeviceProperties(dev.id)['name'].decode()
+            raise RuntimeError(
+                f"GPU {dev.id} ({name}) does not support cooperative launch, "
+                f"which backend_step3='gpu' needs for gMSHBM / cMSHBM "
+                f"(check_connectedness). Use backend_step3='cpu'.")
         opts = ('--fmad=false',)
         mod = cp.RawModule(code=_MAIN_SRC, options=opts, backend='nvrtc')
-        mod_plain = cp.RawModule(code=_CC_PLAIN_SRC, options=opts,
-                                 backend='nvrtc')
         # Cooperative CC keeps the whole convergence loop on device (no D2H).
-        mod_coop = None
-        k_coop = None
-        try:
-            mod_coop = cp.RawModule(code=_CC_COOP_SRC, options=opts,
-                                    backend='nvrtc',
-                                    enable_cooperative_groups=True)
-            k = mod_coop.get_function('k_cc_coop')
-            probe_lab = cp.zeros(8, dtype=cp.int32)
-            probe_nb = cp.full(8, -1, dtype=cp.int32)
-            probe_comp = cp.empty(8, dtype=cp.int32)
-            probe_changed = cp.zeros(1, dtype=cp.int32)
-            k((1,), (32,), (probe_lab, probe_nb, np.int32(8), np.int32(1),
-                            probe_comp, probe_changed))
-            # Sync only the probe's own stream: a device-wide sync here
-            # would also drain every concurrent EM worker stream.
-            cp.cuda.get_current_stream().synchronize()
-            k_coop = k
-        except Exception:                                   # pragma: no cover
-            mod_coop = None
-            k_coop = None
-        _MODULES = (mod, mod_plain, mod_coop, k_coop)
+        mod_coop = cp.RawModule(code=_CC_COOP_SRC, options=opts,
+                                backend='nvrtc',
+                                enable_cooperative_groups=True)
+        _MODULES = (mod, mod_coop.get_function('k_cc_coop'))
         return _MODULES
+
+
+def prewarm_connectedness_gpu() -> None:
+    """Check cooperative-launch support and compile the kernels now, so a
+    device or CUDA toolkit that cannot run them fails before step 0."""
+    _compiled_modules()
 
 
 def _pack_nbors(lh_nbors: np.ndarray, rh_nbors: np.ndarray) -> np.ndarray:
@@ -480,15 +521,24 @@ class ConnectednessGPU:
     num_parcel : int (``L``; LH owns 1..L/2, RH owns L/2+1..L).
     connect_th : float -- ``eucli > connect_th`` marks a distributed parcel.
     components_threshold : int -- ``parcel_components > this`` likewise.
+    isolated_component_min_size : int or None -- when set, ``step`` first
+        relabels every same-label component smaller than this to its
+        neighbours' mode label (cMSHBM's
+        :func:`remove_isolated_surface_components`; the argument is
+        ``abs_threshold``) and runs the predicate on the cleaned copy.
+        The caller's labels are not modified. ``None`` = no pre-pass.
 
-    All device buffers are allocated here; ``components_and_distance`` and
-    ``step`` allocate nothing.
+    All device buffers are allocated here; ``components_and_distance``,
+    ``remove_isolated`` and ``step`` allocate nothing. Labels are always a
+    C-contiguous ``(2n,)`` int32 device array (LH first, RH after; 0 =
+    medial wall) that this object does not own.
     """
 
     def __init__(self, lh_vertex_nbors, rh_vertex_nbors,
                  lh_vertices, rh_vertices,
                  num_parcel: int, connect_th: float,
-                 components_threshold: int):
+                 components_threshold: int,
+                 isolated_component_min_size: Optional[int] = None):
         n = int(lh_vertex_nbors.shape[1])
         self.n_hemi = n
         self.Ntot = 2 * n
@@ -523,7 +573,23 @@ class ConnectednessGPU:
         self._eucli = cp.zeros(L, dtype=cp.float32)
         self._out2 = cp.zeros(2, dtype=cp.float64)
 
-        self._mod, self._mod_plain, _, self._k_cc_coop = _compiled_modules()
+        self.isolated_component_min_size: Optional[int] = None
+        if isolated_component_min_size is not None:
+            thr = int(isolated_component_min_size)
+            if thr <= 0:
+                raise ValueError(
+                    f"isolated_component_min_size must be positive (got {thr})")
+            self.isolated_component_min_size = thr
+            # A component has at most Ntot members, so any larger threshold
+            # is the same predicate (and fits the kernel's int argument).
+            self._ri_thr = np.int32(min(thr, Nt + 1))
+            self._ri_head = cp.empty(Nt, dtype=cp.int32)
+            self._ri_next = cp.empty(Nt, dtype=cp.int32)
+            self._ri_small = cp.empty(Nt, dtype=cp.int32)
+            self._ri_nsmall = cp.zeros(1, dtype=cp.int32)
+            self._labels_clean = cp.empty(Nt, dtype=cp.int32)
+
+        self._mod, self._k_cc_coop = _compiled_modules()
         self._k_reset = self._mod.get_function('k_reset')
         self._k_count = self._mod.get_function('k_count')
         self._k_pc = self._mod.get_function('k_pc')
@@ -533,41 +599,27 @@ class ConnectednessGPU:
         self._k_pairs = self._mod.get_function('k_pairs')
         self._k_reduce = self._mod.get_function('k_reduce')
         self._k_step = self._mod.get_function('k_step')
-
-        self._k_cc_init = self._mod_plain.get_function('k_cc_init')
-        self._k_cc_hook = self._mod_plain.get_function('k_cc_hook')
-        self._k_cc_compress = self._mod_plain.get_function('k_cc_compress')
+        self._k_ri_push = self._mod.get_function('k_ri_push')
+        self._k_ri_small = self._mod.get_function('k_ri_small')
+        self._k_ri_relabel = self._mod.get_function('k_ri_relabel')
 
         self._grid = ((Nt + _THREADS - 1) // _THREADS,)
         nsm = int(cp.cuda.Device().attributes['MultiProcessorCount'])
         self._coop_grid = (min(self._grid[0], 2 * nsm),)
 
     # -----------------------------------------------------------------
-    @property
-    def uses_cooperative_cc(self) -> bool:
-        """True when the CC convergence loop runs device-side (no D2H)."""
-        return self._k_cc_coop is not None
+    def _check_labels(self, labels_dev):
+        if (labels_dev.dtype != cp.int32 or labels_dev.shape != (self.Ntot,)
+                or not labels_dev.flags.c_contiguous):
+            raise ValueError(
+                f"labels must be a C-contiguous ({self.Ntot},) int32 device "
+                f"array; got {labels_dev.dtype} {labels_dev.shape}")
 
     def _cc(self, labels_dev):
-        if self._k_cc_coop is not None:
-            self._k_cc_coop(self._coop_grid, (_THREADS,),
-                            (labels_dev, self._nbors,
-                             np.int32(self.Ntot), np.int32(self.M1),
-                             self._comp, self._changed))
-            return
-        # Fallback: host-driven loop (extra D2H per iteration).
-        self._k_cc_init(self._grid, (_THREADS,),
-                        (np.int32(self.Ntot), self._comp, self._changed))
-        for _ in range(4096):
-            self._changed.fill(0)
-            self._k_cc_hook(self._grid, (_THREADS,),
-                            (labels_dev, self._nbors,
-                             np.int32(self.Ntot), np.int32(self.M1),
-                             self._comp, self._changed))
-            if int(self._changed.get()[0]) == 0:
-                break
-            self._k_cc_compress(self._grid, (_THREADS,),
-                                (np.int32(self.Ntot), self._comp))
+        self._k_cc_coop(self._coop_grid, (_THREADS,),
+                        (labels_dev, self._nbors,
+                         np.int32(self.Ntot), np.int32(self.M1),
+                         self._comp, self._changed))
 
     def components_and_distance(self, labels_dev):
         """Return ``(parcel_components (L,) fp64, eucli (L,) fp32)``.
@@ -576,6 +628,7 @@ class ConnectednessGPU:
         next call. ``labels_dev`` is a bilateral ``(N,)`` int32 device array
         (LH first, RH after; 0 = medial wall).
         """
+        self._check_labels(labels_dev)
         Nt, L = self.Ntot, self.L
         g, blk = self._grid, (_THREADS,)
 
@@ -602,14 +655,55 @@ class ConnectednessGPU:
                                 self._bpar, self._cmin, self._eucli))
         return self._pc, self._eucli
 
+    def remove_isolated(self, labels_dev):
+        """Device ``remove_isolated_surface_components(labels, nbors, thr)``.
+
+        ``labels_dev`` is a bilateral ``(N,)`` int32 device array (LH first,
+        RH after; 0 = medial wall) and is left untouched. Returns the cleaned
+        copy, a device array **owned by this object** -- overwritten on the
+        next call (and not accepted back as input: the votes must read a
+        buffer the relabel does not write). Bit-identical to the host
+        function applied per hemisphere: the packed neighbour table has no
+        cross-hemisphere edge, so one bilateral pass is the two per-hemi
+        passes. Requires ``isolated_component_min_size``.
+        """
+        if self.isolated_component_min_size is None:
+            raise ValueError("ConnectednessGPU built without "
+                             "isolated_component_min_size")
+        self._check_labels(labels_dev)
+        if cp.may_share_memory(labels_dev, self._labels_clean):
+            raise ValueError("labels_dev is the buffer remove_isolated returns")
+        Nt = self.Ntot
+        g, blk = self._grid, (_THREADS,)
+        self._cc(labels_dev)
+        self._ri_head.fill(-1)
+        self._ri_nsmall.fill(0)
+        self._k_ri_push(g, blk, (self._comp, np.int32(Nt), self._ri_head,
+                                 self._ri_next))
+        self._k_ri_small(g, blk, (self._ri_head, self._ri_next, np.int32(Nt),
+                                  self._ri_thr, self._ri_small, self._ri_nsmall))
+        cp.copyto(self._labels_clean, labels_dev)
+        self._k_ri_relabel(g, blk, (labels_dev, self._nbors, self._ri_head,
+                                    self._ri_next, self._ri_small,
+                                    self._ri_nsmall, np.int32(Nt),
+                                    np.int32(self.M1), np.int32(self.L),
+                                    self._labels_clean),
+                           shared_mem=4 * self.L)
+        return self._labels_clean
+
     def step(self, labels_dev, xyz_gamma_dev):
         """``_check_connectedness_step`` semantics.
 
+        With ``isolated_component_min_size`` set, the predicate runs on
+        :meth:`remove_isolated`'s cleaned copy of ``labels_dev`` (cMSHBM);
+        the cleaned labels stay internal, as they do on the CPU chain.
         Updates ``xyz_gamma_dev`` (L,) fp64 in place (``+= 1000`` at
         distributed parcels) and returns
         ``(max_connectedness, max_components)`` as Python floats. Exactly one
         device->host copy (the 2-element scalar buffer).
         """
+        if self.isolated_component_min_size is not None:
+            labels_dev = self.remove_isolated(labels_dev)
         self.components_and_distance(labels_dev)
         self._k_step((1,), (256,), (self._eucli, self._pc, xyz_gamma_dev,
                                     np.int32(self.L),

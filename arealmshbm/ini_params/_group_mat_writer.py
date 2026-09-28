@@ -12,7 +12,7 @@ it — so it must stay, but there is no reason for the caller's critical
 path to wait on it. Handing the write to a background thread removes
 it from the step-1 wall; the caller joins with ``result.writer.wait()``.
 
-The supercalls always write compressed (the historical on-disk form);
+The supercalls always write compressed;
 ``compress`` stays a parameter of this writer because both settings
 round-trip identically through ``scipy.io.loadmat`` / ``load_group_mtc``.
 

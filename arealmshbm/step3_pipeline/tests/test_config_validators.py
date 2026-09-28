@@ -46,21 +46,24 @@ def test_cMSHBM_min_size_positive_accepted() -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# w=0 × backend='gpu_sparse'
+# w > 0 on every backend
 #
-# w=0 is not a "prior off" switch: the dense E-step still evaluates
-# 0*log(theta)=NaN outside supp(theta), while the candidate-set backend
-# only visits supp(theta) and would silently answer differently.
+# At w=0 the E-step's w*log(theta) term is 0*log(0) = NaN outside
+# supp(theta) and the parcellation degenerates (stock CBIG does the same).
 # ─────────────────────────────────────────────────────────────────────
-def test_w_zero_rejected_with_gpu_sparse() -> None:
-    with pytest.raises(ValueError, match=r"gpu_sparse.*requires\s+w > 0"):
-        Step3Config(**_base_kwargs(w=0.0, backend="gpu_sparse"))
+@pytest.mark.parametrize("backend", ["cpu", "gpu"])
+def test_w_zero_rejected(backend: str) -> None:
+    with pytest.raises(ValueError, match=r"w must be > 0 \(got 0\.0\)"):
+        Step3Config(**_base_kwargs(w=0.0, backend=backend))
 
 
-def test_w_zero_accepted_on_cpu() -> None:
-    assert Step3Config(**_base_kwargs(w=0.0, backend="cpu")).w == 0.0
+@pytest.mark.parametrize("backend", ["cpu", "gpu"])
+def test_w_positive_accepted(backend: str) -> None:
+    cfg = Step3Config(**_base_kwargs(w=1.0, backend=backend))
+    assert cfg.w == 1.0 and cfg.backend == backend
 
 
-def test_w_positive_accepted_with_gpu_sparse() -> None:
-    cfg = Step3Config(**_base_kwargs(w=50.0, backend="gpu_sparse"))
-    assert cfg.w == 50.0 and cfg.backend == "gpu_sparse"
+def test_cMSHBM_accepted_with_gpu() -> None:
+    cfg = Step3Config(**_base_kwargs(pipeline_type="cMSHBM", backend="gpu"))
+    assert cfg.backend == "gpu" and cfg.variant.pre_predicate_remove_isolated
+    assert cfg.connect_th == 0.0

@@ -6,7 +6,7 @@ Three families:
     store — they pin the fast MAT parser against the dense loaders for
     compressed / uncompressed, fp32 / fp64 θ, and the v7.3 branch when
     ``h5py`` is importable, plus what routes to scipy (an unsupported
-    layout) and what does not (a corrupt payload, a missing ``isal``);
+    layout) and what does not (a corrupt payload);
   * sub-001 exactness — prior, mask, layout (``layouts_equal`` against
     ``build_candidate_layout_dense``), packed BOLD, gradient,
     ``setting_params`` — skipped when the profile store is absent;
@@ -24,12 +24,21 @@ import numpy as np
 import pytest
 
 from arealmshbm.step3_pipeline import sparse_inputs as si
-from arealmshbm.vmf_clustering.sparse_layout import (
+from arealmshbm.vmf_clustering.tests._layout_oracle import (
     build_candidate_layout_dense, layouts_equal,
 )
 from arealmshbm.vmf_clustering.tests._sub001_fixture import (
     SUB001_DIR, sub001_available,
 )
+
+
+def _theta_csr_to_dense(theta_csr, N: int, L: int) -> np.ndarray:
+    """Densify a ``theta_csr`` triple."""
+    row_ptr, col, val = theta_csr
+    out = np.zeros((N, L), dtype=np.float32)
+    rows = np.repeat(np.arange(N, dtype=np.int64), np.diff(row_ptr))
+    out[rows, col] = val
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -72,7 +81,7 @@ def test_prior_csr_matches_dense_synthetic(tmp_path, compress, theta_dtype):
     assert np.array_equal(got["epsil"], ref["epsil"].ravel())
     assert np.array_equal(got["sigma"], ref["sigma"].ravel())
     assert (got["N"], got["L"]) == ref["theta"].shape
-    dense = si.theta_csr_to_dense(got["theta_csr"], got["N"], got["L"])
+    dense = _theta_csr_to_dense(got["theta_csr"], got["N"], got["L"])
     assert np.array_equal(dense, ref["theta"])
     # ascending columns inside each row
     row_ptr, col, _ = got["theta_csr"]
@@ -93,24 +102,6 @@ def test_prior_csr_missing_file(tmp_path):
         si.load_group_prior_csr(tmp_path / "nope.mat")
 
 
-def test_prior_csr_fast_path_without_isal(tmp_path, monkeypatch):
-    """The shared reader's stdlib-zlib fallback keeps this path exact."""
-    import zlib
-    from arealmshbm.data_io import mat5_stream as ms
-
-    p = _write_prior(tmp_path, _make_prior(np.random.default_rng(23)), True)
-    ref = si.load_group_prior_csr(p)
-    assert si.LAST_PRIOR_PATH == "fast"
-
-    monkeypatch.setattr(ms, "_zlib", zlib)
-    got = si.load_group_prior_csr(p)
-    assert si.LAST_PRIOR_PATH == "fast"      # not the 6x-slower scipy path
-    for k in ("mu", "epsil", "sigma"):
-        assert got[k].tobytes() == ref[k].tobytes(), k
-    for a, b in zip(got["theta_csr"], ref["theta_csr"]):
-        assert np.array_equal(a, b)
-
-
 def test_prior_csr_corrupt_payload_propagates(tmp_path):
     """A decode error is not a "layout I do not model" verdict.
 
@@ -118,8 +109,8 @@ def test_prior_csr_corrupt_payload_propagates(tmp_path):
     reach the caller instead of being re-read on the dense fallback
     (which materialises the 33 MB θ this module exists to avoid).
     Patches ``epsil``'s payload byte count to a non-multiple of the
-    fp32 itemsize, so ``np.frombuffer`` raises ``ValueError`` — the
-    class the walker's ``except`` clause used to swallow.
+    fp32 itemsize, so ``np.frombuffer`` raises ``ValueError``, which
+    must propagate rather than route to the scipy path.
     """
     import struct
     import zlib
@@ -155,7 +146,7 @@ def test_prior_csr_v73(tmp_path):
     ref = load_group_prior(p)
     got = si.load_group_prior_csr(p)
     assert si.LAST_PRIOR_PATH == "scipy"
-    dense = si.theta_csr_to_dense(got["theta_csr"], got["N"], got["L"])
+    dense = _theta_csr_to_dense(got["theta_csr"], got["N"], got["L"])
     assert np.array_equal(dense, ref["theta"])
     assert np.array_equal(got["mu"], ref["mu"])
 
@@ -173,11 +164,43 @@ def test_spatial_mask_csr_matches_dense_synthetic(tmp_path, compress):
     savemat(str(p), {"lh_boundary": lh, "rh_boundary": rh},
             do_compression=compress)
 
-    lh_ref, rh_ref = load_spatial_mask(p)
+    lh_dense, rh_dense = load_spatial_mask(p)
     lh_got, rh_got = si.load_spatial_mask_csr(p)
-    assert np.array_equal(lh_got.toarray(), lh_ref)
-    assert np.array_equal(rh_got.toarray(), rh_ref)
+    for got in (lh_dense, lh_got.toarray()):
+        assert np.array_equal(got, lh.toarray())
+    for got in (rh_dense, rh_got.toarray()):
+        assert np.array_equal(got, rh.toarray())
+    assert lh_dense.dtype == np.float64 and lh_dense.flags["C_CONTIGUOUS"]
     assert lh_got.dtype == np.float64
+
+
+def test_spatial_mask_csr_v73(tmp_path):
+    h5py = pytest.importorskip("h5py")
+    import scipy.sparse as sp
+    from arealmshbm.data_io import load_spatial_mask, mat5_stream
+
+    rng = np.random.default_rng(5)
+    p = tmp_path / "spatial_mask_v73.mat"
+    written = {}
+    with h5py.File(p, "w") as f:
+        for key in ("lh_boundary", "rh_boundary"):
+            m = sp.random(20, 4, density=0.3, random_state=rng, format="csc")
+            written[key] = m.toarray()
+            g = f.create_group(key)
+            g.create_dataset("data", data=m.data)
+            g.create_dataset("ir", data=m.indices.astype(np.uint64))
+            g.create_dataset("jc", data=m.indptr.astype(np.uint64))
+            g.attrs["MATLAB_sparse"] = np.uint64(m.shape[0])
+
+    lh_dense, rh_dense = load_spatial_mask(p)
+    assert mat5_stream.LAST_PATH == "h5py"
+    lh_got, rh_got = si.load_spatial_mask_csr(p)
+    assert mat5_stream.LAST_PATH == "h5py"
+    assert lh_got.shape == (20, 4)
+    for got in (lh_dense, lh_got.toarray()):
+        assert np.array_equal(got, written["lh_boundary"])
+    for got in (rh_dense, rh_got.toarray()):
+        assert np.array_equal(got, written["rh_boundary"])
 
 
 def test_spatial_mask_csr_missing_file(tmp_path):
@@ -279,19 +302,23 @@ def test_sub001_prior_csr_exact():
     assert np.array_equal(got["mu"], ref["mu"])
     assert np.array_equal(got["epsil"], ref["epsil"].ravel())
     assert np.array_equal(got["sigma"], ref["sigma"].ravel())
-    dense = si.theta_csr_to_dense(got["theta_csr"], got["N"], got["L"])
+    dense = _theta_csr_to_dense(got["theta_csr"], got["N"], got["L"])
     assert np.array_equal(dense, ref["theta"])
 
 
 @pytestmark_sub001
 def test_sub001_spatial_mask_csr_exact():
+    from scipy.io import loadmat
     from arealmshbm.data_io import load_spatial_mask
 
     cfg = _cfg()
-    lh_ref, rh_ref = load_spatial_mask(cfg.spatial_mask_path)
-    lh_got, rh_got = si.load_spatial_mask_csr(cfg.spatial_mask_path)
-    assert np.array_equal(lh_got.toarray(), lh_ref)
-    assert np.array_equal(rh_got.toarray(), rh_ref)
+    ref = loadmat(str(cfg.spatial_mask_path))
+    dense = load_spatial_mask(cfg.spatial_mask_path)
+    csr = si.load_spatial_mask_csr(cfg.spatial_mask_path)
+    for i, key in enumerate(("lh_boundary", "rh_boundary")):
+        want = ref[key].toarray()
+        assert np.array_equal(dense[i], want)
+        assert np.array_equal(csr[i].toarray(), want)
 
 
 @pytestmark_sub001
@@ -477,7 +504,8 @@ def test_packed_bold_rejects_profile_wider_than_the_kernel_limit(tmp_path):
 
     D = 8 * MAX_D_BYTES + 1
     project, lh, rh = _tiny_packed_project(tmp_path, D=D, dirty=False)
-    with pytest.raises(ValueError, match=r"exceeds the gpu_sparse"):
+    with pytest.raises(ValueError, match=r"backend='gpu' requires "
+                       r"ceil\(D/8\) <= 256.*use backend='cpu'"):
         si.fetch_packed_bold_TND(project, 2, 1, "fsaverage6", lh, rh)
 
 
@@ -563,12 +591,12 @@ def test_cohort_check_rejects_mismatching_spatial_mask_path():
         si.load_step3_sparse_inputs(cfg, cohort=_dummy_cohort())
 
 
-def test_pipeline_rejects_sparse_cohort_on_dense_backend():
+def test_pipeline_rejects_sparse_cohort_on_cpu_backend():
     from arealmshbm.step3_pipeline import Step3Config, Step3Pipeline
 
     cfg = Step3Config(project_dir="/tmp/nonexistent", num_session=6,
                       num_clusters=300, backend="cpu")
-    with pytest.raises(ValueError, match="gpu_sparse"):
+    with pytest.raises(ValueError, match="only meaningful on backend='gpu'"):
         Step3Pipeline(cfg, sparse_cohort=_dummy_cohort())
 
 

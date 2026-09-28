@@ -75,20 +75,6 @@ _LOG_EPS20 = float(math.log(np.finfo(np.float64).eps ** 20))
 
 
 # ─────────────────────────────────────────────────────────────────────
-# invad — full MATLAB-equivalent algorithm.
-#
-# Replaced the asymptotic-only formula with the full Bessel-probe +
-# secant-polish algorithm at ``arealmshbm.m_step._invad.invad_numba``
-# — bit-equivalent to MATLAB ``CBIG_ArealMSHBM_invAd`` (verified to fp64
-# ULP on rbar ∈ [0.05, 0.9], D=1175 via mpmath). The previous
-# ``_invad_asymptotic_f64`` only matched MATLAB when Bessel overflowed
-# (κ > ~880 at D=1175); in early EM iters (κ ~ 553) MATLAB used fzero
-# and Python used asymptotic-only — a ~0.5 absolute κ discrepancy that
-# compounded over iters.
-# ─────────────────────────────────────────────────────────────────────
-
-
-# ─────────────────────────────────────────────────────────────────────
 # Phase A — Precompute X_dot_sl[s, t] = s_lambda[s].T @ X[s, t].
 #
 # This is the hoisted M-step trick: ``X.T @ s_lambda`` is
@@ -112,8 +98,8 @@ def _compute_X_dot_sl_s_NTD(
     Implemented as ONE big sgemm ``(L, N) @ (N, T·D) → (L, T·D)``,
     then transposed to ``(T, L, D)`` into the caller-owned output.
 
-    Equivalent FLOPs to the legacy ``T`` smaller ``(L, N) × (N, D)``
-    sgemms (the (S, T, N, D) TND path), but a single BLAS dispatch
+    Equivalent FLOPs to ``T`` smaller ``(L, N) × (N, D)`` sgemms,
+    but a single BLAS dispatch
     instead of T → marginally better cache reuse of the (L, N) left
     factor, and — critically — works directly on the (S, N, T, D) NTD
     layout without paying for a per-(s, t) C-contig staging copy
@@ -342,13 +328,12 @@ def _mstep_inner_loop_master_step2(
     converged s_t_nu lives in ``s_t_nu_A_STLD`` if ``final_idx == 0``
     else ``s_t_nu_B_STLD``.
 
-    Closed-form invad (Banerjee asymptotic) — for D ≥ ~200 (production
-    fsaverage6: D=1174) the Bessel polish branch never activates in
-    MATLAB's invAd.
+    kappa = ``invad_numba(dim, rbar)``: Bessel probe, secant polish when
+    the probe is finite, otherwise the asymptotic value. A non-finite
+    kappa falls back to the previous iterate.
 
     kappa clamp: if ``kappa < ini_val`` (the invAd output dipped below
-    the initial seed), clamp to ini_val. Matches the legacy
-    ``kappa_update.py`` boundary check.
+    the initial seed), clamp to ini_val (MATLAB's boundary check).
     """
     S, T, L, D = X_dot_sl_STLD.shape
 
@@ -378,9 +363,7 @@ def _mstep_inner_loop_master_step2(
         rbar = kappa_sum_f64 / denom_f64
         kappa_new = invad_numba(dim_f64, rbar)
 
-        # Inf-safeguard (MATLAB: kappa_update(==Inf) = prev_kappa). For the
-        # closed-form path, kappa is always finite given finite rbar in
-        # [0, 1). Just defensively check.
+        # Inf-safeguard (MATLAB: kappa_update(==Inf) = prev_kappa).
         if not math.isfinite(kappa_new):
             kappa_new = kappa_prev
         # ini_val clamp (MATLAB: if kappa < ini_val: kappa = ini_val).
@@ -576,8 +559,7 @@ def _spatial_connect_per_subject_numba(
 #
 # So in production data, ``alive_t_n = (BOLD[s, n, t, :] has any
 # nonzero entry)`` — a per-(t, n) BOLD-row scan replaces the
-# materialize-lv-then-check pattern, with the bonus that we no longer
-# need (T, N, L) scratch.
+# materialize-lv-then-check pattern and needs no (T, N, L) scratch.
 # ─────────────────────────────────────────────────────────────────────
 @njit(cache=True, fastmath=False, boundscheck=False,
       error_model='numpy', parallel=True, inline='always')
@@ -884,98 +866,6 @@ def _phase_e2_theta_only_kernel(
 # Python with loader callbacks, so peak BOLD/grad RAM stays bounded at
 # one subject's slab regardless of S.
 # ─────────────────────────────────────────────────────────────────────
-# ─────────────────────────────────────────────────────────────────────
-# Warmup — JIT-compile every kernel once at process start.
-# ─────────────────────────────────────────────────────────────────────
-def warmup() -> None:
-    """JIT-compile the master + every sub-kernel. Idempotent."""
-    S, T, N, D, L, D_grad = 2, 2, 8, 4, 4, 3
-    n_lh = N // 2
-    L_lh = L // 2
-    rng = np.random.default_rng(0)
-
-    # BOLD layout: (S, N, T, D) — NTD.
-    BOLD = rng.standard_normal((S, N, T, D)).astype(np.float32)
-    grad = rng.standard_normal((S, T, N, D_grad)).astype(np.float32)
-    bm = np.ones((N, L), dtype=np.float32)
-    s_lambda_f32 = np.full((S, N, L), 0.25, dtype=np.float32)
-    s_t_nu_A = (rng.standard_normal((S, T, L, D)) * 0.1).astype(np.float32)
-    s_t_nu_B = np.empty_like(s_t_nu_A)
-    theta = np.full((N, L), 0.25, dtype=np.float32)
-    cost = np.zeros(S, dtype=np.float64)
-    X_dot_sl = np.empty((S, T, L, D), dtype=np.float32)
-    sigma_psi = np.empty((S, L, D), dtype=np.float32)
-    log_connect = np.zeros((N, L), dtype=np.float32)
-    log_vmf = np.zeros((N, L), dtype=np.float32)
-    tmp_idx = np.zeros((N, L), dtype=np.bool_)
-    flag_ST = np.zeros((S, T), dtype=np.int8)
-    converge_STL = np.zeros((S, T, L), dtype=np.int8)
-    scratch_u = np.empty((L, D_grad), dtype=np.float32)
-    scratch_uupd_DL = np.empty((D_grad, L), dtype=np.float32)
-    scratch_sumlam_L = np.empty(L, dtype=np.float32)
-    scratch_grad_sq = np.empty(N, dtype=np.float32)
-    scratch_u_sq = np.empty(L, dtype=np.float32)
-    scratch_cross_NL = np.empty((N, L), dtype=np.float32)
-    s_t_nu_TDL_scratch = np.empty((T, D, L), dtype=np.float32)
-    sigma = np.full(L, 0.1, dtype=np.float32)
-    s_psi = (rng.standard_normal((S, L, D)) * 0.05).astype(np.float32)
-    # Per-subject fp64 scratch for Phase D output.
-    s_lambda_NL_f64_scratch = np.empty((N, L), dtype=np.float64)
-    # Per-subject E-step scratch (Session-promoted in production; the
-    # warmup allocates a stub so the signature matches).
-    log_lambda_scratch_NL_w = np.empty((N, L), dtype=np.float32)
-    n_alive_count_N_w = np.empty(N, dtype=np.int32)
-
-    # Streaming-master warmup — runs the Python orchestrator once on
-    # tiny shapes to surface signature errors immediately.
-    from arealmshbm.step2_io import (
-        InMemoryGradientLoader,
-        InMemoryProfileLoader,
-    )
-    BOLD_w = np.ascontiguousarray(BOLD)  # (S, N, T, D) fp32 C-contig
-    grad_w = np.ascontiguousarray(grad)  # (S, T, N, D_grad) fp32 C-contig
-    bold_loader_w = InMemoryProfileLoader(BOLD_w, num_session=T)
-    grad_loader_w = InMemoryGradientLoader(grad_w, num_session=T)
-
-    def _bold_into(s_1, out):
-        bold_loader_w.load_into(s_1, out)
-
-    def _grad_into(s_1, out):
-        grad_loader_w.load_into(s_1, out)
-
-    bold_scratch_w = np.empty((N, T, D), dtype=np.float32)
-    grad_scratch_w = np.empty((T, N, D_grad), dtype=np.float32)
-
-    em_iter_master_kernel_streaming(
-        bold_scratch_w, grad_scratch_w, _bold_into, _grad_into,
-        bm, 1,
-        s_lambda_f32, s_t_nu_A, s_t_nu_B, theta, cost,
-        s_lambda_NL_f64_scratch,
-        X_dot_sl, sigma_psi,
-        log_connect, log_vmf, tmp_idx, flag_ST, converge_STL,
-        scratch_u, scratch_uupd_DL, scratch_sumlam_L,
-        scratch_grad_sq, scratch_u_sq, scratch_cross_NL,
-        s_t_nu_TDL_scratch,
-        log_lambda_scratch_NL_w, n_alive_count_N_w,
-        sigma, s_psi,
-        D, 50.0, 30.0, 5000.0, np.float32(1e-4), 3, n_lh, L_lh,
-    )
-    em_iter_master_kernel_streaming(
-        bold_scratch_w, grad_scratch_w, _bold_into, _grad_into,
-        bm, 0,
-        s_lambda_f32, s_t_nu_A, s_t_nu_B, theta, cost,
-        s_lambda_NL_f64_scratch,
-        X_dot_sl, sigma_psi,
-        log_connect, log_vmf, tmp_idx, flag_ST, converge_STL,
-        scratch_u, scratch_uupd_DL, scratch_sumlam_L,
-        scratch_grad_sq, scratch_u_sq, scratch_cross_NL,
-        s_t_nu_TDL_scratch,
-        log_lambda_scratch_NL_w, n_alive_count_N_w,
-        sigma, s_psi,
-        D, 50.0, 30.0, 5000.0, np.float32(1e-4), 3, n_lh, L_lh,
-    )
-
-
 # ─────────────────────────────────────────────────────────────────────
 # Streaming master kernel — Python orchestrator.
 #

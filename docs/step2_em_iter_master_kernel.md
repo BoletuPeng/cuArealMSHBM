@@ -29,7 +29,7 @@ boundary if they hold a different layout — `Step2EmIterSession` handles
 this once at construction (BOLD, gradients, `s_psi`) and once per
 `run_iter` call (`s_t_nu`, `s_lambda`, `theta`, `kappa`).
 
-| Tensor          | External (legacy CBIG shape)     | Internal (this kernel)        | Notes                                    |
+| Tensor          | External (CBIG MATLAB shape)     | Internal (this kernel)        | Notes                                    |
 |-----------------|----------------------------------|-------------------------------|------------------------------------------|
 | BOLD            | `(N, D, T)` per subject (list)   | `(N, T, D)` fp32 C-contig per subject | NTD, streamed one subject at a time into a re-used scratch slot — there is no `(S, …)` BOLD array |
 | gradient        | `(N, D_grad, T)` per subject     | `(T, N, D_grad)` fp32 per subject | gMSHBM only; same per-subject streaming  |
@@ -110,7 +110,7 @@ sizes the cost of a future GPU port).
 ### What the GPU backend does with this contract
 
 **`backend='gpu'`** (the P-layout backend,
-`step2_em_iter_master/_kernels_gpu.py` + `session_gpu.py`) restores the
+`step2_em_iter_master/_kernels_gpu.py` + `session_gpu.py`) keeps the
 CPU semantics on device: fp64 `exp` with an fp64 `scr`, fp64
 row-normalise, and subnormal-aware fp32 stores that work around CuPy's
 forced `-ftz=true` (`f32_rn` / `f32_to_f64` helpers). Its numerics
@@ -120,14 +120,15 @@ CuPy's parallel-tree reductions differ from numba's serial accumulators
 at ULP level; bit equality across backends is NOT a goal (measured: 0
 `theta` argmax flips vs the CPU at S=1 and S=2, 2 at S=10).
 
-The dense CuPy port that held `backend='gpu'` until 2026-09 ran the
-Phase-D softmax `exp` and the Phase-E row-normalise in fp32 (CuPy's
+Why the softmax `exp` and row-normalise stay fp64 (measured 2026-09-03
+on a dense CuPy port that ran both in fp32; CuPy's
 `-ftz=true` puts the `exp` cliff at −87.3 where fp64 reaches −745): on
 the S=1 bench it killed 5 528 alive vertices vs 1 303 on the CPU, moved
-cost −5 % and `kappa` 954 vs 922, flipped 4 744 `theta` argmaxes, and its
-widen kernel carried a nondeterministic `atomicAdd`. It was removed in
-favour of the P-layout backend; configurations outside that backend's
-static limits (a seed mesh above fsaverage3, L > 512) run on `cpu`.
+cost −5 % and `kappa` 954 vs 922, and flipped 4 744 `theta` argmaxes.
+The `gpu` backend's static limits (seed mesh fsaverage3, L ≤ 512,
+n_grad_components ≤ 11772) are its contract: any other configuration
+is rejected at config / driver validation — select `backend_step2='cpu'`
+for it.
 
 ### Two constants worth stating exactly
 

@@ -46,7 +46,7 @@ Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Tuple
 
@@ -143,20 +143,17 @@ def read_bold_inputs(path: Path | str) -> BoldInputs:
                     f"bold_inputs.json: subjects[{sub_i}].sessions[{sess_i}].id "
                     f"must be {expected_sess_id!r}, got {sess_id!r}"
                 )
-            lh = Path(rsess.get("lh", ""))
-            rh = Path(rsess.get("rh", ""))
-            if not str(lh) or not str(rh):
+            lh_raw = rsess.get("lh")
+            rh_raw = rsess.get("rh")
+            lh_raw = lh_raw.strip() if isinstance(lh_raw, str) else ""
+            rh_raw = rh_raw.strip() if isinstance(rh_raw, str) else ""
+            if not lh_raw or not rh_raw:
                 raise ValueError(
                     f"bold_inputs.json: subjects[{sub_i}].sessions[{sess_i}] "
                     f"missing lh/rh path"
                 )
-            # GIFTI-only since the NIFTI surface-BOLD reader was retired.
-            # The bit-equality argument that justified the strip is
-            # captured in the PR #54 description (10/10 numerical
-            # artifacts match between the direct-GIFTI route and the
-            # converted-NIFTI mirror on real YS sub-001 data under
-            # backend_step0=cpu); the e2e harness was retired with the
-            # NIFTI reader.
+            lh = Path(lh_raw)
+            rh = Path(rh_raw)
             for hemi, p in (("lh", lh), ("rh", rh)):
                 # Whitelist: any ``.gii`` is accepted. GIFTI BOLD is
                 # canonically ``.func.gii`` (BIDS naming convention) but
@@ -171,8 +168,7 @@ def read_bold_inputs(path: Path | str) -> BoldInputs:
                         f"bold_inputs.json: subjects[{sub_i}]."
                         f"sessions[{sess_i}].{hemi}={str(p)!r} — only "
                         f"``.gii`` surface BOLD is supported (typically "
-                        f"``.func.gii``). The NIFTI mirror path was "
-                        f"removed; re-derive your BOLD from "
+                        f"``.func.gii``); re-derive your BOLD from "
                         f"DeepPrep/fmriprep GIFTI output."
                     )
             parsed_sess.append(BoldInputSession(id=sess_id, lh=lh, rh=rh))
