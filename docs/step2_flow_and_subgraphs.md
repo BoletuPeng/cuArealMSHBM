@@ -409,7 +409,7 @@ Per-launch means (S=1): K3 `x_dot_sl_bits` 0.34 ms, K6 `acc_P` 0.35,
 K8-K10 E-step rows 0.40, M-step 0.17 per `iter_m` (×2.4), K5 connect
 0.15, K12 theta 0.22.
 
-Parity vs the CPU reference (`compare_step2_backends.py`, §7.3 bars):
+Parity vs the CPU reference (internal step-2 comparison harness, §7.3 bars):
 S=1 theta argmax flips **0** (bar ≤ 500), support-diff rows 1, dead-alive
 rows **1 303 vs 1 303**, `kappa` max-rel **0.0** (bit-identical),
 first-inter `Record` rel **3.99e-6** (bar ≤ 5e-3), `iter_inter` 10 == 10.

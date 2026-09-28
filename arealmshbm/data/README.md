@@ -20,7 +20,9 @@ changes). Verify downloads against the release's `SHA256SUMS.txt`.
 
 ```bash
 curl -L -O https://github.com/BoletuPeng/cuArealMSHBM/releases/download/assets-v1/avg_mesh-fsaverage6.tar.gz
+curl -L -O https://github.com/BoletuPeng/cuArealMSHBM/releases/download/assets-v1/step0_inputs-fsaverage6_sigma2.55_khop3.tar.gz
 tar -xzf avg_mesh-fsaverage6.tar.gz -C arealmshbm/data/precomputed/
+tar -xzf step0_inputs-fsaverage6_sigma2.55_khop3.tar.gz -C arealmshbm/data/precomputed/
 ```
 
 **From a CBIG checkout** — the group priors and spatial masks below are

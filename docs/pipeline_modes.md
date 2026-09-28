@@ -110,7 +110,7 @@ Sources a creator can copy from (toolkits, never read at run time):
 
 | Source | What | Coverage |
 |---|---|---|
-| `arealmshbm/data/group_priors/HCP_{fsaverage6,fs_LR_32k}_40sub/100/...` | Shipped in this fork | K=100 example only |
+| `arealmshbm/data/group_priors/HCP_{fsaverage6,fs_LR_32k}_40sub/<K>/...` | optional local staging of CBIG's priors — not shipped here (see `arealmshbm/data/README.md`) | whatever was staged |
 | `$CBIG_CODE_DIR/.../Kong2022_ArealMSHBM/lib/group_priors/` | CBIG checkout (creator-side; not read at runtime) | full K=100…1000 |
 | another project's `priors/<variant>/beta<X>/Params_Final.mat` | a prior `modeB_train_prior` run | whatever it trained |
 

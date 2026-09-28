@@ -94,14 +94,14 @@ algebraically correct.
 
 ## 4. Group-prior fallback (cMSHBM / dMSHBM)
 
-Only gMSHBM priors are shipped — the local
-`arealmshbm/data/group_priors/HCP_fsaverage6_40sub/<L>/gMSHBM/beta5/`
-layout has only `gMSHBM/beta<B>` subdirs; cMSHBM and dMSHBM
-directories don't exist. Step 2 trains gMSHBM / dMSHBM in-house
+CBIG's HCP priors (`lib/group_priors/HCP_fsaverage6_40sub/<L>/`,
+staged by the user — this repository does not ship them; see
+`arealmshbm/data/README.md`) carry only `gMSHBM/beta<B>` subdirs;
+cMSHBM and dMSHBM directories don't exist. Step 2 trains gMSHBM / dMSHBM in-house
 (cMSHBM is not wired for step 2).
 
-When running cMSHBM step-3 in isolation against the shipped HCP
-material, point at the gMSHBM `Params_Final.mat`. The four prior
+When running cMSHBM step-3 in isolation against CBIG's HCP
+priors, point at the gMSHBM `Params_Final.mat`. The four prior
 fields (`mu`, `theta`, `epsil`, `sigma`) have identical meaning across
 all three variants — they're vMF group parameters and a spatial-prior
 probability map; the step-3 driver reads them positionally with no

@@ -650,7 +650,7 @@ Fixtures: `testdata/step2_bench/proj` (S=1) and `proj2` (S=2), env override
    `InMemoryProfileLoader` after the CPU widen: bars `s_t_nu/theta/s_lambda
    ≤ 5e-3`, `kappa ≤ 1e-4`;
    gMSHBM and dMSHBM.
-3. **End-to-end A/B** (`compare_step2_backends.py`) on S=1 and S=2: `gpu`
+3. **End-to-end A/B** (the internal step-2 comparison harness) on S=1 and S=2: `gpu`
    twice → identical on every saved field (**required**); vs CPU: theta argmax
    flips ≤ 500,
    dead-alive rows within ±100 of the CPU's (1 303 at S=1; the dense port: 4 744 /
@@ -660,7 +660,7 @@ Fixtures: `testdata/step2_bench/proj` (S=1) and `proj2` (S=2), env override
    **Additionally REPORTED (not barred), every A/B:** `epsil` max-rel *and* the
    conditioning-aware per-parcel `|log10(epsil_a/epsil_b)|` median / max, and
    `mu` per-column cosine min / median. Both are printed by
-   `compare_step2_backends.py`. They are excluded from the bars for the reason
+   the internal step-2 comparison harness. They are excluded from the bars for the reason
    in §8 (`invAd` near `R -> 1` is ill-conditioned; `mu` max-rel measures the
    wrong thing for a unit direction) — but a summary that omits them is
    incomplete, because the headline "matches CPU" is otherwise carried entirely
@@ -715,7 +715,7 @@ Fixtures: `testdata/step2_bench/proj` (S=1) and `proj2` (S=2), env override
   element-wise `mu` max-rel of ~2.0 at S=1 is one sign-flipped near-zero
   component. Downstream, step 3 uses `epsil` only inside
   `s_psi = normalize(sigma·Σ nu + epsil·mu)`, where `epsil >> sigma` makes
-  `s_psi ≈ mu` regardless of the magnitude. `compare_step2_backends.py` prints
+  `s_psi ≈ mu` regardless of the magnitude. the internal step-2 comparison harness prints
   both the log10-ratio view of `epsil` and the per-column cosine of `mu`, and
   §7.3 requires them **reported** (not barred).
 * Potential later win: per-subject member compaction by `s_lambda[s] != 0` for K3

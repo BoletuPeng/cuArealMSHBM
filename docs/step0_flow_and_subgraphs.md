@@ -185,7 +185,7 @@ cuSPARSE eigsh and recovers ~17× on that leaf. Subgraph A's GPU win
 (~2.7×) is from `fc_similarity` (curr_data + t_series device-resident
 across iter_a/iter_b, sgemm via cuBLAS, fused demean+norm RawKernel
 replacing the prior fp64-cast-and-reduce chain — see
-[`## fc_similarity fused demean+norm`](#fc-similarity-fused-demean-norm)
+[`fc_similarity fused demean+norm`](#fc_similarity-fused-demeannorm)
 below); the rest of A (watershed, local_minima, surface_smoothing's
 per-iter SpMV) stays on the numba CPU path. Subgraph B's GPU port is
 documented inline under [`## Subgraph B GPU port`](#subgraph-b-gpu-port).
@@ -389,10 +389,11 @@ jitter — the blockers are structural:
 
 * **Assets are not caches.** The rewrite needs an inputs-cache v2 plus
   a `step0_down` bundle written at runtime under
-  `arealmshbm/data/precomputed/`. This tree's rule is that everything
-  under that path is a shipped asset the installer stages, never a
-  cache the pipeline fills in (see `arealmshbm/data/README.md`), so the
-  rewrite would have to ship both bundles as assets first.
+  `arealmshbm/data/precomputed/`. In this tree `avg_mesh/` there is
+  asset-only (`load_avg_mesh` has no runtime rebuild) and
+  `step0_inputs/` is shipped for download (its rebuild needs raw CBIG
+  sources; see `arealmshbm/data/README.md`), so the rewrite would have
+  to ship both new bundles as downloadable assets first.
 * **Subgraph A is not bit-exact.** Its fused stage-A path and the
   block-Krylov subgraph-C solver both move values at the ULP level
   (about 90 % of FC cells), so no per-kernel oracle against the

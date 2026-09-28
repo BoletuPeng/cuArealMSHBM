@@ -142,7 +142,7 @@ arealmshbm/
 │                                            batched nvCOMP ingest)
 │
 ├── avg_profiles/                            # subgraph 2 — sum/divide across sub × sess
-│   ├── _kernels.py                          numba CPU: accum_inplace, scale_inplace
+│   ├── _kernels.py                          numba CPU: _accum_packed_session_inplace_kernel, _scale_inplace_kernel
 │   ├── avg_profiles.py                      CPU supercall + dispatch shim (returns AvgProfilesResult)
 │   └── avg_profiles_gpu.py                  GPU supercall: PackedProfileAccumulator (the leaf's
 │                                            on_packed hook) + avg_profiles_from_accumulator; the

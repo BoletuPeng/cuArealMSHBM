@@ -3,10 +3,8 @@
 ``gradient_geodesic_distance``, plus the dispatcher's precondition
 contracts.
 
-The oracle is the batched pull-based Bellman-Ford that Δ-stepping
-replaced, transcribed into this file (kernels, host loop and the same
-normalisation arithmetic) so the bit-identity that justified the
-replacement stays under test after the production copy was deleted.
+The oracle is a batched pull-based Bellman-Ford, transcribed into this
+file (kernels, host loop and the same normalisation arithmetic).
 Both solvers reach the same fixed point of
 ``d[u] = min_v fl(d[v] + w(v, u))``, so the gate is bit-identity, not a
 tolerance: a tolerance would hide a dropped update. Skipped without

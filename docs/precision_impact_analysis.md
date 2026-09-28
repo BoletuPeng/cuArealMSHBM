@@ -72,7 +72,7 @@ canonical readout.
   L=300 clusters, gMSHBM, β=5)
 * Pipeline step2 (Mode B group prior training) GPU backend
 * Compare two configurations:
-  * **OLD (NoTF32)**: current code (fp32 softmax committed) with no
+  * **OLD (NoTF32)**: the code of that date (fp32 softmax committed) with no
     `NVIDIA_TF32_OVERRIDE`
   * **NEW (TF32)**: same code, plus `NVIDIA_TF32_OVERRIDE=1` ⇒ cuBLAS
     sgemms use TF32 tensor cores
@@ -168,15 +168,17 @@ TF32 is **functionally safe** and **mathematically equivalent** under
 the L4 quality metric. The vertex-level disagreement is "edge of
 parcel" precision noise — the underlying atlas quality is preserved.
 
-The fp32 softmax change (now the shipped default) shows the same
+The fp32 softmax change (the default of that 2026-05 dense port) shows the same
 pattern: cost rel-diff 2e-4, no parcel relocated, atlas quality
 unchanged.
 
 ## Reproducibility
 
-Re-running the case study was two commands on the retired code (step2
-took ~3.5 min; step3 × 40 subs ~2 min) — kept for the record, see the
-status note:
+Re-running the case study was two commands on the 2026-05-21 code
+(step2 took ~3.5 min; step3 × 40 subs ~2 min), kept for the record. On
+the current tree `NVIDIA_TF32_OVERRIDE=1` reaches only step 0's sgemms
+(see the note at the top of the case study), so these commands record
+how the numbers were made rather than reproduce them:
 
 ```bash
 # OLD baseline — step2 + step3 (Mode-B project run, no TF32)
