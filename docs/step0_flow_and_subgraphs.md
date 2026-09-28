@@ -389,11 +389,11 @@ jitter — the blockers are structural:
 
 * **Assets are not caches.** The rewrite needs an inputs-cache v2 plus
   a `step0_down` bundle written at runtime under
-  `arealmshbm/data/precomputed/`. In this tree `avg_mesh/` there is
-  asset-only (`load_avg_mesh` has no runtime rebuild) and
-  `step0_inputs/` is shipped for download (its rebuild needs raw CBIG
-  sources; see `arealmshbm/data/README.md`), so the rewrite would have
-  to ship both new bundles as downloadable assets first.
+  `arealmshbm/data/precomputed/`. In this tree, `avg_mesh/` under that
+  path is asset-only (`load_avg_mesh` has no runtime rebuild) and
+  `step0_inputs/` is a downloadable release asset (its rebuild needs raw
+  CBIG sources; see `arealmshbm/data/README.md`), so the rewrite would
+  have to ship both new bundles as downloadable assets first.
 * **Subgraph A is not bit-exact.** Its fused stage-A path and the
   block-Krylov subgraph-C solver both move values at the ULP level
   (about 90 % of FC cells), so no per-kernel oracle against the

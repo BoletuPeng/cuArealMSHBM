@@ -715,7 +715,7 @@ Fixtures: `testdata/step2_bench/proj` (S=1) and `proj2` (S=2), env override
   element-wise `mu` max-rel of ~2.0 at S=1 is one sign-flipped near-zero
   component. Downstream, step 3 uses `epsil` only inside
   `s_psi = normalize(sigma·Σ nu + epsil·mu)`, where `epsil >> sigma` makes
-  `s_psi ≈ mu` regardless of the magnitude. the internal step-2 comparison harness prints
+  `s_psi ≈ mu` regardless of the magnitude. The internal step-2 comparison harness prints
   both the log10-ratio view of `epsil` and the per-column cosine of `mu`, and
   §7.3 requires them **reported** (not barred).
 * Potential later win: per-subject member compaction by `s_lambda[s] != 0` for K3

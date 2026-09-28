@@ -176,9 +176,9 @@ unchanged.
 
 Re-running the case study was two commands on the 2026-05-21 code
 (step2 took ~3.5 min; step3 × 40 subs ~2 min), kept for the record. On
-the current tree `NVIDIA_TF32_OVERRIDE=1` reaches only step 0's sgemms
-(see the note at the top of the case study), so these commands record
-how the numbers were made rather than reproduce them:
+the current tree the step-2 `gpu` backend has neither the fp32 softmax
+nor a TF32 scope (see the note at the top of the case study), so these
+commands record how the numbers were made rather than reproduce them:
 
 ```bash
 # OLD baseline — step2 + step3 (Mode-B project run, no TF32)

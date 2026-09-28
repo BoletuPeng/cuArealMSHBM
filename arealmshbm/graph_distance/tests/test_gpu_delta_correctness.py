@@ -4,7 +4,8 @@
 contracts.
 
 The oracle is a batched pull-based Bellman-Ford, transcribed into this
-file (kernels, host loop and the same normalisation arithmetic).
+file (kernels, host loop and the production path's normalisation
+arithmetic).
 Both solvers reach the same fixed point of
 ``d[u] = min_v fl(d[v] + w(v, u))``, so the gate is bit-identity, not a
 tolerance: a tolerance would hide a dropped update. Skipped without
