@@ -283,6 +283,7 @@ def test_bold_cache_mode_stream_matches_eager(monkeypatch):
     """Eager, stream with the host cache, and stream decoding through
     the reader on every visit (host cache over budget) agree bit for
     bit; only the first keeps no host copy at all."""
+    pytest.importorskip("psutil")
     from arealmshbm.initialize_concentration import initialize_concentration
     import arealmshbm.step2_em_iter_master.session_gpu as sg
     inputs, _bm, _mtc, _bold, _g = _synthetic(3)
@@ -356,6 +357,8 @@ def test_ctor_propagates_a_reader_failure(monkeypatch, cache, fraction):
     residency path. The eager ring and the stream-mode host cache pull
     the subjects through worker threads, whose exception must surface,
     not be swallowed."""
+    if cache == "stream":
+        pytest.importorskip("psutil")
     import arealmshbm.step2_em_iter_master.session_gpu as sg
     from arealmshbm.initialize_concentration import initialize_concentration
     base, _bm, _mtc, _bold, _g = _synthetic(7)

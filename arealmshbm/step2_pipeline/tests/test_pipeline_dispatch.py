@@ -146,7 +146,8 @@ class Recorder:
 
 @pytest.fixture
 def sparse_env(monkeypatch, tmp_path):
-    """Patch the two lazy imports the sparse path makes + the writer."""
+    """Patch what the sparse path imports lazily (the loader, the
+    Session, the kernel warm-up) + the writer."""
     sess_holder: Dict[str, FakeSession] = {}
     inputs = _fake_inputs()
 
@@ -160,8 +161,11 @@ def sparse_env(monkeypatch, tmp_path):
 
     monkeypatch.setattr(_sio, "load_step2_sparse_inputs", _loader,
                         raising=False)
-    monkeypatch.setattr(_eim, "Step2SparseSession", _session_factory,
-                        raising=False)
+    # ``setitem`` on the module dict: ``setattr`` reads the old value
+    # first, through the package's lazy ``__getattr__``, which imports
+    # the GPU module and cupy with it.
+    monkeypatch.setitem(vars(_eim), "Step2SparseSession", _session_factory)
+    monkeypatch.setitem(vars(_eim), "warmup_step2_gpu", lambda: None)
     rec = Recorder()
     monkeypatch.setattr(Step2Pipeline, "_save_params", rec.hook(),
                         raising=True)

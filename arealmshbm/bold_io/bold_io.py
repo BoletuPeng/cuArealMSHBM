@@ -4,8 +4,8 @@ Read a single-hemi surface BOLD ``.func.gii`` and reshape it to the
 ``(N, T)`` matrix the rest of the step-0 pipeline expects.
 
 The hemi concatenation + NaN→0 + medial-mask drop is the inner content
-of the MATLAB scan loop in ``CBIG_SPGrad_RSFC_gradients.m`` lines
-264–285. We faithfully reproduce its order:
+of the MATLAB scan loop in ``CBIG_SPGrad_RSFC_gradients.m``. We
+reproduce its order:
 
     1. Read lh_curr_data, replace NaN with 0.
     2. Read rh_curr_data, replace NaN with 0.
@@ -86,6 +86,10 @@ def concat_hemis_drop_medial(
         rh_curr_data(isnan(rh_curr_data)) = 0;
         curr_data = [curr_data; rh_curr_data];
         curr_data(medial_mask, :) = [];
+
+    One difference: ``np.nan_to_num`` also clamps ``+inf`` / ``-inf`` to
+    the largest / smallest finite fp32, where the MATLAB lines leave an
+    infinity in place.
 
     Parameters
     ----------

@@ -5,6 +5,7 @@ entry point: a thin ``.gii``-only wrapper around
 :func:`arealmshbm.data_io.gifti_io.read_surface_gifti` plus the
 ``expected_n`` guard. These tests pin both the contract refusal
 (non-``.gii`` suffixes must error) and the V-mismatch guard.
+``concat_hemis_drop_medial`` is checked against a hand-written result.
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """
@@ -17,7 +18,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from arealmshbm.bold_io import read_surface_bold
+from arealmshbm.bold_io import concat_hemis_drop_medial, read_surface_bold
 
 
 def _synth_gifti(dim0: int = 4, T: int = 2) -> bytes:
@@ -66,3 +67,17 @@ def test_read_surface_bold_rejects_unknown_suffix(tmp_path: Path):
     p.write_bytes(b"nope")
     with pytest.raises(ValueError, match=r"\.gii"):
         read_surface_bold(p)
+
+
+def test_concat_hemis_drop_medial_hand_oracle():
+    """Per-hemisphere NaN -> 0, lh rows before rh rows, medial rows
+    dropped (the mask given as a ``(2N, 1)`` column); +-inf comes out as
+    +-FLT_MAX. The expected array is written by hand."""
+    fmax = np.finfo(np.float32).max
+    lh = np.array([[1, np.nan], [9, 9], [np.inf, 4]], np.float32)
+    rh = np.array([[np.nan, -np.inf], [5, 6], [9, 9]], np.float32)
+    mask = np.array([0, 1, 0, 0, 0, 1], np.uint8).reshape(-1, 1)
+    got = concat_hemis_drop_medial(lh, rh, mask)
+    want = np.array([[1, 0], [fmax, 4], [0, -fmax], [5, 6]], np.float32)
+    assert got.dtype == np.float32
+    np.testing.assert_array_equal(got, want)
