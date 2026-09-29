@@ -32,6 +32,7 @@ Covered:
 from __future__ import annotations
 
 import json
+import math
 import subprocess
 import sys
 from pathlib import Path
@@ -910,3 +911,73 @@ def test_catalog_backend_step3_values() -> None:
     assert entry["values"] == list(_VALID_BACKENDS) == ["cpu", "gpu"]
     assert entry["default"] == "cpu"
 
+
+
+def test_step1_gpu_rejects_fp32_reduction_at_parse(tmp_path: Path) -> None:
+    """The GPU ini_params kernels are fp64-only; a float32 reduction on
+    ``backend_step1='gpu'`` is refused when the config is read."""
+    body = _full_v2_modeB()
+    body["backend_step1"] = "gpu"
+    body["step1"]["reduction_dtype"] = "float32"
+    with pytest.raises(
+            ValueError,
+            match=r"backend_step1='gpu' requires "
+                  r"step1\.reduction_dtype='float64'"):
+        read_pipeline_config(_write_config(tmp_path, body))
+
+
+def test_step1_gpu_fp32_profile_dtype_accepted(tmp_path: Path) -> None:
+    body = _full_v2_modeB()
+    body["backend_step1"] = "gpu"
+    body["step1"]["profile_dtype"] = "float32"
+    cfg = read_pipeline_config(_write_config(tmp_path, body))
+    assert cfg.step1.profile_dtype == "float32"
+    assert cfg.step1.reduction_dtype == "float64"
+
+
+def test_step1_cpu_fp32_reduction_accepted(tmp_path: Path) -> None:
+    body = _full_v2_modeB()
+    body["step1"]["reduction_dtype"] = "float32"
+    cfg = read_pipeline_config(_write_config(tmp_path, body))
+    assert cfg.backend_step1 == "cpu"
+    assert cfg.step1.reduction_dtype == "float32"
+
+
+_FLOAT_KNOBS = [
+    ("step0", "smooth_sigma"), ("step0", "watershed_frac"),
+    ("step0", "downsample"),
+    ("step1", "threshold"), ("step1", "radius_mask_radius_mm"),
+    ("step2", "epsilon"), ("step2", "intra_em_convergence_eps"),
+    ("step2", "inter_convergence_eps"), ("step2", "em_convergence_eps"),
+    ("step2", "gpu_cache_safety_margin_gb"),
+    ("step3", "connect_th"), ("step3", "epsilon"),
+]
+
+
+@pytest.mark.parametrize("block,key", _FLOAT_KNOBS)
+@pytest.mark.parametrize("value", [math.nan, math.inf])
+def test_nonfinite_float_rejected(tmp_path: Path, block: str, key: str,
+                                  value: float) -> None:
+    """``json`` reads the ``NaN`` / ``Infinity`` tokens; no float knob
+    accepts them."""
+    body = _full_v2_modeB()
+    body[block][key] = value
+    p = _write_config(tmp_path, body)
+    token = "NaN" if math.isnan(value) else "Infinity"
+    assert token in p.read_text(encoding="utf-8")
+    with pytest.raises(ValueError, match=rf"{block}\.{key}"):
+        read_pipeline_config(p)
+
+
+def test_overflowing_float_literal_rejected(tmp_path: Path) -> None:
+    """``1e400`` is valid JSON and parses to infinity."""
+    body = _full_v2_modeB()
+    p = _write_config(tmp_path, body)
+    text = p.read_text(encoding="utf-8")
+    sigma = json.dumps(body["step0"]["smooth_sigma"])
+    needle = f'"smooth_sigma": {sigma}'
+    assert text.count(needle) == 1
+    p.write_text(text.replace(needle, '"smooth_sigma": 1e400'),
+                 encoding="utf-8")
+    with pytest.raises(ValueError, match=r"step0\.smooth_sigma"):
+        read_pipeline_config(p)

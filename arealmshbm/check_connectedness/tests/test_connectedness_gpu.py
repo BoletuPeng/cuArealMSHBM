@@ -374,6 +374,23 @@ def test_modules_require_cooperative_launch(monkeypatch):
         cg._MODULES = saved
 
 
+def test_modules_require_a_cuda_toolkit(monkeypatch):
+    """Without a CUDA toolkit root the cooperative kernel cannot link;
+    the error names ``CUDA_PATH`` and the ``cpu`` backend."""
+    skip_unless_cupy()
+    from arealmshbm.check_connectedness import connectedness_gpu as cg
+
+    saved = cg._MODULES
+    cg._MODULES = None
+    monkeypatch.setattr(cg.cp.cuda, 'get_cuda_path', lambda: None)
+    try:
+        with pytest.raises(RuntimeError, match='CUDA_PATH'):
+            cg.prewarm_connectedness_gpu()
+        assert cg._MODULES is None
+    finally:
+        cg._MODULES = saved
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # Test 7 — cMSHBM pre-predicate: remove_isolated on device
 # ─────────────────────────────────────────────────────────────────────────

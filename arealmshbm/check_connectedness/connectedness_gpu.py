@@ -469,6 +469,13 @@ def _compiled_modules():
                 f"GPU {dev.id} ({name}) does not support cooperative launch, "
                 f"which backend_step3='gpu' needs for gMSHBM / cMSHBM "
                 f"(check_connectedness). Use backend_step3='cpu'.")
+        if cp.cuda.get_cuda_path() is None:
+            raise RuntimeError(
+                "backend_step3='gpu' needs a CUDA toolkit at CUDA_PATH for "
+                "gMSHBM / cMSHBM: the cooperative connected-components "
+                "kernel (check_connectedness) links cudadevrt and includes "
+                "cooperative_groups.h from it. Set CUDA_PATH to the "
+                "toolkit root or use backend_step3='cpu'.")
         opts = ('--fmad=false',)
         mod = cp.RawModule(code=_MAIN_SRC, options=opts, backend='nvrtc')
         # Cooperative CC keeps the whole convergence loop on device (no D2H).
@@ -480,8 +487,10 @@ def _compiled_modules():
 
 
 def prewarm_connectedness_gpu() -> None:
-    """Check cooperative-launch support and compile the kernels now, so a
-    device or CUDA toolkit that cannot run them fails before step 0."""
+    """Check cooperative-launch support and the CUDA toolkit, and compile
+    and link the cooperative connected-components kernel now, so a device
+    or toolkit that cannot run it fails before step 0. The main module
+    compiles at its first launch."""
     _compiled_modules()
 
 

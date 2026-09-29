@@ -53,7 +53,8 @@ The parser enforces four safety invariants:
      does NOT coerce to ``True`` in a bool field. ``bool`` being a
      subclass of ``int`` in Python makes these footguns easy; the
      ``_need_in`` helper rejects them explicitly with a per-field error
-     prefixed by the block name.
+     prefixed by the block name. A float field must be finite: ``NaN``,
+     ``Infinity`` and a literal that overflows to infinity are rejected.
 
   4. **Strict enum type matching** — ``num_clusters: 100.0`` is rejected
      even though ``100.0 == 100``; the allowed-tuple's element type is
@@ -64,6 +65,7 @@ Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Literal, Optional
@@ -307,6 +309,11 @@ def _need_in(
             f"pipeline_config.json: {prefix} must be {type_.__name__} "
             f"(got {type(v).__name__})"
         )
+    if type_ is float and not math.isfinite(v):
+        raise ValueError(
+            f"pipeline_config.json: {prefix} must be a finite number "
+            f"(got {v!r})"
+        )
     if positive and v <= 0:
         raise ValueError(
             f"pipeline_config.json: {prefix} must be positive (got {v!r})"
@@ -488,6 +495,11 @@ def _parse_step3(raw: Dict[str, Any]) -> Step3Knobs:
         raise ValueError(
             f"pipeline_config.json: step3.connect_th must be number or null "
             f"(got {type(ct).__name__})"
+        )
+    if ct is not None and not math.isfinite(ct):
+        raise ValueError(
+            f"pipeline_config.json: step3.connect_th must be a finite "
+            f"number or null (got {ct!r})"
         )
     return Step3Knobs(
         connect_th=ct,
@@ -696,6 +708,16 @@ def read_pipeline_config(path: Path | str) -> PipelineConfig:
     step3 = _parse_step3(raw["step3"])
     _validate_step0(step0)
     _validate_step1(step1)
+    if backend_step1 == "gpu" and step1.reduction_dtype != "float64":
+        # The GPU ini_params kernels reduce in fp64 only; step 1 runs
+        # in every mode, so this is failed here rather than in step 1's
+        # third subgraph, after step 0 and the profile pass.
+        raise ValueError(
+            f"pipeline_config.json: backend_step1='gpu' requires "
+            f"step1.reduction_dtype='float64'; got "
+            f"{step1.reduction_dtype!r}. Use backend_step1='cpu' for a "
+            f"float32 reduction."
+        )
     if step2 is not None:
         _validate_step2(step2)
     _validate_step3(step3)

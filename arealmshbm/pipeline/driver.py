@@ -54,6 +54,19 @@ from .layout import ProjectLayout
 _log = logging.getLogger(__name__)
 
 
+def _require_cuda_device() -> None:
+    """Import CuPy, query the current CUDA device and load NVRTC.
+
+    Every ``gpu`` backend compiles its kernels through NVRTC on a CUDA
+    device, so none of them runs without all three: a missing CuPy is
+    an ``ImportError``, no usable device a ``CUDARuntimeError``, a CuPy
+    that cannot load NVRTC raises from the library load.
+    """
+    import cupy as cp
+    cp.cuda.runtime.getDevice()
+    cp.cuda.nvrtc.getVersion()
+
+
 @dataclass
 class PipelineRunResult:
     """One-shot record of what the driver did, written to ``logs/``.
@@ -177,10 +190,11 @@ class Pipeline:
                     f"Mode A min-input check: group prior not found at "
                     f"{prior_path}. Stage a Params_Final.mat there before "
                     f"running Mode A - e.g. copy one from a CBIG checkout's "
-                    f"lib/group_priors/, from the in-tree example priors "
-                    f"under arealmshbm/data/group_priors/, or from another "
-                    f"project's modeB_train_prior output. (Mode B writes "
-                    f"this slot itself via step2.)"
+                    f"stable_projects/brain_parcellation/"
+                    f"Kong2022_ArealMSHBM/lib/group_priors/, or from "
+                    f"another project's Mode B output (see "
+                    f"arealmshbm/data/README.md). (Mode B writes this "
+                    f"slot itself via step2.)"
                 )
             return prior_path
         return None
@@ -756,22 +770,23 @@ class Pipeline:
             timings["stage_bold_lists"] = time.perf_counter() - t
 
             current_phase = "prewarm"
-            # Step 2's GPU backend compiles one RawModule at first
-            # use. Kick that NVRTC compile onto a daemon thread now so it
-            # overlaps step 0 + step 1 instead of landing inside step 2's
-            # first EM iter. Compile plus a 32x32 gemm that pays cuBLAS's
-            # process-wide module load — no pinned buffers, because the
-            # pools get drained right after step 0 and anything allocated
-            # here would be reclaimed before step 2 runs (see the
-            # step2_runners docstring).
-            # Mode A never runs step 2. ``psutil`` is a dependency of
-            # backend_step2='gpu' (it sizes the packed host BOLD cache);
-            # importing it here fails a missing install before step 0.
-            if (not self.config.is_mode_a
-                    and self.config.backend_step2 == "gpu"):
+            # Mode A never runs step 2.
+            step2_gpu = (not self.config.is_mode_a
+                         and self.config.backend_step2 == "gpu")
+
+            # Every gpu backend needs CuPy, a visible CUDA device and
+            # NVRTC. Checked first, so a run whose earlier steps are on
+            # cpu does not get through them before a gpu step fails.
+            if step2_gpu or "gpu" in (self.config.backend_step0,
+                                      self.config.backend_step1,
+                                      self.config.backend_step3):
+                _require_cuda_device()
+
+            # ``psutil`` is a dependency of backend_step2='gpu' (it
+            # sizes the packed host BOLD cache); importing it here fails
+            # a missing install before step 0.
+            if step2_gpu:
                 import psutil  # noqa: F401
-                from .step2_runners import prewarm_step2_gpu
-                prewarm_step2_gpu(background=True)
 
             # backend_step3='gpu' with gMSHBM / cMSHBM needs the
             # cooperative connected-components kernel, which links
@@ -788,11 +803,15 @@ class Pipeline:
                     )
                     prewarm_connectedness_gpu()
 
-            # Step 1's one-time GPU costs (RawKernel NVRTC compiles,
-            # the cuBLAS handle, the nvCOMP load, pinned staging) are
-            # paid on a daemon thread that overlaps step 0. The leaf's
-            # prewarm is lock-guarded and idempotent, so the call step 1
-            # makes itself later just waits for this one.
+            # backend_step1='gpu' ingests BOLD through nvCOMP only.
+            # The call resolves the nvCOMP binding on this thread
+            # first, so a missing or unloadable nvidia-nvcomp-cu12
+            # fails before step 0. Step 1's one-time GPU costs (the
+            # profile leaf's RawKernel NVRTC compiles, the cuBLAS
+            # handle, pinned staging) are then paid on a daemon thread
+            # that overlaps step 0. The leaf's prewarm is lock-guarded
+            # and idempotent, so the call step 1 makes itself later
+            # just waits for this one.
             if self.config.backend_step1 == "gpu":
                 from .step1_runners import (
                     bold_pairs_for_prewarm, prewarm_step1_gpu,
@@ -800,6 +819,19 @@ class Pipeline:
                 prewarm_step1_gpu(bold_pairs_for_prewarm(
                     self.layout.project_dir,
                     self.inputs.subject_ids(), self.inputs.session_ids()))
+
+            # Step 2's GPU backend compiles one RawModule at first
+            # use. Kick that NVRTC compile onto a daemon thread now so it
+            # overlaps step 0 + step 1 instead of landing inside step 2's
+            # first EM iter. Compile plus a 32x32 gemm that pays cuBLAS's
+            # process-wide module load — no pinned buffers, because the
+            # pools get drained right after step 0 and anything allocated
+            # here would be reclaimed before step 2 runs (see the
+            # step2_runners docstring). It starts after the dependency
+            # checks above, so a failed check has no thread to wait for.
+            if step2_gpu:
+                from .step2_runners import prewarm_step2_gpu
+                prewarm_step2_gpu(background=True)
 
             # Step 0: gradients per subject. Returns the in-memory dict
             # ``{sub_id: gradient_mat}`` that step3 will consume directly,

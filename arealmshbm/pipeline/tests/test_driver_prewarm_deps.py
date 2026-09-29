@@ -1,11 +1,14 @@
 """test_driver_prewarm_deps.py — the driver's pre-step-0 dependency checks.
 
-``backend_step2='gpu'`` needs ``psutil``; ``backend_step3='gpu'`` with a
-variant that runs ``check_connectedness`` needs the cooperative CC kernel
-(CUDA toolkit at ``CUDA_PATH`` + a device that supports cooperative
-launch). ``Pipeline.run()`` checks both in its prewarm phase so a missing
-dependency fails before step 0, not after steps 0-2. No GPU needed: the
-GPU-side calls are stubbed and step 0 is replaced by a sentinel raise.
+Every ``gpu`` backend needs CuPy, a CUDA device and NVRTC;
+``backend_step1='gpu'`` needs nvCOMP; ``backend_step2='gpu'`` needs
+``psutil``; ``backend_step3='gpu'`` with a variant that runs
+``check_connectedness`` needs the cooperative CC kernel (CUDA toolkit at
+``CUDA_PATH`` + a device that supports cooperative launch).
+``Pipeline.run()`` checks all of them in its prewarm phase, before it
+starts the step-2 prewarm thread, so a missing dependency fails before
+step 0, not after steps 0-2. No GPU needed: the GPU-side calls are
+stubbed and step 0 is replaced by a sentinel raise.
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """
@@ -18,7 +21,8 @@ from pathlib import Path
 
 import pytest
 
-from arealmshbm.pipeline.driver import Pipeline
+from arealmshbm.pipeline import driver
+from arealmshbm.pipeline.driver import Pipeline, _require_cuda_device
 
 _CC_MOD = "arealmshbm.check_connectedness.connectedness_gpu"
 
@@ -76,7 +80,10 @@ def _pipeline(project: Path) -> Pipeline:
 def stubs(monkeypatch: pytest.MonkeyPatch) -> dict:
     """Stub every GPU-side prewarm and stop ``run()`` at step 0.
     ``calls`` records which dependency checks the driver made."""
-    calls: dict = {"cc": 0, "step2": 0}
+    calls: dict = {"cuda": 0, "cc": 0, "step2": 0}
+
+    def _cuda():
+        calls["cuda"] += 1
 
     def _step0(self):
         raise _ReachedStep0
@@ -89,6 +96,7 @@ def stubs(monkeypatch: pytest.MonkeyPatch) -> dict:
 
     monkeypatch.setattr(Pipeline, "_run_step0_all_subjects_maybe_tf32",
                         _step0)
+    monkeypatch.setattr(driver, "_require_cuda_device", _cuda)
     fake_cc = types.ModuleType(_CC_MOD)
     fake_cc.prewarm_connectedness_gpu = _cc
     monkeypatch.setitem(sys.modules, _CC_MOD, fake_cc)
@@ -111,12 +119,14 @@ def test_mode_b_step2_gpu_missing_psutil_fails_before_step0(
 
 
 def test_mode_b_step2_gpu_with_psutil_prewarms(
-        tmp_path: Path, stubs: dict) -> None:
+        tmp_path: Path, stubs: dict,
+        monkeypatch: pytest.MonkeyPatch) -> None:
     pipe = _pipeline(_write_project(tmp_path, mode_a=False,
                                     variant="gMSHBM", backend_step2="gpu"))
+    monkeypatch.setitem(sys.modules, "psutil", types.ModuleType("psutil"))
     with pytest.raises(_ReachedStep0):
         pipe.run()
-    assert stubs["step2"] == 1
+    assert stubs == {"cuda": 1, "cc": 0, "step2": 1}
 
 
 def test_mode_a_ignores_backend_step2_gpu(
@@ -127,7 +137,43 @@ def test_mode_a_ignores_backend_step2_gpu(
     monkeypatch.setitem(sys.modules, "psutil", None)
     with pytest.raises(_ReachedStep0):
         pipe.run()
-    assert stubs == {"cc": 0, "step2": 0}
+    assert stubs == {"cuda": 0, "cc": 0, "step2": 0}
+
+
+@pytest.mark.parametrize("mode_a,variant,backends", [
+    (False, "gMSHBM", {"backend_step0": "gpu"}),
+    (True, "gMSHBM", {"backend_step1": "gpu"}),
+    (False, "gMSHBM", {"backend_step2": "gpu"}),
+    (True, "dMSHBM", {"backend_step3": "gpu"}),
+    (False, "dMSHBM", {"backend_step3": "gpu"}),
+])
+def test_gpu_backend_missing_cupy_fails_before_step0(
+        tmp_path: Path, stubs: dict, monkeypatch: pytest.MonkeyPatch,
+        mode_a: bool, variant: str, backends: dict) -> None:
+    pipe = _pipeline(_write_project(tmp_path, mode_a=mode_a,
+                                    variant=variant, **backends))
+    monkeypatch.setattr(driver, "_require_cuda_device",
+                        _require_cuda_device)
+    monkeypatch.setitem(sys.modules, "cupy", None)
+    with pytest.raises(ImportError, match="cupy"):
+        pipe.run()
+    assert stubs == {"cuda": 0, "cc": 0, "step2": 0}
+
+
+@pytest.mark.parametrize("mode_a", [True, False])
+def test_step1_gpu_missing_nvcomp_fails_before_step0(
+        tmp_path: Path, stubs: dict, monkeypatch: pytest.MonkeyPatch,
+        mode_a: bool) -> None:
+    from arealmshbm.data_io import _nvcomp_batched
+    pipe = _pipeline(_write_project(tmp_path, mode_a=mode_a,
+                                    variant="gMSHBM", backend_step1="gpu",
+                                    backend_step2="gpu"))
+    monkeypatch.setitem(sys.modules, "psutil", types.ModuleType("psutil"))
+    monkeypatch.setitem(sys.modules, "nvidia.nvcomp", None)
+    monkeypatch.setattr(_nvcomp_batched, "_CACHE", {})
+    with pytest.raises(ImportError, match="nvidia-nvcomp-cu12"):
+        pipe.run()
+    assert stubs["step2"] == 0
 
 
 @pytest.mark.parametrize("mode_a,variant", [
@@ -137,15 +183,18 @@ def test_step3_gpu_cc_failure_fails_before_step0(
         tmp_path: Path, stubs: dict, monkeypatch: pytest.MonkeyPatch,
         mode_a: bool, variant: str) -> None:
     pipe = _pipeline(_write_project(tmp_path, mode_a=mode_a,
-                                    variant=variant, backend_step3="gpu"))
+                                    variant=variant, backend_step2="gpu",
+                                    backend_step3="gpu"))
 
     def _no_coop():
         raise RuntimeError("device 0 does not support cooperative launch")
 
+    monkeypatch.setitem(sys.modules, "psutil", types.ModuleType("psutil"))
     monkeypatch.setattr(sys.modules[_CC_MOD], "prewarm_connectedness_gpu",
                         _no_coop)
     with pytest.raises(RuntimeError, match="cooperative launch"):
         pipe.run()
+    assert stubs["step2"] == 0
 
 
 @pytest.mark.parametrize("mode_a", [True, False])
@@ -174,9 +223,12 @@ def test_step3_gpu_cc_variants_prewarm(tmp_path: Path, stubs: dict,
 def test_cpu_backends_check_nothing(tmp_path: Path, stubs: dict,
                                     monkeypatch: pytest.MonkeyPatch,
                                     mode_a: bool) -> None:
+    from arealmshbm.data_io import _nvcomp_batched
     pipe = _pipeline(_write_project(tmp_path, mode_a=mode_a,
                                     variant="gMSHBM"))
     monkeypatch.setitem(sys.modules, "psutil", None)
+    monkeypatch.setitem(sys.modules, "nvidia.nvcomp", None)
+    monkeypatch.setattr(_nvcomp_batched, "_CACHE", {})
     with pytest.raises(_ReachedStep0):
         pipe.run()
-    assert stubs == {"cc": 0, "step2": 0}
+    assert stubs == {"cuda": 0, "cc": 0, "step2": 0}
