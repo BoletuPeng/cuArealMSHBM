@@ -321,10 +321,7 @@ class SubjectProfileLoader:
         second call for the same ``s`` is a no-op. Designed for use from
         a :class:`concurrent.futures.ThreadPoolExecutor` worker pool to
         overlap disk reads across subjects with the main thread's
-        widen+normalize numba kernel work — blosc2 chunk decoding
-        releases the GIL during decompression, so concurrent prefetch
-        from N worker threads achieves ~Nx disk-bandwidth scaling on a
-        cold cohort (and ~free idle on a hot OS-page-cache cohort).
+        widen+normalize numba kernel work.
 
         Thread-safety: each call opens its own b2nd handle on a
         different ``s``; the only shared mutable state is the

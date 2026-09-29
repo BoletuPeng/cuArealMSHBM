@@ -1736,9 +1736,9 @@ def check_dims(D: int, Db: int, L: int, dim: int, D_grad: int) -> None:
     if Db > max_db:
         raise ValueError(
             f"backend='gpu' supports ceil(D/8) <= {max_db} (D <= {8 * max_db}); got "
-            f"D={D} (Db={Db}). The profile length is the seed-mesh vertex "
-            f"count + 1, so this needs a seed mesh of at most fsaverage3 "
-            f"(D=1175). Use backend='cpu' for larger seeds."
+            f"D={D} (Db={Db}). D is the number of cortical seed vertices "
+            f"over both hemispheres, so this needs a seed mesh of at most "
+            f"fsaverage3 (D=1175). Use backend='cpu' for larger seeds."
         )
     if L > MAX_CLUSTERS:
         raise ValueError(

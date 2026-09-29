@@ -6,10 +6,12 @@ Dispatches on ``mode ∈ {gMSHBM, dMSHBM}``. cMSHBM is not wired
 
 Stages:
 
-    1. load_inputs        — mesh + training-set txt lists + group.mat
-                            + spatial_mask (→ boundary_mask) + preload all
-                            subjects' (N, D, T) profiles and (N, 100, T)
-                            gradients (gMSHBM/dMSHBM).
+    1. load_inputs        — mesh + cohort.json + group.mat
+                            + spatial_mask (→ boundary_mask) + per-subject
+                            loaders for the (N, T, D) profiles and, gMSHBM
+                            only, the (N, D_grad) gradients (dims peeked
+                            from subject 1; subjects are decoded on demand,
+                            not preloaded).
     2. initialize_params  — sigma/s_psi/epsil/mu/kappa/s_t_nu from group.mat;
                             init s_lambda per subject via mtc-argmax projection;
                             init theta from s_lambda.
@@ -397,9 +399,10 @@ class Step2Pipeline:
 
         # Fused compose of Params["s_lambda"] + Params["theta"] (MATLAB
         # lines 137-180). Streams per-subject BOLD through a single
-        # scratch slot, writes Params["s_lambda"] directly in (S, N, L)
-        # fp32 layout, and computes theta inline from the per-(n, l)
-        # active-subject count.
+        # scratch slot (one per decode worker, up to 4, when
+        # bold_cache_mode='stream'), writes Params["s_lambda"] directly
+        # in (S, N, L) fp32 layout, and computes theta inline from the
+        # per-(n, l) active-subject count.
         t_compose = time.perf_counter()
         Params["s_lambda"], Params["theta"] = compose_init_state(
             bold_loader=inputs.bold_loader,

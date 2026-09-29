@@ -6,8 +6,9 @@ contract shared by the kernel modules; the numerical reference is always
 the **CPU backend** (`backend='cpu'`, numba kernels under
 `arealmshbm/{vmf_clustering,V_lambda,m_step,spatial_priors,
 em_stop_criterion,check_connectedness}`). `gpu` requires seed_mesh
-fsaverage3 (`ceil(D/8) ≤ 256`); any other seed mesh is rejected at
-config / driver validation — select `backend_step3='cpu'` for it.
+fsaverage3 (`ceil(D/8) ≤ 256`); the driver rejects any other seed mesh
+by name — select `backend_step3='cpu'` for it — and the per-step API
+rejects `ceil(D/8) > 256` when it reads the packed BOLD.
 Every backend requires w > 0 (`w·log θ` is NaN outside supp(θ) at
 w = 0).
 
@@ -41,7 +42,7 @@ Layout arrays: see `arealmshbm/vmf_clustering/sparse_layout.py`
 |---|---|---|
 | `bold_packed` | `(T, N, D_bytes)` uint8 | **on-disk layout, no transpose**; MW rows zeroed; bit `d` ↔ bit `(d & 7)` of byte `d >> 3` (LSB-first). `D_bytes = ceil(D/8) ≤ MAX_D_BYTES = 256` (`sparse_layout.py`; `acc_bits` gives its 32 lanes `ACC_MAXB = 8` bytes each) — checked by `fetch_packed_bold_TND`, the `acc_bits` wrapper and the `x_dot_sl_bits` wrapper (`m_step_gpu.py`) |
 | `row_mean` | `(T, N)` fp32 | `fp32(fp64(popcount) / fp64(D))` |
-| `row_inv` | `(T, N)` fp32 | `fp32(1 / sqrt(pop - D·mean²))` computed in fp64 (same as the CPU `_normalize_session_bitpacked_numba`, `data_io/bitpacked_norm.py`); **0 when `pop ∈ {0, D}`** (the `has_zero` gate ⇒ the row is identically zero) |
+| `row_inv` | `(T, N)` fp32 | `fp32(1 / sqrt(pop - D·mean²))` computed in fp64 (the CPU `_normalize_session_bitpacked_numba`, `data_io/bitpacked_norm.py`, instead sums fp32 `(bit − mean)²` in fp64 and takes the fp32 reciprocal of the fp32 norm, so the two scales differ by ≤ 2 ulp on some rows); **0 when `pop ∈ {0, D}`** (the `has_zero` gate ⇒ the row is identically zero) |
 | `grad` | `(N, Dg)` fp32, `grad_sq (N,)` fp32 | gMSHBM |
 | `sphere_unit` | `(N, 3)` fp32 | `compute_unit_sphere_xyz` |
 | `lh_nbors`, `rh_nbors` | `(M1, n_hemi)` int32 | 1-indexed, 0 = absent (mesh `vertexNbors`) |
@@ -121,7 +122,9 @@ support** of row m (not just P), the dense CPU kernel produces NaN `rsum`
 ⇒ whole row 0. Mirror it via `bm_row_ptr/bm_col` (only evaluated when
 `any(col_nan)`). `checklam = drift / (N·L)`; converged when
 `|checklam_new − checklam_old| ≤ ε`. V_lambda is bit-identical to the
-CPU kernel; `exp` is evaluated in fp64 like numba's `math.exp`.
+CPU kernel; `exp` is evaluated in fp64 and cast to fp32, while numba's
+`math.exp` on the fp32 argument is an fp32 `expf`, so the two can
+differ by 1 ulp.
 
 ### 2.3 M-step (per em_iter; contract of `MStepSession.run`)
 
@@ -190,8 +193,9 @@ Per round: `kappa ← ini_val`, `s_t_nu[t] ← mu`, run EM, then
 `intra_subject_var` and `intra_em_cost` (fp64 sums, cdln of σ/ε cached),
 `matlab_ratio_converged`, cap `max_iter_intra_em`. `intra_subject_var`
 is bit-identical to the CPU reference only for **T < 8**: the kernel
-sums the T sessions serially, which matches numpy's axis-0 reduction
-only below the length at which its pairwise summation starts blocking.
+sums the T sessions serially, which matches numpy's sum over the
+contiguous last axis (`s_t_nu.sum(axis=2)`) only below the length at
+which its pairwise summation starts blocking.
 
 ## 3. Validation
 
@@ -206,7 +210,8 @@ only below the length at which its pairwise summation starts blocking.
 The ground-truth records below are dated; arms named `gpu_full` are the
 dense CuPy EM measured alongside `gpu` on the same inputs. Pooled over
 cohorts the two are fidelity-equivalent, not uniformly ordered (of the
-cells below, cMSHBM YS is the one where the dense arm is ahead).
+cells below, the dense arm is ahead on cMSHBM YS and on the Mode-B
+prior).
 
 * Cohort ground truth: on an internal 10-subject cohort, `gpu`
   labels agree with the stock-MATLAB reference (produced by an

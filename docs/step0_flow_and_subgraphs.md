@@ -186,8 +186,9 @@ cuSPARSE eigsh and recovers ~17× on that leaf. Subgraph A's GPU win
 across iter_a/iter_b, sgemm via cuBLAS, fused demean+norm RawKernel
 replacing the prior fp64-cast-and-reduce chain — see
 [`fc_similarity fused demean+norm`](#fc_similarity-fused-demeannorm)
-below); the rest of A (watershed, local_minima, surface_smoothing's
-per-iter SpMV) stays on the numba CPU path. Subgraph B's GPU port is
+below); the rest of A (surface_gradient, surface_smoothing,
+local_minima, watershed) runs on CuPy too under `backend='gpu'`; see
+the dispatch list above. Subgraph B's GPU port is
 documented inline under [`## Subgraph B GPU port`](#subgraph-b-gpu-port).
 
 ### Subgraph B GPU port
@@ -318,10 +319,12 @@ that does both passes through the fp32 buffer with fp64 accumulators
 Layout-specific kernels for the two callers — same algorithm, flipped
 coalescing pattern:
 
-* `axis0` ((T, K) row-major, reduce over T): block (32, 1); each
-  thread owns one column j. Warp loads `x[t, j..j+31]` = 32
+* `axis0` ((T, K) row-major, reduce over T): 256 threads per block;
+  each thread owns one column j. Warp loads `x[t, j..j+31]` = 32
   consecutive fp32 → one coalesced 128 B transaction. No shared
-  memory.
+  memory, except in the divide-fused variant used on FC_A / FC_B
+  (`fused_div_demean_norm_columns_cupy`), which stages its per-row
+  divisor in dynamic shared memory.
 * `axis1` ((K, T) row-major, reduce over T): block (256, 1), one
   block per row k. Threads cooperate via an 8-byte-per-cell shared
   fp64 array with stride-1 access — no bank conflicts in the tree
@@ -402,11 +405,18 @@ jitter — the blockers are structural:
 
 ## RNG / orientation tolerances
 
-Every hot-path kernel is `@njit` numba CPU (with one CuPy path in
-subgraph C); the tech-stack exceptions delegate to BLAS sgemm (numpy
-`@`) and Lanczos partial eigh (`scipy.sparse.linalg.eigsh` /
-`cupyx.scipy.sparse.linalg.eigsh`). Three RNG / orientation
-tolerances are inherent to the algorithm semantics:
+On `backend='cpu'` every hot-path kernel is `@njit` numba; the
+tech-stack exceptions delegate to BLAS sgemm (numpy `@`), a
+scipy.sparse SpMV (the cached smoothing gather) and Lanczos partial
+eigh (`scipy.sparse.linalg.eigsh`). `backend='gpu'` runs the leaves in
+the dispatch list above on CuPy (subgraph C through
+`cupyx.scipy.sparse.linalg.eigsh`); BOLD reads, subsampling, the
+icosphere and the sphere interpolations stay on the host. The GPU
+watershed numbers catchments in atomic-counter order and runs one
+Jacobi pass per threshold step instead of the permutations described
+under L10, so for a given input its boundary mask is deterministic.
+Three RNG / orientation tolerances are inherent to the algorithm
+semantics:
 
 * **L5 `subsampling`** seeds `np.random.seed(scan_idx)` and uses
   `np.random.permutation`. Any uniform permutation is acceptable;

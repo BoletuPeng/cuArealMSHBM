@@ -107,7 +107,7 @@ void base64_decode_checked(
 
 
 def get_gifti_gpu_kernels():
-    """Compile (once) and return the RawKernels + the b64 decode table.
+    """Build (once) and return the RawKernels + the b64 decode table.
 
     Returns ``(find_tags, b64_decode, table_dev)``, the last
     being the 256-entry uint8 base64 lookup (255 = outside the

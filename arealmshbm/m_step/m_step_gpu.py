@@ -38,8 +38,12 @@ Numerical mirroring of the CPU reference
 * ``cos``: ``new*old`` in fp32, summed in fp64, stored fp32.
 * empty parcels: ``cn == 0 -> inv_cn = inf -> 0*inf = NaN`` (IEEE, not
   trapping). Note CuPy appends ``-ftz=true`` to every nvrtc compile, so
-  fp32 denormals flush to zero in this module; none of the quantities
-  here get within ~1e-30 of that boundary.
+  fp32 denormals flush to zero in this module, and ``s_lambda`` reaches
+  that boundary: the first M-step of a step-3 session gets
+  ``s_lambda = theta``, whose subnormal cells (a prior can hold a few)
+  are read as 0 here, and E-step posteriors go down to ~1e-38, so the
+  fp32 weight ``s_lambda * row_inv`` in :func:`x_dot_sl_bits` can
+  flush to 0.
 * This module compiles with FMA contraction ON (``options=("-std=c++14",)``
   — no ``-fmad=false``, unlike ``vmf_clustering/_kernels_gpu``).
   That is the flag the design contract was validated under; leave it.

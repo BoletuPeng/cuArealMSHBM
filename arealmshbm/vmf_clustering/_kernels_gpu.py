@@ -15,14 +15,19 @@ Design rules
   mirror the CPU kernels (E-step assembly, softmax, intra_em algebra)
   must not be contracted into FMAs, or they would round differently from
   numba's ``fastmath=False`` code.
-* ``exp`` is evaluated in fp64 on the fp32 difference and cast, exactly
-  like numba's ``float32(math.exp(x))``.
+* ``exp`` is evaluated in fp64 on the fp32 difference and cast to fp32;
+  numba's ``float32(math.exp(x))`` on an fp32 ``x`` is an fp32 ``expf``,
+  so the two can differ by 1 ulp.
 * CuPy appends ``-ftz=true`` to every nvrtc compile, so fp32 denormals
   DO flush to zero here — that cannot be turned off from ``options=``.
-  It is safe for this backend because the one quantity with denormal
-  inputs, ``log(theta)``, is computed on the host in fp64 (see
-  :class:`VmfClusteringSessionSparseCUDA`); every other fp32 value the
-  kernels touch is far from the 1e-38 boundary.
+  ``log(theta)`` is therefore computed on the host in fp64 (see
+  :class:`VmfClusteringSessionSparseCUDA`): theta can carry denormal
+  cells, which would give ``-Inf`` on the device where the CPU backend
+  has a finite value. Elsewhere the flush stands: theta's denormal
+  cells, read as the initial ``s_lambda``, count as 0 in device
+  arithmetic, and E-step posteriors below 2^-126 (about 1.2e-38) are
+  stored as 0, where the CPU backend keeps the denormal value — a
+  change of less than 1.2e-38 per cell.
 * Kernels never allocate; the Session owns every buffer.
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
@@ -153,12 +158,13 @@ void combine_col_flags(const unsigned char* __restrict__ allzero,
 // acc[p] = Sum_t Sum_d X[n,t,d] * s_t_nu[t,l,d]   (design ?2.1)
 //   X[n,t,d] = (bit - mean[t,n]) * inv[t,n]
 //   => acc = Sum_t inv * (Sum_{d: bit} s_t_nu[t,l,d] - mean * S[t,l])
-// One warp per active row m. The warp first expands the set bits of
-// row (t, n) into a shared-memory list, then for each candidate l the
-// lanes stride over that list gathering s_t_nu[t,l,*] (a 4.7 KB,
-// L1-resident segment). fp64 accumulation throughout, fp32 store.
-// Candidates are processed in chunks of ACC_CHUNK so the per-candidate
-// fp64 accumulators live in shared memory regardless of row degree.
+// One warp per active row m, no shared memory. For each candidate l
+// and each t with inv != 0, lane k reads bytes k, k+32, ... (at most
+// ACC_MAXB) of row (t, n) and gathers s_t_nu[t,l,*] (a 4.7 KB,
+// L1-resident segment) under the set bits, 8 predicated loads per
+// byte. The bit term accumulates in fp32 (scaled by inv, summed over
+// t, then a fixed warp tree); lane 0 accumulates the mean * S
+// correction in fp64, subtracts in fp64 and stores fp32.
 // ---------------------------------------------------------------------
 #define ACC_WARPS 4
 #define ACC_MAXB 8          // bytes per lane; 32 lanes => Db <= MAX_D_BYTES

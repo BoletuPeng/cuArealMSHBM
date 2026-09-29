@@ -24,16 +24,18 @@ port returns the polished root (or the asymptotic value where the
 secant reports non-convergence), and neither this module nor
 ``ini_params._invad.invAd`` returns the MATLAB value.
 
-At D ≈ 1175 the besseli probe is finite for κ0 below about 880, so the
-root branch runs whenever κ0 is below that; above it the probe
-overflows and the asymptotic correction runs. The step-1 ``group.mat``
-``epsil`` values measured on disk (151 files) span 1126-4841, all in
-the asymptotic branch, where :func:`invad` and ``ini_params``' brentq
-``invAd`` are bit-equal. The step-3 M-step takes the root branch on
-almost every call (124/126 on reference-cohort sub-001, rbar 0.25-0.54).
+At D ≈ 1175 the besseli probe is non-zero and finite for κ0 from about
+120 to about 895, so the root branch runs for κ0 in that range; outside
+it the probe underflows to 0 or overflows and the asymptotic correction
+runs. The step-1 ``group.mat`` ``epsil`` values measured on disk (151
+files) span 1126-4841, all in the asymptotic branch, where
+:func:`invad` and ``ini_params``' brentq ``invAd`` are bit-equal. The
+step-3 M-step takes the root branch on almost every call (124/126 on
+reference-cohort sub-001, rbar 0.25-0.54).
 
-Called ~3 times per M-step inner iter, ~9 times per M-step call,
-~27-30 times per parcellation. Sub-millisecond and not a hotspot.
+:func:`invad` is called once per step-3 M-step inner iteration (at
+most ``max_iter_m + 1`` times per M-step call), ~30-140 times per
+parcellation. Sub-millisecond and not a hotspot.
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """
@@ -125,9 +127,10 @@ def invad(D: float, rbar: float) -> float:
 # overflow at the same threshold.
 #
 # In the production regime (D = setting_params.dim = 1174 → v = 586),
-# log(I_v(k0)) crosses 709 at k0 ≈ 880, so:
-#   * iter 1 m=1 (κ ~ 553):  probe finite → secant polish runs
-#   * iter 1 m=2+  (κ ≳ 1200): probe overflows → asymptotic correction
+# log(I_v(k0)) crosses 709 at k0 ≈ 898; above that the probe overflows
+# and the asymptotic correction runs. Step 2's κ updates on the
+# multi-subject cohorts measured stay below it (k0 ~260-875) and take
+# the secant polish.
 # Where scipy's secant in :func:`invad` stalls (f(x1) == f(x0)) and
 # reports non-convergence, ``invad`` returns the asymptotic value while
 # this one returns the current iterate, so the two differ by up to

@@ -20,13 +20,15 @@ Each mode requires a specific subset of step blocks (matching
   * ``modeA_single`` / ``modeA_batch`` — step0 + step1 + step3
   * ``modeB_train_prior``              — step0 + step1 + step2 + step3
 
-Including a block the mode doesn't run (e.g. a ``step2`` block in a
-Mode A config) raises as an unknown key. Omitting a required block
-raises with a "missing required block" message that names both the
-block and the mode.
+Including a block the mode doesn't run (a ``step2`` block in a Mode A
+config) raises an error that says to remove it. Omitting a required
+block raises with a "missing required block" message that names both
+the block and the mode.
 
 Mode A reads the group prior from ``<project>/priors/<variant>/
-beta<beta_scalar>/Params_Final.mat``. Mode B writes it there via step 2.
+beta<beta_scalar>/Params_Final.mat`` (dMSHBM:
+``<project>/priors/dMSHBM/Params_Final.mat``, no ``beta`` segment).
+Mode B writes it there via step 2.
 
 The matching authoritative parameter catalog lives at
 ``lib/hyperparameters/`` — every knob below has a corresponding
@@ -171,9 +173,9 @@ class Step3Knobs:
     dMSHBM (which doesn't read it). Step3Config's ``__post_init__``
     resolves ``None`` to the variant default; the unified-driver path
     reaches that branch ONLY when the project creator wrote ``null``
-    explicitly (the in-tree sample projects ship explicit floats for
-    gMSHBM / cMSHBM and reserve ``null`` for dMSHBM, so the resolution
-    branch is exercised only in dMSHBM runs and per-step API tests).
+    explicitly (the in-tree sample projects are all gMSHBM and ship an
+    explicit 15.0). Per-step API calls that leave ``connect_th`` unset
+    take that branch too.
     """
     connect_th: Optional[float]
     epsilon: float
@@ -241,9 +243,9 @@ _TOP_LEVEL_BASE_KEYS = frozenset({
 
 # Mode → required step blocks. Mirrors lib/hyperparameters/modes.json's
 # per-mode ``includes`` field (minus ``project_basics`` which is the
-# top-level itself). Including a block the mode doesn't run is treated
-# as an unknown top-level key; omitting a required block raises a
-# "missing required block" error that names the mode.
+# top-level itself). Including a block the mode doesn't run (step2 in
+# Mode A) raises an error that says to remove it; omitting a required
+# block raises a "missing required block" error that names the mode.
 _MODE_REQUIRED_BLOCKS: Dict[str, frozenset] = {
     "modeA_single":      frozenset({"step0", "step1", "step3"}),
     "modeA_batch":       frozenset({"step0", "step1", "step3"}),
@@ -523,8 +525,10 @@ def _parse_step3(raw: Dict[str, Any]) -> Step3Knobs:
 # than mid-pipeline when the driver builds a Step{N}Config and
 # __post_init__ rejects.
 #
-# Kept next to Step{N}Config.__post_init__ on purpose: importing those
-# range checks here would couple the packages.
+# The step 0 / 2 / 3 checks repeat those in Step{N}Config.__post_init__
+# (step{N}_pipeline/config.py) on purpose: importing those range checks
+# here would couple the packages. There is no Step1Config, so step 1's
+# checks live only here.
 #
 # Note the threshold range check below is HARD — it's documented as
 # an exception to the advisory ``range_policy`` in
@@ -672,8 +676,8 @@ def read_pipeline_config(path: Path | str) -> PipelineConfig:
         )
 
     if backend_step2 == "gpu" and "step2" in required_blocks:
-        # Two static kernel limits, failed here rather than after step 0/1
-        # and the cohort BOLD decode. The literals mirror
+        # Two static kernel limits, failed here rather than after step 0/1.
+        # The literals mirror
         # ``step2_em_iter_master._kernels_gpu``'s MAX_CLUSTERS / MAX_D_GRAD
         # (this parser
         # is stdlib-only; importing the kernel module would pull numba +

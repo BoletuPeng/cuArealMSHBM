@@ -191,9 +191,12 @@ def compute_subject_profiles_gpu(sessions: Iterable,
         run, matching ``profiles._SessionInputs.censor_runs``. A ``1``
         keeps the timepoint.
     stream : cupy.cuda.Stream, optional
-        Stream every kernel here is issued on. Defaults to the current
-        stream. Pass a non-blocking stream distinct from the ingest's
-        decode stream to get real overlap.
+        Stream the per-session kernels and copies are issued on; the
+        seed and medial-wall inputs are prepared before them on the
+        caller's current stream, with no event ordering them before
+        ``stream``. Defaults to the null stream
+        (``cupy.cuda.Stream.null``). Pass a non-blocking stream
+        distinct from the ingest's decode stream to get real overlap.
     out : numpy.ndarray, optional
         Destination for the single D2H: ``(n_sess, n_full, ceil(K/8))``
         uint8, C-contiguous. Pass pinned memory to halve the copy;
@@ -782,9 +785,9 @@ def generate_subject_profiles_gpu(project_dir,
     pipeline, whenever every run has the same ``T``, which is the
     production case. Only the block boundaries cost a pipeline bubble.
 
-    Every kernel is issued on a module-owned non-blocking compute
-    stream (:func:`_thread_stream`) so the ingest's decode stream can
-    run ahead.
+    The per-session compute kernels are issued on a module-owned
+    non-blocking compute stream (:func:`_thread_stream`) so the
+    ingest's decode stream can run ahead.
 
     Returns
     -------
@@ -966,13 +969,16 @@ _PREWARM_DONE = False
 
 
 def prewarm_generate_profiles_gpu(bold_paths=None) -> None:
-    """Pay every first-call cost of this module off the timed path.
+    """Pay part of this module's first-call cost off the timed path.
 
     Compiles the three RawKernels (zscore-zerovar, radix histogram,
     binarize+pack), creates the cuBLAS handle, imports blosc2 for the
     writer, and forwards to
     :func:`~arealmshbm.data_io.gifti_bold_gpu.prewarm_subject_bold_gpu`
-    (nvCOMP library load, GIFTI kernels, pinned staging).
+    (nvCOMP library load, GIFTI kernel objects, pinned staging). The
+    two GIFTI RawKernels and the CuPy elementwise kernels launched by
+    the ingest and the fused compute are compiled at their first
+    launch.
 
     Idempotent and thread-safe; safe to run on a daemon thread during
     pipeline init. ``bold_paths`` is an optional sequence of
@@ -1010,9 +1016,9 @@ def prewarm_generate_profiles_gpu(bold_paths=None) -> None:
         from ..data_io.profile_io import _blosc2
         _blosc2()
         # Without paths we cannot size the pinned staging buffer, so
-        # ask for a token 1 MB -- the NVRTC compile, the nvCOMP ctypes
-        # load and the first cupy reduction are what matter, and the
-        # real allocation happens at ingest.
+        # ask for a token 1 MB -- the nvCOMP ctypes load and the first
+        # cupy reduction are what matter, and the real allocation
+        # happens at ingest.
         if bold_paths:
             prewarm_subject_bold_gpu(bold_paths)
         else:

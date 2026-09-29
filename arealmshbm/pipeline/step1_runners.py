@@ -107,9 +107,11 @@ _log = logging.getLogger(__name__)
 
 def prewarm_step1_gpu(bold_pairs: Optional[Sequence[Tuple[str, str]]] = None,
                       *, background: bool = True) -> Optional[threading.Thread]:
-    """Pay step 1's one-time GPU costs (RawKernel NVRTC compiles, the
-    cuBLAS handle, the nvCOMP library + GIFTI kernels + pinned
-    staging) off the timed path.
+    """Pay part of step 1's one-time GPU costs (the profile leaf's
+    RawKernel NVRTC compiles, the cuBLAS handle, the nvCOMP library +
+    GIFTI kernel objects + pinned staging) off the timed path. The
+    GIFTI RawKernels, the CuPy elementwise kernels and the avg /
+    ini_params / radius_mask kernels compile at their first launch.
 
     The nvCOMP binding is resolved first, synchronously, and a missing
     or unloadable ``nvidia-nvcomp-cu12`` is raised from here as

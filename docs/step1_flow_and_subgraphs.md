@@ -106,9 +106,10 @@ Subgraph coverage by mode:
 
 * **Mode A** (HCP-prior, production path) consumes step 1's
   ``generate_profiles`` output (per-subject .b2nd) via cohort.json.
-  The spatial mask is typically copied in from CBIG's shipped HCP set,
-  so ``radius_mask`` is optional; ``avg_profiles`` + ``ini_params``
-  are not needed because the group prior comes pre-trained.
+  Step 3 reads the spatial mask that ``radius_mask`` writes into the
+  project (``spatial_mask/spatial_mask_<mesh>.mat``), so that subgraph
+  is needed too; ``avg_profiles`` + ``ini_params`` are not needed
+  because the group prior comes pre-trained.
 * **Mode B** (self-trained prior) consumes all four subgraphs:
   ``generate_profiles`` per (subject, session), then ``avg_profiles``
   + ``ini_params`` to seed step 2's EM, ``radius_mask`` for the
@@ -193,9 +194,13 @@ fsaverage6 too).
 ## Backend dispatch
 
 Each runner takes a ``backend ∈ {'cpu', 'gpu'}`` keyword. For
-subgraphs 2–4 it passes it straight through to the leaf supercall,
-where a single `if backend == 'gpu':` branch lazily imports the
-`<leaf>_gpu.py` sibling and tail-calls it. Subgraph 1 dispatches in
+subgraphs 3–4, and for subgraph 2's disk flow, it passes it straight
+through to the leaf supercall, where a single `if backend == 'gpu':`
+branch lazily imports the `<leaf>_gpu.py` sibling and tail-calls it.
+Subgraph 2's in-memory GPU flow (the driver's GPU path, where
+subgraph 1 filled the accumulator) does not reach that branch:
+`run_avg_profiles` hands the accumulator to
+`avg_profiles_from_accumulator` itself. Subgraph 1 dispatches in
 the runner instead: the two backends have different shapes (a
 per-session CPU leaf fed by the stage pipeline vs. one whole-subject
 GPU call), so `run_generate_profiles` calls

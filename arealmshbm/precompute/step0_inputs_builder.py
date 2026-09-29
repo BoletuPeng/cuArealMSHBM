@@ -91,12 +91,11 @@ def build_step0_inputs(cfg) -> "Step0Inputs":
                   "utilities" / "fs6_surface_template")
     if not atlas_dir.exists():
         raise FileNotFoundError(f"midthickness atlas missing: {atlas_dir}")
-    # The raw FreeSurfer sphere surfaces live inside CBIG at
-    # data/templates/surface/<mesh>/surf/. NOTE: this only covers meshes
-    # CBIG ships there — fsaverage{5,6}. fsaverage{3,4} live at
-    # fake_freesurfer/subjects/<mesh>/ in CBIG. The builder only uses
-    # cfg.mesh today (default fsaverage6), so this is sufficient; if a
-    # future caller asks for a lower-res mesh, add a fallback.
+    # The raw FreeSurfer sphere surfaces and cortex.label are read from
+    # <cbig>/data/templates/surface/<mesh>/{surf,label}/. CBIG does not
+    # ship the fsaverage meshes there (its own code reads them from
+    # $FREESURFER_HOME/subjects/<mesh>/), so copy them in first;
+    # otherwise this raises FileNotFoundError.
     surf_root = cbig_dir / "data" / "templates" / "surface"
 
     # --- fsaverage6 sphere meshes (full resolution) ---
@@ -110,7 +109,7 @@ def build_step0_inputs(cfg) -> "Step0Inputs":
     def _read_sphere(hemi: str):
         """Sphere geometry + cortex.label → MARS_label, read from the raw
         FreeSurfer sources.
-        Both files live under the CBIG flat layout
+        Both files are read from
         ``<surf_root>/<mesh>/{surf,label}/``.
         """
         surf_path = surf_root / cfg.mesh / "surf" / f"{hemi}.sphere"

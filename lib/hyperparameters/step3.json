@@ -3,7 +3,7 @@
   "schema_version": "1",
   "description": "Step 3 - single-subject parcellation EM. All three variants supported with per-entry applies_to_variants gating.",
   "source_note": "`source` fields name the file owning the field's authoritative default. Line numbers are intentionally omitted — they drift on every reformat and the file/symbol name is the stable contract.",
-  "range_policy": "advisory — `min`/`max` fields are UI hints documenting the values authors have validated; the parser/validator enforces only positivity (numeric fields) and enum membership (enum fields). Out-of-range-but-positive values are accepted at parse time.",
+  "range_policy": "advisory — `min`/`max` fields are UI hints documenting the values authors have validated; the parser/validator enforces only positivity (numeric fields), finiteness (float fields: NaN and Infinity are refused) and enum membership (enum fields). Out-of-range values that are positive and finite are accepted at parse time.",
   "entries": [
     {
       "key": "backend_step3",

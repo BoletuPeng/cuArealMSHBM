@@ -156,7 +156,7 @@ def profile_backend(sub: str, backend: str, *,
     }
     # Release Session + Inputs and the cupy memory pool. Without this,
     # successive (subject, backend) profile_backend calls in the same
-    # process keep ~4 GB of GPU pool blocks across runs.
+    # process keep the run's peak of GPU pool blocks across runs.
     pipe.close()
     return out
 

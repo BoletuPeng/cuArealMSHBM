@@ -640,11 +640,12 @@ def iter_subject_bold_gpu(session_paths,
     """Decode one subject's sessions straight to device, yielding each
     session as soon as its group lands.
 
-    Yields ``(sess_idx, dev_array)``, 0-based and in input order. The
-    generator waits only on the current group's completion event while
-    the remaining groups are already in flight on the two streams. Each
-    array is yielded only after its group's event has been synchronised,
-    so the consumer may use it from any stream.
+    Yields ``(sess_idx, dev_array)``, 0-based and in input order. Every
+    file's host read is submitted up front; a group's device work (H2D,
+    tag scan, base64, decode) is issued only when the consumer asks for
+    that group's first session. Each array is yielded only after its
+    group's event has been synchronised, so the consumer may use it
+    from any stream.
 
     Transients are bounded at :data:`_MAX_INFLIGHT` groups, so the live
     device set is *outputs the consumer still holds* plus at most two

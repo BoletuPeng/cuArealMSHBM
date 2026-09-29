@@ -452,8 +452,9 @@ def test_x_dot_geometry_is_pinned():
 
 
 def test_x_dot_src_is_ascii():
-    """Step 2's ``module()`` refuses non-ASCII CUDA source; the shared text
-    must not be able to break it from the m_step side."""
+    """On a kernel-cache miss CuPy writes each ``RawModule`` source to a
+    ``.cu`` file in the locale codec, so the shared text must stay ASCII
+    for both consumers (step 3's M-step and step 2's ``module()``)."""
     from arealmshbm.m_step._xdot_kernel import XDOT_SL_BITS_SRC
     bad = [i for i, ch in enumerate(XDOT_SL_BITS_SRC) if ord(ch) > 127]
     assert not bad, f"non-ASCII at offsets {bad[:5]}"

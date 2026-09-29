@@ -40,11 +40,11 @@ subject" pattern sidesteps that pitfall. Phase C consumes per-t
 Reduction-accumulator dtype: mixed, per the per-site policy in
 ``docs/step2_em_iter_master_kernel.md §2``:
 
-* **fp32 acc**: Phase B denom / col-norm / cosine; Phase D log_vmf
+* **fp32 acc**: Phase B col-norm / cosine; Phase D log_vmf
   composition + per-subject cost; Phase E.2 theta-mean.
-* **fp64 acc (MUST stay fp64)**: Phase B kappa_sum; Phase D softmax
-  exp / row_max subtract (β=5000 subnormal); Phase E.1 row-normalize
-  ``rs`` (catastrophic on fp32 — see kernel comment).
+* **fp64 acc (MUST stay fp64)**: Phase B kappa_sum and denom; Phase D
+  softmax exp / row_max subtract (β=5000 subnormal); Phase E.1
+  row-normalize ``rs`` (catastrophic on fp32 — see kernel comment).
 
 The CPU wall is identical either way (memory-bound), but the dtype
 map informs the GPU port: on a 1:64 fp64:fp32 device, every fp32-safe

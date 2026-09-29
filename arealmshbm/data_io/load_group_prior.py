@@ -7,8 +7,8 @@ arrays. In Mode A these are fixed throughout step 3; the EM only updates
 subject-level state.
 
 Reads typical v7 ``.mat`` via :func:`scipy.io.loadmat`; falls back to
-``h5py`` for the v7.3 case (the HCP-prior files at
-``arealmshbm/data/group_priors/HCP_fsaverage6_40sub/<num_ROIs>/gMSHBM/beta<X>/Params_Final.mat``
+``h5py`` for the v7.3 case (the HCP-prior files in CBIG's
+``stable_projects/brain_parcellation/Kong2022_ArealMSHBM/lib/group_priors/``
 are v7).
 
 Output dtype is fp32 by intent — the EM hot path is fp32 throughout,

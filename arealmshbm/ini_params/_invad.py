@@ -15,9 +15,12 @@ Numerical notes:
       ``Inf``/``NaN``/``0``.
     * We use ``scipy.special.ive`` (exponentially scaled
       ``exp(-|x|) * I_nu(x)``) and form the ratio
-      ``ive(D/2, k) / ive(D/2-1, k)`` so the ``exp(-x)`` factors cancel
-      and the ratio stays well-conditioned in the range we see
-      (``kappa ~ 100..2000``).
+      ``ive(D/2, k) / ive(D/2-1, k)`` so the ``exp(-x)`` factors cancel.
+      ``ive`` underflows to 0 for small ``kappa``, where ``_ad`` does
+      not return A_d, so a root below that edge is not found: the edge
+      is about 173 at the fsaverage3 seed (D = 1174; ``rbar`` about
+      0.10-0.14, up to ~44 % off) and lies above every root the brentq
+      branch looks for at the fsaverage4/5 seeds.
     * The "is besseli pathological?" probe before fzero in MATLAB is
       reproduced via the unscaled ``iv`` (it overflows to ``Inf`` —
       that's the same trigger MATLAB uses) so this port takes the
@@ -39,11 +42,13 @@ from scipy import special as _spec
 
 
 def _ad(kappa: float, D: float) -> float:
-    """``A_d(kappa) = I_{D/2}(k) / I_{D/2-1}(k)`` via ``ive`` (stable).
+    """``A_d(kappa) = I_{D/2}(k) / I_{D/2-1}(k)`` via ``ive``.
 
     The exponentially scaled Bessels share the same ``exp(-|x|)`` factor,
-    which cancels in the ratio, so we get a finite result for any
-    ``kappa > 0`` while ``iv`` itself overflows past ``kappa ~ 700``.
+    which cancels in the ratio, so the ratio stays finite where ``iv``
+    itself overflows. For small ``kappa`` ``ive(D/2-1, k)`` underflows
+    to 0 (below ``kappa ~ 172`` at D = 1174); there this returns the
+    large-kappa asymptotic instead of the ratio.
     """
     nu_top = D / 2.0
     nu_bot = D / 2.0 - 1.0
@@ -52,8 +57,9 @@ def _ad(kappa: float, D: float) -> float:
     if bot == 0.0 or not np.isfinite(top) or not np.isfinite(bot):
         # Both overflow / underflow regimes: fall back to large-kappa
         # asymptotic A_d(k) ~ 1 - (D-1)/(2k) (DLMF 10.41 / Banerjee 2005
-        # eq. (4.4)) so the residual still has the right sign for the
-        # bracket search.
+        # eq. (4.4)). It lies below A_d, so when the root lies below the
+        # ive underflow edge the residual has the wrong sign just above
+        # the root and the bracket search does not return the root.
         return 1.0 - (D - 1.0) / (2.0 * kappa)
     return float(top / bot)
 

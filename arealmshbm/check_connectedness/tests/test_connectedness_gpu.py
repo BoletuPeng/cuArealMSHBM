@@ -45,7 +45,8 @@ def _cpu_ref(lh_labels, rh_labels, lh_mesh, rh_mesh, L):
 
 
 def _cpu_step(pc, eucli, xyz_gamma, connect_th, components_threshold):
-    """Lines 182-198 of ``_check_connectedness_step``, verbatim."""
+    """The distributed-mask / ``xyz_gamma`` decision block of
+    ``_check_connectedness_step``, expression for expression."""
     distrib = (eucli > connect_th) | (pc > components_threshold)
     if distrib.any():
         max_conn = float(eucli[distrib].max())
@@ -455,7 +456,7 @@ def test_remove_isolated_synthetic(thr):
 
 
 def test_remove_isolated_sub001():
-    """Base labels + 8 perturbations (scattered islands), on both CC paths."""
+    """Base labels + 8 perturbations (scattered islands)."""
     skip_unless_cupy()
     fx, lh0, rh0, L, gpu = _sub001_setup(0.0, 1, isolated_component_min_size=5)
     n_changed = [_check_pre_predicate("sub001-ri-base", gpu, lh0, rh0,

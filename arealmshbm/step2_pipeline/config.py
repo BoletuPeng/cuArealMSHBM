@@ -191,9 +191,11 @@ class Step2Config:
                 f"(got {self.backend!r})"
             )
         # ``x_dot_sl_bits`` gives each of its 256 threads one byte of the
-        # packed row, so ⌈D/8⌉ ≤ 256, which only fsaverage3's D = 1175
-        # satisfies. Fail here rather than in the session ctor's
-        # ``check_dims``, which only runs after step 0/1 and the BOLD decode.
+        # packed row, so ⌈D/8⌉ ≤ 256; fsaverage4 and larger exceed it, and
+        # fsaverage3 (D = 1175) is also the only seed mesh the gpu sessions
+        # are validated on. Fail here rather than in the session ctor's
+        # ``check_dims``, which only runs after the step-2 input load and
+        # the kernel compile.
         if self.backend == "gpu":
             if self.seed_mesh != "fsaverage3":
                 raise ValueError(
@@ -206,7 +208,7 @@ class Step2Config:
             # warp, and ``connect_u`` stages one float per gradient
             # component in shared memory. Checked here as well as in
             # ``check_dims`` because the session ctor only runs after
-            # step 0/1 and the cohort's BOLD decode; the literals mirror
+            # the step-2 input load and the kernel compile; the literals mirror
             # ``_kernels_gpu``'s MAX_CLUSTERS / MAX_D_GRAD (no
             # kernel import — this dataclass must stay cupy-free) and
             # ``test_config_backend.py`` pins the equality.

@@ -10,10 +10,10 @@ flag-insensitive: every fp32 multiply-add is an explicit ``fmaf`` and the
 only other fp32 ops are lone multiplies, so ``-fmad`` does not change it.
 
 The text must stay ASCII: cupy writes a ``RawModule`` source to a ``.cu``
-file in the locale codec before NVRTC sees it, and step 2's ``module()``
-refuses any non-ASCII source outright. ``m_step/tests/test_m_step_gpu.py``
-pins that here, and holds the shared-memory-staged form as the
-bit-exact oracle, instantiated at both consumers' geometries.
+file in the locale codec before NVRTC sees it.
+``m_step/tests/test_m_step_gpu.py`` pins that here, and holds the
+shared-memory-staged form as the bit-exact oracle, instantiated at both
+consumers' geometries.
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """

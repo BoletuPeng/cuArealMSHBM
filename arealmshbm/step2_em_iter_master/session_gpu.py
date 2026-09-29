@@ -1,9 +1,11 @@
 """session_gpu.py — device-resident Session of the step-2 ``gpu`` backend.
 
 :class:`Step2SparseSession` owns every device buffer of the P-layout step-2
-EM and drives the kernels in ``_kernels_gpu``. Nothing bulk crosses the
-PCIe bus after the constructor: one EM iteration costs ``m_iters + 1`` blocking
-syncs, all of them tiny pinned reads.
+EM and drives the kernels in ``_kernels_gpu``. In ``eager_bitpacked`` mode
+nothing bulk crosses the PCIe bus after the constructor: one EM iteration
+costs ``m_iters + 1`` blocking syncs, all of them tiny pinned reads.
+``stream`` mode adds, for ``S > 1``, two fenced H2D copies of each
+subject's packed bytes per EM iteration.
 
 Contract: ``docs/step2_sparse_design.md`` §2 (device state), §3 (kernel
 catalog) and §4 (this API). The numerical reference is the CPU numba backend.
@@ -56,11 +58,11 @@ def _alloc_pinned_unpooled(shape: Tuple[int, ...], dtype) -> np.ndarray:
 
 #: Page-locked slots the eager ingest decodes into ahead of the H2D (one
 #: subject each, 72 MB at fsaverage6 / T=6), and the width of both decode
-#: pools. blosc2 already decodes each subject on every core, so the ring
-#: only has to hide one subject's H2D + row statistics behind the next
-#: decode: on the 40-subject reference-cohort ingest depth 2 measured 1.91 s
-#: against 1.88 s at depths 4 and 8 (noise) and 1.96 s at depth 1 (no
-#: overlap).
+#: pools. A blosc2 decode holds the GIL, so decodes do not overlap each
+#: other and the ring only hides one subject's H2D + row statistics behind
+#: the next decode: on the 40-subject reference-cohort ingest depth 2
+#: measured 1.91 s against 1.88 s at depths 4 and 8 (noise) and 1.96 s at
+#: depth 1 (no overlap).
 _INGEST_DEPTH = 2
 #: Fraction of available host RAM the stream-mode host cache may claim.
 _HOST_CACHE_FRACTION = 0.5
@@ -323,8 +325,8 @@ class Step2SparseSession:
         margin = int(margin_gb * (1 << 30))
         need = packed_b + grad_b + state_b + k7_b + margin
         # ``mem_info`` reports DRIVER-free memory, which does not see blocks the
-        # cupy pools are holding but not using (step 1 runs on GPU and nothing
-        # drains between step 1 and step 2), so a pooled step-1 arena would make
+        # cupy pools are holding but not using (earlier GPU work in the same
+        # process can leave them undrained), so a pooled arena would make
         # the sizing rule read a free_b that is a whole pool too low.  Reclaim
         # only when the undrained reading is already short: draining can only
         # ADD free memory, so "it fits before the drain" implies "it fits after
@@ -383,7 +385,7 @@ class Step2SparseSession:
         """Fill the ``(S, T, N, Db)`` device cache straight from the reader.
 
         ``_INGEST_DEPTH`` worker threads decode subjects into as many
-        page-locked slots (the reader releases the GIL inside blosc2)
+        page-locked slots (one at a time: a blosc2 decode holds the GIL)
         while this thread issues each finished slot's H2D and row
         statistics; a slot is refilled only after its copy is fenced on
         the current stream. The slots live outside cupy's pinned pool and

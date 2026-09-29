@@ -147,8 +147,9 @@ class Pipeline:
         """Reject the P-layout ``'gpu'`` backend of step 2 / step 3 on a
         seed mesh it cannot serve.
 
-        Both bake a ``ceil(D/8) <= 256`` limit that only
-        ``seed_mesh='fsaverage3'`` satisfies. ``seed_mesh`` lives in
+        Both bake a ``ceil(D/8) <= 256`` limit; fsaverage4 and larger
+        exceed it, and ``seed_mesh='fsaverage3'`` is also the only seed
+        mesh the gpu sessions are validated on. ``seed_mesh`` lives in
         bold_inputs.json, so ``read_pipeline_config`` cannot see it and
         the leaf-side rules (``Step2Config.__post_init__``, the step-3
         packed-BOLD loader) fire only after steps 0-1 (step 3: 0-2)
@@ -263,8 +264,8 @@ class Pipeline:
         overlaps the whole stack. See
         :mod:`arealmshbm.pipeline._step0_stage_pipeline`.
 
-        CPU backend stays sequential (numba threads inside each call
-        already saturate cores).
+        The CPU backend runs the same four stage threads, without cupy
+        streams.
         """
         from arealmshbm.step0_pipeline import Step0Config, Step0Pipeline
         from ._step0_bold_prefetcher import Step0BoldPrefetcher
@@ -360,8 +361,8 @@ class Pipeline:
         ``avg_accumulator`` as it packs it → ``lh_avg_dev``) and every
         disk write runs on a background thread joined once at the end
         (:func:`step1_runners.join_step1_writers`); on CPU that
-        background writer carries the group.mat write alone. The
-        one-time GPU costs are prewarmed on a daemon thread that
+        background writer carries the group.mat write alone. Part of
+        the one-time GPU cost is prewarmed on a daemon thread that
         :meth:`run` starts before step 0. No subject's packed bytes
         outlive its .b2nd write: the average lives in two ``(V_h, D)``
         fp32 device sums, whatever the cohort size.
@@ -621,11 +622,11 @@ class Pipeline:
 
         ``gradient_by_sub`` is the dict returned by step0 — each entry
         is the in-memory ``(N, n_grad_components)`` fp32 gradient_mat
-        for one subject. fetch_data uses it directly instead of
-        re-reading the cohort's gradient .npy files. After processing a
-        subject we drop the reference so its ~33 MB (81924 × 100 × 4 B
-        at fsa6 with n_grad_components=100) is reclaimable; this matters
-        at large K.
+        for one subject. fetch_data (``cpu``) or fetch_gradient (``gpu``)
+        uses it directly instead of re-reading the cohort's gradient .npy
+        files. After processing a subject we drop the reference so its
+        ~33 MB (81924 × 100 × 4 B at fsa6 with n_grad_components=100) is
+        reclaimable; this matters at large K.
 
         **Pipeline-parallel by phase (GPU backend, K ≥ 2).** The
         single-subject pipeline runs three phases sequentially (LOAD:
@@ -806,12 +807,14 @@ class Pipeline:
             # backend_step1='gpu' ingests BOLD through nvCOMP only.
             # The call resolves the nvCOMP binding on this thread
             # first, so a missing or unloadable nvidia-nvcomp-cu12
-            # fails before step 0. Step 1's one-time GPU costs (the
-            # profile leaf's RawKernel NVRTC compiles, the cuBLAS
-            # handle, pinned staging) are then paid on a daemon thread
-            # that overlaps step 0. The leaf's prewarm is lock-guarded
-            # and idempotent, so the call step 1 makes itself later
-            # just waits for this one.
+            # fails before step 0. The profile leaf's RawKernel NVRTC
+            # compiles, the cuBLAS module load and the pinned staging
+            # buffer are then paid on a daemon thread that overlaps
+            # step 0; the GIFTI ingest kernels, CuPy's elementwise
+            # kernels and the avg / ini_params / radius_mask kernels
+            # compile at their first launch. The leaf's prewarm is
+            # lock-guarded and idempotent, so the call step 1 makes
+            # itself later just waits for this one.
             if self.config.backend_step1 == "gpu":
                 from .step1_runners import (
                     bold_pairs_for_prewarm, prewarm_step1_gpu,

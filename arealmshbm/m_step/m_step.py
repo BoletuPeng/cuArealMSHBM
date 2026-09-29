@@ -133,15 +133,16 @@ class MStepSession:
 
     Ping-pong buffers
     -----------------
-    ``s_t_nu`` is double-buffered as ``_s_t_nu_TSDL_A`` / ``_s_t_nu_TSDL_B``.
-    Each iter_m, the fused kernel reads from ``buffers_st[old_idx]`` and
-    writes to ``buffers_st[new_idx]``; old/new are swapped at the end of
-    the iter (no memcpy — just swap which buffer is "current"). Same
-    pattern for ``kappa`` via ``_kappa_old_L`` / ``_kappa_new_L``. This
+    ``s_t_nu`` is double-buffered as ``_s_t_nu_TDL_A`` / ``_s_t_nu_TDL_B``.
+    Each iter_m, the fused kernel reads from ``st_buffers[old_idx]`` and
+    writes to ``st_buffers[new_idx]``; old/new are swapped at the end of
+    the iter (no memcpy — just swap which buffer is "current"). This
     is the natural CUDA pattern: two device arrays, the "current" one
-    rotates each step.
+    rotates each step. ``kappa`` is a scalar held in a Python local
+    inside ``run()``; the caller-facing ``(L,)`` array is built once on
+    return.
 
-    The two ``s_t_nu`` TSDL buffers are MANDATORY (not just an
+    The two ``s_t_nu`` TDL buffers are MANDATORY (not just an
     optimization): the fused kernel's cosine convergence test reads the
     old value while writing the new. Aliasing them would corrupt the
     test.
@@ -149,9 +150,10 @@ class MStepSession:
     Layout
     ------
     Externally the caller speaks in **MATLAB shape** (matches the GT
-    files); internally the Session uses a **Python-natural** layout
-    with batch axes (T, S, ...) leading so per-(t, s) slices are
-    C-contig. See module docstring for the full layout map.
+    files); internally ``s_t_nu`` and ``X_dot_sl`` use a
+    **Python-natural** ``(T, D, L)`` layout with the session axis T
+    leading so per-t slices are C-contig. See module docstring for the
+    external shapes.
 
     The Session contract assumes ``data_series`` does NOT change between
     calls within a parcellation — it's the BOLD time series, which is

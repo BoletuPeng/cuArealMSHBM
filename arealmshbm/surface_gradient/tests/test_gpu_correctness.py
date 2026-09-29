@@ -31,8 +31,8 @@ _HAS_CUPY = importlib.util.find_spec("cupy") is not None
 
 # Tests that read the CBIG midthickness atlas point at the env-configured
 # CBIG checkout; if ``CBIG_CODE_DIR`` is unset, the atlas-dependent tests
-# are skipped (the GPU vs. CPU equivalence tests don't depend on this
-# atlas, they consume the precomputed step0_inputs cache instead).
+# are skipped (both tests in this file read the fs6 midthickness from
+# this atlas).
 _CBIG_ENV = os.environ.get("CBIG_CODE_DIR")
 _CBIG = Path(_CBIG_ENV) if _CBIG_ENV else None
 _ATLAS = (_CBIG / "utilities" / "matlab" / "speedup_gradients" /

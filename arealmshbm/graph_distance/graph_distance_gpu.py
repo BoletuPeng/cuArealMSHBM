@@ -1,7 +1,10 @@
 """graph_distance_gpu.py
 
 GPU implementation of :func:`gradient_geodesic_distance` — same
-signature, precision contract and output shape as the CPU function.
+precision contract and output shape as the CPU function. Its entry
+point, :func:`gradient_geodesic_distance_gpu_device`, takes the
+neighbour table and gradient already on the device (no ``verts``) and
+returns the matrix as a ``cupy.ndarray``.
 
 The solver is the per-source Δ-stepping SSSP in :mod:`._kernels_gpu`;
 its bit-identity with pull Bellman-Ford is pinned by the oracle in

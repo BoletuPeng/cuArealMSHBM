@@ -174,8 +174,9 @@ bench) single-threaded; acceptable (§8).
 
 ### 1.5 Phase C — spatial_connect (gMSHBM) — exact except `u_update`/`cross` order
 
-Per subject (CPU `_kernels.py:432-547`), all `t`-invariant because the gradient
-is session-invariant; evaluated on the active support (§2.3):
+Per subject (CPU `_kernels.py::_spatial_connect_per_subject_numba`), all
+`t`-invariant because the gradient is session-invariant; evaluated on the active
+support (§2.3):
 
 ```
 sum_lambda[l] = serial ascending-n fp32 sum over members(l) of s_lambda      (exact; native fp32, §1.10 note)
@@ -220,7 +221,8 @@ Such cells are `-inf` whenever `theta_out == 0`, i.e. from the first E.2 on. So:
   (§3 K7) with the same fp32 op order;
 * afterwards `rmax = rmax_P(n)` — bit-identical to the dense CPU rmax.
 
-Cost (fp32, per row, ascending `l` over P(n); CPU `_kernels.py:742-805`):
+Cost (fp32, per row, ascending `l` over P(n); CPU
+`_kernels.py::_fused_estep_per_subject_NTD`, its "Step 3: per-subject cost" block):
 
 ```
 row_sum = serial fp32 Σ_l f32(scr[p]) * 1.0f
@@ -345,7 +347,7 @@ test oracles in `arealmshbm/step2_io/tests/_layout_oracle.py`.
 
 | name | shape / dtype | notes |
 |---|---|---|
-| `packed` | `(S, T, N, Db)` uint8 (`eager_bitpacked`) or one `(T, N, Db)` slot (`stream`) | on-disk layout; padding bits zero (writer contract; cheap check on subject 1) |
+| `packed` | `(S, T, N, Db)` uint8 (`eager_bitpacked`) or one `(T, N, Db)` slot (`stream`) | on-disk layout; padding bits zero (writer contract, not checked) |
 | `row_mean`, `row_inv`, `n_alive` | `(S, T, N)` fp32 ×2, `(S, N)` int32 — device-resident for ALL S in both cache modes (computed once in the ctor; stream mode only H2Ds the packed bytes per visit) | §1.1 |
 | `n_alive` | `(S, N)` int32 | |
 | `grad`, `grad_sq` | `(S, N, Dg)` fp32, `(S, N)` fp32 | gMSHBM only; device-resident (no stream mode for grad in v1) |
@@ -371,8 +373,8 @@ else `stream`. An explicit `eager_bitpacked` that does not fit raises
 `ValueError` with the sizes; `auto` warns and falls
 back. An explicit `stream` still validates that the resident state fits (named `ValueError` otherwise).
 `eager_bitpacked` fills the device cache straight from `inputs.bold_reader` through a
-2-slot page-locked ring (one decode runs ahead of the H2D + row stats; blosc2 already
-decodes on every core, so deeper rings measured within noise) allocated outside cupy's
+2-slot page-locked ring (one decode runs ahead of the H2D + row stats; a blosc2 decode
+holds the GIL, so decodes do not overlap and deeper rings measured within noise) allocated outside cupy's
 pinned pool and released once the cache is full — no host memory of the cohort outlives
 the constructor in eager mode. `stream` = per-visit
 H2D of one subject's packed bytes (no row-stats recompute) from a **host**
@@ -424,7 +426,7 @@ pinned-slot D2H (`.get(out=pinned)`).
 | # | kernel | geometry | contract |
 |---|---|---|---|
 | K0 | `row_stats_exact` | thread per (s,t,n) row | §1.1; writes `row_mean`, `row_inv`; a second kernel counts `n_alive` |
-| K1a | `init_hard_labels` | block per 8 rows (s,n): 256 threads; lanes/warps own `l`; `g[d, :]` staged per d-tile and reused across the 8 rows | §1.2; per-(n,l) accumulator stays a private serial ascending-d fp32 sum; warp argmax with first-index tie rule; `norm_sq` serial fp32 |
+| K1a | `init_hard_labels` | block per 32 rows (s,n) (8 warps × 4 rows): 256 threads; lanes own `l`, each warp owns 4 rows; the rows' `a_d` staged in smem per d-tile; `g[d, :]` read from global, each load reused across the warp's 4 rows | §1.2; per-(n,l) accumulator stays a private serial ascending-d fp32 sum; warp argmax with first-index tie rule; `norm_sq` serial fp32 |
 | K1b | `init_compose` | thread per (s,n); then thread per p | §1.2: binary-search `l_act` in `col[row_ptr[n]:row_ptr[n+1]]`; `theta[p]` from `Σ_s s_lambda[s,p] > 0` |
 | K2 | `sigma_psi_SLD` | grid-stride | exact |
 | K3 | `x_dot_sl_bits` | one launch per subject s: grid T·L (block per (t,l)), 256 thr × 1 byte, dyn smem `64*8` B (member weights + row ids) | the kernel text shared with step 3 (`m_step/_xdot_kernel.py`) over the **active** CSC; no host wrapper — `check_dims` (session ctor) rejects `Db > 256` (the kernel's `XDOT_BLOCK × XDOT_MAX_NB`) with a `ValueError` naming the seed mesh: `backend='gpu'` supports `ceil(D/8) ≤ 256`, i.e. seed mesh fsaverage3 |
@@ -434,7 +436,7 @@ pinned-slot D2H (`.get(out=pinned)`).
 | K4e | `cdln_after_loop` | 1 thread | `cdln_val = f32(Cdln(kappa_final))`, once per `run_iter` |
 | K5a | `connect_u` | grid (L, ntile=4): member tiles, fixed-tree combine in a second stage | `sum_lambda` serial fp32 (ascending members, one thread), `u_update` fp64, `inv_l`, `u`, `u_sq` serial fp32 |
 | K5b | `connect_scv_P` | thread per active p | `cross` fp32 serial over d; `vmf`; T sequential adds; NaN kept |
-| K6 | `acc_P` (lv_sum on active P) | block per (s,l,tile): 256 thr; members of the active column in chunks of 256; inner loop over t restages `nu[s,t,l,:]` **as `Db*8` floats with the tail zero-filled** + `S[t,l]` in smem | thread per member: 147 packed bytes (`__ldg`), `pt = serial ascending-d fp32 Σ` via branch-free `fmaf((float)bit, nu_sm[d], pt)` (measured bit-identical to set-bit iteration and 1.9× faster), `part += (double)inv * ((double)pt − (double)mean * S)`; after T: `lv_sum[p] = f32(part)`. `S[t,l]` from a block-per-(s,t,l) fp64 row-sum kernel. Measured 3.07 ms on full P → ~0.4 ms on the active support |
+| K6 | `acc_P` (lv_sum on active P) | one launch per subject s: grid L (block per l), `ACC_BLOCK` = 768 thr; members of the active column in chunks of 768; inner loop over t restages `nu[s,t,l,:]` **as `Db*8` floats with the tail zero-filled** in smem | thread per member: 147 packed bytes (`__ldg`), `pt = serial ascending-d fp32 Σ` via branch-free `fmaf((float)bit, nu_sm[d], pt)` (measured bit-identical to set-bit iteration and 1.9× faster), `part += (double)inv * ((double)pt − (double)mean * S)`; after T: `lv_sum[p] = f32(part)`. `S[t,l]` from a block-per-(s,t,l) fp64 row-sum kernel. Measured 3.07 ms on full P → ~0.4 ms on the active support |
 | K7 | iteration-1 dense pass (only while `theta_out != 0`) | (i) `widen_exact`: `X_tile[i, t·D+d] = (f32(bit) − mean)·inv` (8192-row tiles, warp per (n, t) row; exact); (ii) `lv_tile = X_tile @ nu.reshape(T·D, L)` via cuBLAS sgemm (**16.6 ms**; `nu` transposed to `(T,D,L)` first); (iii) `cross_tile = grad @ u.T` (sgemm, 0.3 ms); (iv) `rmax_out_k`: warp per (s,n), lanes over l ∉ P(n) (smem scatter of the row's P cols), gMSHBM: same-hemisphere only, `lc = T-fold of ((2f·cross − grad_sq) − u_sq[l])`; dMSHBM: all l, no lc term; `lam = (kappa_f32·lv + f32(n_alive)·cdln) + f32(log(theta_out)) [+ beta_f32·lc]`; NaN skipped; `-inf` if none | ~35-40 ms once per run (S=1), one-tile transient freed after. No TF32 scope wraps step 2, so the sgemm runs strict fp32 |
 | K8 | `estep_row1` | thread per row n (measured: better than warp-per-row at ≤ 15 cells) | §1.6 up to `scr`; reads `rmax_out` when the flag is set; skips `lv_sum` reads for inactive cells; writes `log_vmf[p]`, `scr[p]`, `rmax[n]` |
 | K9 | `dead_col` | grid (L, ntile) over active members + fixed-tree combine | fp64 NaN-skipping sum; if 0 → write 0 to those `scr[p]` |
@@ -510,7 +512,8 @@ class Step2SparseInputs:
     S: int; T: int; N: int; D: int; D_grad: int; n_lh: int; n_rh: int
     mtc: np.ndarray                     # (D, L) fp64, verbatim group.mat 'mtc' (D = 1175 here; dim = D-1)
     dim: int
-    bold_reader: Callable[[int, np.ndarray], None]   # bold_reader(s_1, out_TNDb): one .b2nd decode into a caller buffer
+    bold_reader: Callable[[int, np.ndarray], None]   # bold_reader(s_1, out_TNDb): one .b2nd decode into a caller buffer;
+                                        # the Session may call it from up to _INGEST_DEPTH worker threads at once (distinct subjects and buffers)
     grad_reader: Optional[Callable[[int, np.ndarray], None]]   # grad_reader(s_1, out_NDg) (gMSHBM), else None
     timings: Dict[str, float]
     @classmethod
@@ -526,13 +529,15 @@ def load_step2_sparse_inputs(cfg: Step2Config, *, overlap: bool = True) -> Step2
 * BOLD: subject 1's header + one chunk (the MW contract) are read here, from one open;
   `bold_reader` is `blosc2.open(path, mode='r')` + `get_slice_numpy` straight into the
   caller's buffer (`profile_io.decode_subject_profile_packed_into`; ≈ 47 ms per subject
-  at fsaverage6 / T=6, GIL-released — `a[:]` + copy was 63 ms and a second 72 MB host
+  at fsaverage6 / T=6 — `a[:]` + copy was 63 ms and a second 72 MB host
   copy), with the per-subject header checks on every call. Residency is the Session's
   (§2.2): the eager device cache is filled through the reader on a 2-slot page-locked
   ring; the stream-mode host cache is built when `S·T·N·Db ≤ 0.5 × available host RAM`
   (psutil), else stream mode decodes per visit (2·S·47 ms per EM iter).
 * gradient: `data_io.fetch_data.read_gradient_emb` per hemisphere (`.npy` or `.mat`,
   the same reader step 3 uses), concatenated to `(N, Dg)` fp32, no T replication.
+  All subjects share one suffix: `SubjectGradientLoader` rejects a mixed cohort on
+  both backends.
 * `group.mat`: `mat5_stream.read_fields(path, {'mtc'})` — streaming inflate
   (isal_zlib) that never inflates the 22 MB
   `lambda` field's body: the container cursor advances by the raw element size,
@@ -632,8 +637,9 @@ Fixtures: `testdata/step2_bench/proj` (S=1) and `proj2` (S=2), env override
    labels/medial/s_lambda/theta `np.array_equal` vs `compose_init_state`; K3 vs an
    fp64 matmul: max rel ≤ 1e-4 and ≤ 10× the fp32 sgemm's error; K4c in-place: run
    with `eps = 0` for ≥ 2 iter_m, assert `cos != 1` and `s_t_nu` bit-equal to a
-   ping-pong reference; K5 `sum_lambda`, `u_sq`, `grad_sq` exact, `log_connect` on
-   P within 1e-5 rel of the CPU kernel, NaN pattern equal; K6 vs `X @ s_t_nu` fp64:
+   ping-pong reference; K5 `sum_lambda` exact, `grad_sq` within 1e-3 × max of an
+   fp32 einsum, `log_connect` on P within 1e-5 rel of the CPU kernel, NaN pattern
+   equal; K6 vs `X @ s_t_nu` fp64:
    max rel ≤ 3e-4; K7 `rmax_out` vs a dense numpy evaluation of the same expression
    (incl. the cross-hemisphere `-inf` rule); K8-K10 with the CPU
    `_fused_estep_per_subject_NTD` + `_phase_e1_normalize_per_subject_kernel` fed

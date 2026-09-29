@@ -5,8 +5,11 @@ subject BOLD profiles (NTD per-sub) from disk via a
 :class:`SubjectProfileLoader`, plus group mu + boundary mask, and
 produces ``Params["s_lambda"] (S, N, L) fp32`` (one-hot sparse) and
 ``Params["theta"] (N, L) fp32`` in the EM body's expected internal
-layout. One subject is decoded into a re-used scratch slot at a
-time, so peak RAM stays at one subject's slab regardless of S.
+layout. Subject reads run on a pool of up to four worker threads;
+the (N, T, D) fp32 scratch is one slot when the loader keeps its
+bit-packed host cache (cache_mode='eager_bitpacked', which holds
+every subject's packed bytes) and one slot per worker with
+cache_mode='stream'.
 
 See ``_kernels.profile_to_hard_labels_kernel`` and
 ``_kernels.compose_init_state_kernel`` for the kernel-side docs.
@@ -32,10 +35,7 @@ from ._kernels import (
 # Prefetch concurrency for the per-subject disk pump.
 #
 # Each subject's .b2nd packed slab is read on the worker pool BEFORE
-# the main thread's widen+normalize + argmax stage consumes it. blosc2
-# chunk decode releases the GIL during decompression, so concurrent
-# workers fan out across NVMe sequential bandwidth (multi-MB sequential
-# reads coalesce naturally on Windows / NTFS).
+# the main thread's widen+normalize + argmax stage consumes it.
 #
 # Sizing: at fsa6 / T=6 each packed slab is ~47 MB; 4 concurrent reads
 # pump ~190 MB of in-flight I/O — comfortably below the OS read-ahead
@@ -111,17 +111,18 @@ def compose_init_state(bold_loader: SubjectProfileLoader,
     #     The loader's host packed cache is reused across init + EM,
     #     so the prefetch *populates production-needed state* — not
     #     throwaway work. Workers call ``prefetch_packed(s)`` (disk +
-    #     blosc2 decode, GIL-released), then the main thread runs the
+    #     blosc2 decode), then the main thread runs the
     #     warm ``load_into`` path (widen+normalize numba kernel from
     #     cached packed bytes, ~56 ms) plus the argmax kernel (~134 ms).
     #     Cohort wall: 52s sequential → 8.75s on the S=40 reference cohort (5.8x).
     #
-    #   Path B (cache_mode='stream', e.g. GPU backend): no host cache;
+    #   Path B (cache_mode='stream'): the CPU step-2 backend with
+    #     bold_cache_mode='stream'. No host cache;
     #     each load_into goes back to disk. We can't prefetch into a
     #     shared cache, but we CAN parallelize the per-sub
     #     disk-read+widen+normalize across worker scratches and run
     #     argmax sequentially on the main thread. n_workers (N, T, D)
-    #     fp32 scratch slabs (~3.1 GB transient at fsa6/T=6/n=4) —
+    #     fp32 scratch slabs (~9.2 GB transient at fsa6/T=6/n=4) —
     #     released when compose_init_state returns.
     #
     # The widen+normalize kernel itself is numba-parallel (24-thread
@@ -180,7 +181,7 @@ def compose_init_state(bold_loader: SubjectProfileLoader,
 
         def _decode_into(s_1, slot_idx):
             # Stream-mode load_into: per-session disk decode +
-            # normalize. blosc2 + numba both GIL-release internally.
+            # normalize. numba GIL-releases internally.
             bold_loader.load_into(s_1, scratches[slot_idx])
             return slot_idx
 

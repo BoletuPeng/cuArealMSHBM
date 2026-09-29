@@ -490,7 +490,7 @@ def prewarm_connectedness_gpu() -> None:
     """Check cooperative-launch support and the CUDA toolkit, and compile
     and link the cooperative connected-components kernel now, so a device
     or toolkit that cannot run it fails before step 0. The main module
-    compiles at its first launch."""
+    compiles when the first :class:`ConnectednessGPU` is built."""
     _compiled_modules()
 
 

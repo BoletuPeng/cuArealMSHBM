@@ -184,10 +184,11 @@ the YS-2 outlier is an `intra_em` convergence-ratio flip at the 1e-4
 threshold (2.5e-4 vs 5.2e-5 → one extra outer round). Run-to-run
 bit-reproducible (no float atomics). All three variants (cMSHBM's
 `remove_isolated` pre-predicate runs on device inside
-`ConnectednessGPU.step`). `gpu` requires seed_mesh fsaverage3 (D ≤ 2048);
-any other seed mesh is rejected at config / driver validation — select
-`backend_step3='cpu'` for it. Every backend requires w > 0 (`w·log θ`
-is NaN outside supp(θ) at w = 0).
+`ConnectednessGPU.step`). `gpu` needs D ≤ 2048 (`ceil(D/8) ≤ 256`); the
+driver accepts only seed_mesh fsaverage3 and rejects any other seed mesh
+by name — select `backend_step3='cpu'` for it — and the per-step API
+rejects D > 2048 when it reads the packed BOLD. Every backend requires
+w > 0 (`w·log θ` is NaN outside supp(θ) at w = 0).
 
 ## Wall
 

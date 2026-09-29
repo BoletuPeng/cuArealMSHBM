@@ -101,10 +101,9 @@ class EMStopSession:
     """Pre-allocated workspace + ``compute(...)`` hot path.
 
     Caches ``data.series``, ``log_theta_cost``, and per-call scratch
-    buffers; ``compute()`` allocates nothing. The cached
-    ``log_lambda_prop`` and cleaned ``spatial_connect_vmf`` are returned
-    as VIEWS into session buffers — copy if you need to keep them across
-    calls.
+    buffers; ``compute()`` allocates nothing. The cleaned
+    ``spatial_connect_vmf`` is returned as a VIEW into a session buffer
+    — copy if you need to keep it across calls.
     """
 
     __slots__ = (

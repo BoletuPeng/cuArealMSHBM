@@ -79,10 +79,13 @@ Step2Pipeline.run()  [backend == 'gpu']
 State lives on the `P = nnz(boundary_mask)` support (2.4 % of `N·L`),
 not the dense `(N, L)` grid; BOLD stays bit-packed on device and every
 contraction with it is a bit-sum plus a rank-1 term. All three outer-EM
-closure leaves and both resets moved on-device too, so the only host
-traffic per EM iter is the `(S,)` fp64 `cost_S`, and a `'gpu'` run
-never imports `step2_em_outer` at all (the pipeline's leaf imports are
-lazy — worth ~0.2 s of eager numba at import time).
+closure leaves and both resets run on device too, so per EM iter the
+host reads back only the `(S,)` fp64 `cost_S` (plus the active-support
+count) and, once per `iter_m`, a `(2 + S·T)` fp64 slot (drift, kappa,
+convergence flags); `'stream'` mode with `S > 1` adds two H2D copies of
+each subject's packed bytes. A `'gpu'` run never imports
+`step2_em_outer` at all (the pipeline's leaf imports are lazy — worth
+~0.2 s of eager numba at import time).
 
 `theta` reaches the writer as a scipy `csc_matrix` straight out of
 `export_params()`; the densify is the writer's job, not this path's, so
@@ -120,7 +123,7 @@ into the fused widen+normalize numba kernel).
 
 On binary 0/1 input the bit-packed kernel is **bit-identical** to an
 fp32 unpack-then-demean/L2-normalise (same fp32 accumulator order,
-integer popcount → fp32 mean is exact for D ≤ 2^24); the 3-pass oracle
+integer popcount → fp32 row sum is exact for D ≤ 2^24); the 3-pass oracle
 is `_normalize_session_inplace_ref` in
 `step2_io/tests/test_subject_loaders.py`.
 
@@ -476,7 +479,7 @@ the fp32→fp64 promotion to actually occur).
 | Module | Reused by | Notes |
 |---|---|---|
 | `em_stop_criterion/_cdln.py` (`_cdln_single`) | E-step phase D of the EM-iter master | Cdln, general D, 5-term Debye |
-| `m_step/_invad.py` (`invad_numba`) | L17, L18 (outer-EM closure), the EM-iter master; `dev_invad` in `step2_em_iter_master/_kernels_gpu.py` is its device form | Banerjee init, log-Bessel probe, secant polish in the root branch (κ0 below ~880 at D ≈ 1175, e.g. iter 1 m=1), asymptotic fallback. Agrees with step 3's host `invad` (scipy secant) to ~4e-4 rel in the root branch. Stock CBIG's local `invAd` computes this root / asymptotic value, discards it and returns its warm start `outu` (κ0), so neither port function is the MATLAB value. |
+| `m_step/_invad.py` (`invad_numba`) | L17, L18 (outer-EM closure), the EM-iter master; `dev_invad` in `step2_em_iter_master/_kernels_gpu.py` is its device form | Banerjee init, log-Bessel probe, secant polish in the root branch (κ0 from ~128 to ~898 at D ≈ 1175, e.g. iter 1 m=1), asymptotic fallback. Agrees with step 3's host `invad` (scipy secant) to ~4e-4 rel in the root branch. Stock CBIG's local `invAd` computes this root / asymptotic value, discards it and returns its warm start `outu` (κ0), so neither port function is the MATLAB value. |
 | `initialize_concentration/` | init Params | Bessel-root κ init |
 | `data_io/load_avg_mesh.py` | mesh | MARS_label |
 | `data_io/load_spatial_mask.py` | boundary_mask build | already returns Tuple |

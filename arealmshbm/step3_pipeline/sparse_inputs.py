@@ -657,8 +657,10 @@ def fetch_packed_bold_TND(project_dir: str | Path,
     # The profile format requires the padding bits past D to be zero
     # (docs/profile_disk_format.md): the bit-count normalisers fold all
     # 8 bits of every byte with no ``d < D`` clamp, so a set padding bit
-    # would be counted. Both in-tree writers zero the padding; verify
-    # it once per subject — a (T, N)-byte pass.
+    # would be counted, and ``acc_bits`` gathers ``s_t_nu[t, l, d]`` for
+    # every set bit, so it would read past the end of the D-long
+    # ``(t, l)`` row. Both in-tree writers zero the padding; verify it
+    # once per subject — a (T, N)-byte pass.
     pad = (-int(D)) % 8
     if pad and bool((packed[..., -1] >> np.uint8(8 - pad)).any()):
         raise ValueError(

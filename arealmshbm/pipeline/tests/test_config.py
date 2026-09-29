@@ -781,8 +781,7 @@ def test_knobs_cannot_construct_without_args() -> None:
 #
 # The GPU init kernel keeps a fixed number of per-lane accumulators;
 # ``step2_em_iter_master._kernels_gpu.check_dims`` owns the ceiling. Refusing it here
-# means the run does not die in the Session ctor, i.e. after step 0/1
-# and the whole cohort's packed-BOLD decode.
+# means the run does not die after step 0/1.
 # ─────────────────────────────────────────────────────────────────────
 _SPARSE_MAX_CLUSTERS = 512
 _SPARSE_MAX_D_GRAD = 11772

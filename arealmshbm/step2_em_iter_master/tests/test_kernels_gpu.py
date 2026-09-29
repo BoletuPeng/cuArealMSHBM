@@ -327,7 +327,8 @@ def _cpu_spatial_connect(fx, s_lambda_NL, grad_N_Dg):
 
 
 def test_connect_matches_cpu(ctx):
-    """K5a/K5b: sum_lambda / u_sq / grad_sq exact, log_connect <= 1e-5 rel."""
+    """K5a/K5b: sum_lambda exact, grad_sq within 1e-3 * max of an fp32
+    einsum, log_connect <= 1e-5 rel."""
     fx, sess = ctx["fx"], ctx["sess"]
     mod = K.module()
     L, Dg, T = fx.L, fx.D_grad, fx.T
@@ -916,7 +917,8 @@ def test_check_dims_limits():
     """The four static limits of the backend (design §3 / §9)."""
     K.check_dims(1175, 147, 300, 1174, 100)                # the production shape
     with pytest.raises(ValueError, match="fsaverage3"):
-        K.check_dims(2563, 321, 300, 2562, 100)            # fsaverage4 seed mesh
+        # Db = 321 > 256 (a fsaverage4 seed gives D=4690)
+        K.check_dims(2563, 321, 300, 2562, 100)
     with pytest.raises(ValueError, match="num_clusters"):
         K.check_dims(1175, 147, 1024, 1174, 100)
     with pytest.raises(ValueError, match="n_grad_components"):

@@ -1,9 +1,12 @@
-"""layout.py — single source of truth for paths inside a project.
+"""layout.py — path conventions inside a project.
 
-Every cross-module question about "where does X live inside the project
-dir" routes through :class:`ProjectLayout`. Existing per-step pipelines
-(Step0/1/2/3) already use these path conventions; this class makes them
-explicit and centralised so future moves only touch one file.
+The per-step pipelines (Step0/1/2/3) use the path conventions below.
+:class:`ProjectLayout` names part of them (the user inputs,
+``cohort.json``, ``group.mat``, the spatial mask, the group-prior slot
+and the run logs), and the driver takes its input, prior and log paths
+from it. Other paths are built where they are used, e.g.
+``Step0Config.gradients_out_dir`` for ``gradients/`` and
+``data_io.profile_io.profile_path`` for ``profiles_raw/``.
 
 Path conventions::
 

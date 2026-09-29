@@ -6,11 +6,12 @@ write handle, and the writer itself.
 
 Why a handle at all: nearly all of the ``savemat`` cost is the dense
 ``(N_keep, L)`` uint8 ``lambda`` going through zlib. ``lambda`` is
-written purely for MATLAB-format parity — :mod:`arealmshbm.step2_io`'s
-``load_group_mtc``, the only Python reader of this file, never touches
-it — so it must stay, but there is no reason for the caller's critical
-path to wait on it. Handing the write to a background thread removes
-it from the step-1 wall; the caller joins with ``result.writer.wait()``.
+written purely for MATLAB-format parity — neither Python reader of this
+file (:mod:`arealmshbm.step2_io`'s ``load_group_mtc`` and
+``load_step2_sparse_inputs``) uses it — so it must stay, but there is
+no reason for the caller's critical path to wait on it. Handing the
+write to a background thread removes it from the step-1 wall; the
+caller joins with ``result.writer.wait()``.
 
 The supercalls always write compressed;
 ``compress`` stays a parameter of this writer because both settings

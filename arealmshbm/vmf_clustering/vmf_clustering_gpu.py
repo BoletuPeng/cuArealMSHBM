@@ -105,11 +105,13 @@ class VmfClusteringSessionSparseCUDA:
             K.zero_rows_packed(self.packed, cp.asarray(mw))
         self.row_mean, self.row_inv = compute_row_stats(self.packed, D)
 
-        # log(θ) on P, computed on the HOST in fp64 and cast, like numba's
-        # ``float32(math.log(v))``. cupy's elementwise kernels (``log`` and
-        # even ``astype``) flush fp32 denormals to zero; θ carries a few
-        # 1e-45..1e-39 cells, which would become -Inf on device while the
-        # CPU backend has a finite ~-100 there.
+        # log(θ) on P, computed on the HOST in fp64 and cast. The CPU
+        # backend's numba ``float32(math.log(v))`` takes an fp32 ``v``, so
+        # it is an fp32 log and can differ from this by 1 ulp. cupy's
+        # elementwise kernels (``log`` and even ``astype``) flush fp32
+        # denormals to zero; θ carries a few 1e-45..1e-39 cells, which
+        # would become -Inf on device while the CPU backend has a finite
+        # ~-100 there.
         self.log_theta = cp.asarray(
             np.log(np.asarray(layout.theta, dtype=np.float64)).astype(np.float32))
         self.log_theta_cost = self.log_theta                # same values on P (θ > 0)

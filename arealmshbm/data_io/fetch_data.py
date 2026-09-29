@@ -18,9 +18,9 @@ Input artifacts (resolved against project_dir via cohort.json):
 
 Output shape contract:
     data["series"]       : (N, T, ⌈D/8⌉) uint8 — bit-packed bilateral
-                           BOLD profile, T sessions, D features. Each
-                           consumer (CPU or GPU Session) runs its own
-                           unpack + demean + L2-norm step on this
+                           BOLD profile, T sessions, D features. The
+                           consumer (the cpu VmfClusteringSession) runs
+                           its own unpack + demean + L2-norm step on this
                            buffer; the on-disk packed format flows
                            through this layer untouched (modulo MW
                            zeroing for algorithmic parity with MATLAB).
@@ -47,8 +47,8 @@ def _read_b2nd_series_packed(b2nd_path: Path,
 
     Reads the on-disk packed bytes directly — no fp32 round-trip,
     verifies shape, reorders ``(T, N, D_bytes)`` (on-disk) ->
-    ``(N, T, D_bytes)`` (the layout the GPU Session H2Ds), then
-    zeros MW rows.
+    ``(N, T, D_bytes)`` (the layout the cpu :class:`VmfClusteringSession`
+    unpacks on host), then zeros MW rows.
 
     The MW-zero pass mirrors MATLAB's CBIG_ArealMSHBM step-3 reader
     (``series(medial_mask, :) = 0;`` right after ``CBIG_MSHBM_read_fmri``,

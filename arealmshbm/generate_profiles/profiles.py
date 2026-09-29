@@ -96,8 +96,8 @@ class _SessionInputs(NamedTuple):
     mesh metadata and censor logic :func:`compute_profile_arrays` runs
     before its per-run kernels.
     """
-    lh_runs: List           # n_runs × (T, V_lh) — host numpy unless
-    rh_runs: List           # the caller pre-staged on device.
+    lh_runs: List           # n_runs × (T, V_lh) — host numpy; this
+    rh_runs: List           # leaf is CPU-only.
     n_runs: int
     censor_runs: Optional[List]   # n_runs × (T,) int32 or None per run; None when all-keep.
     lh_mars: np.ndarray
@@ -397,8 +397,8 @@ def compute_profile_arrays(seed_mesh: str,
     # vertices, which the threshold→binarize can mark as 1; the
     # bitpacked .b2nd contract + step2 SubjectProfileLoader require
     # zero rows at MW vertices. The actual clamp + shape assertion live
-    # in ``_apply_mw_zero`` so the GPU path and a no-disk unit test can
-    # exercise the same code.
+    # in ``_apply_mw_zero`` so a no-disk unit test can exercise the same
+    # code.
     _apply_mw_zero(lh_bin_KxV, rh_bin_KxV, lh_mars, rh_mars)
 
     return lh_bin_KxV, rh_bin_KxV

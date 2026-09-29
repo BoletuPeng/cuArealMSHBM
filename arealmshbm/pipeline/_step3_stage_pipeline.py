@@ -287,12 +287,13 @@ class Step3StagePipeline:
                     # Stash the pipe handle on the work item BEFORE
                     # the H2D / setup work below, so that if
                     # build_session() raises mid-construction the
-                    # SAVE stage can still call pipe.close() on the
-                    # partial Session — without this, any device
-                    # buffers H2D'd before the failure would only be
-                    # reclaimed when the local ``pipe`` reference
-                    # falls out of scope on the next loop iter
-                    # (no free_all_blocks(), pool stays sized).
+                    # SAVE stage can still call pipe.close(), which
+                    # drops the pipe's cached refs and runs
+                    # free_all_blocks(). The partial Session is not
+                    # reachable from ``pipe``: it, and whatever else
+                    # the failed call's frames hold, stays alive via
+                    # work.failure's traceback for as long as that
+                    # exception object lives.
                     work.pipe = pipe
                     with stream:
                         # load_inputs() is host-side (.mat / .b2nd
@@ -368,12 +369,13 @@ class Step3StagePipeline:
             else:
                 # Failure path: close the pipe if LOAD got far enough
                 # to construct one (work.pipe is set as soon as
-                # Step3Pipeline(...) returns). Otherwise its partial
-                # device buffers stay in the cupy pool until the
-                # local ``pipe`` ref in stage LOAD is GC'd — and
-                # free_all_blocks never runs, so the pool doesn't
-                # shrink. Swallow secondary errors; the primary
-                # failure is already captured in work.failure.
+                # Step3Pipeline(...) returns). close() drops only the
+                # pipe's own refs and frees unused pool blocks; what
+                # the failed call's frames still hold (e.g. a partial
+                # or complete Session and its inputs) stays alive via
+                # work.failure's traceback. Swallow secondary errors;
+                # the primary failure is already captured in
+                # work.failure.
                 if work.pipe is not None:
                     try:
                         work.pipe.close()

@@ -59,18 +59,19 @@ as a non-decreasing `nvidia-smi` memory curve across subjects.
 Every CPU kernel is decorated `@njit(cache=True)`. Numba persists the
 compiled object next to the source under `__pycache__/` (the standard
 gitignored cache dir — there is no separate `.numba_cache`). The cache
-is keyed on numba version + source hash, **not** on the host CPU's
-feature set. If you migrate a checkout between machines with materially
-different CPUs (e.g. clone from an AVX-512 box onto a CPU without it)
-clear the cache once so kernels recompile for the new target:
+is keyed on each kernel's signature, its bytecode and the host CPU
+(target triple, CPU name and feature set); numba discards a kernel's
+entries when the numba version or the mtime/size of the kernel's own
+source file changes. A checkout moved to a different CPU, or a numba
+upgrade, therefore recompiles by itself. The key does not cover
+`@njit` helpers called from other files (`graph_distance/_heap.py`,
+`em_stop_criterion/_cdln.py`, `m_step/_invad.py`): after editing one,
+clear the cache, or its callers keep running the old compiled copy:
 
 ```bash
-# from the repo root, on the destination machine, once after first clone:
+# from the repo root:
 find arealmshbm -type d -name __pycache__ -prune -exec rm -rf {} +
 ```
-
-Same applies if numba is upgraded across a major version. Day-to-day
-edits inside a single checkout invalidate per-file automatically.
 
 ## 4. Testing
 

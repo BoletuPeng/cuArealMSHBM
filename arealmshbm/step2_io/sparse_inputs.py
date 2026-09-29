@@ -24,7 +24,11 @@ from .sparse_layout import Step2Layout, build_step2_layout
 
 # Type of the per-subject fill callbacks. ``s_1`` is the 1-based subject
 # index (positional in cohort.json); ``out`` is a caller-owned C-contiguous
-# buffer the callback must fill completely.
+# buffer the callback must fill completely. The Session may call a
+# BoldReader from up to ``_INGEST_DEPTH`` decode-pool worker threads at
+# once, always for distinct subjects and distinct ``out`` buffers, so a
+# BoldReader must hold no mutable state shared between calls. It calls a
+# GradReader serially, on the thread that constructs the Session.
 BoldReader = Callable[[int, np.ndarray], None]      # out: (T, N, Db) uint8
 GradReader = Callable[[int, np.ndarray], None]      # out: (N, D_grad) fp32
 
@@ -43,10 +47,9 @@ class Step2SparseInputs:
     bold_reader : fills ``(T, N, Db)`` uint8 for subject ``s_1`` — the on-disk
                   bit-packed layout (LSB-first along D, padding bits zero).
                   One ``.b2nd`` decode per call, decompressed straight into
-                  the caller's buffer (~47 ms at fsaverage6 / T=6, GIL
-                  released); where the subjects then live — the device
-                  cache, or a host cache in stream mode — is the Session's
-                  decision.
+                  the caller's buffer (~47 ms at fsaverage6 / T=6); where
+                  the subjects then live — the device cache, or a host
+                  cache in stream mode — is the Session's decision.
     grad_reader : fills ``(N, D_grad)`` fp32 for subject ``s_1`` (gMSHBM);
                   ``None`` for dMSHBM.
     timings     : per-item load timings (seconds).
@@ -154,8 +157,7 @@ class Step2SparseInputs:
 #     ``(N, T, D)`` fp32 slab anywhere on this path.
 #
 # The four disk reads (BOLD header, gradient peek, group.mat, mask)
-# overlap on a 4-worker pool: blosc2's decode and the inflate both
-# release the GIL.
+# overlap on a 4-worker pool: the inflate releases the GIL.
 
 
 def _mars_masks(mesh: str) -> Tuple[np.ndarray, np.ndarray]:
@@ -224,11 +226,12 @@ def load_step2_sparse_inputs(cfg: Any, *,
                              overlap: bool = True) -> Step2SparseInputs:
     """Disk loader for the step-2 ``gpu`` backend.
 
-    Reads ``cohort.json``, the per-subject bit-packed ``.b2nd`` BOLD, the
-    per-subject gradient embeddings (gMSHBM), ``group/group.mat`` and
-    ``spatial_mask/spatial_mask_<mesh>.mat``, and returns the
-    :class:`Step2SparseInputs` the sparse Session consumes. See
-    ``docs/step2_sparse_design.md`` §5.
+    Reads ``cohort.json``, subject 1's bit-packed ``.b2nd`` header and
+    one chunk of it, subject 1's gradient dims (gMSHBM),
+    ``group/group.mat`` and ``spatial_mask/spatial_mask_<mesh>.mat``,
+    and returns the :class:`Step2SparseInputs` the sparse Session
+    consumes, whose ``bold_reader`` / ``grad_reader`` read each subject
+    when the Session pulls it. See ``docs/step2_sparse_design.md`` §5.
 
     Parameters
     ----------

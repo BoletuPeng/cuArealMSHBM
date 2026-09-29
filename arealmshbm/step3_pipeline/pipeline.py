@@ -107,7 +107,7 @@ class Step3Pipeline:
       * ``__init__(cfg)``                       — store config; no IO.
       * ``load_inputs() -> Step3Inputs``         — read everything the EM needs.
       * ``build_session(inputs)``                — construct VmfClusteringSession.
-      * ``run(inputs=None) -> Step3Result``      — execute intra_em loop (+ optional load + build).
+      * ``run(time_stages=True) -> Step3Result`` — load + build (both cached), then the intra_em loop.
       * ``save(result, out_path=None) -> Path``  — argmax + savemat.
       * ``close()``                              — release Session + Inputs refs and the
         cupy device-memory pool. **Required** between sequential subjects on

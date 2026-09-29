@@ -9,7 +9,7 @@ enum membership, the rejection message and the catalog's own copy of the
 enum, so a future rename cannot silently demote a GPU run to CPU, and
 the three static kernel limits of the GPU backend (seed mesh,
 ``num_clusters``, ``n_grad_components``) are refused at config time
-rather than after step 0/1.
+rather than in the Session ctor.
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """
@@ -79,7 +79,7 @@ def test_gpu_rejects_more_clusters_than_the_kernels_take() -> None:
     """``init_hard_labels``'s per-lane accumulators cap L (``check_dims``).
 
     Checked at config time, not at Session-ctor time: the ctor only runs
-    after step 0/1 and the whole cohort's packed-BOLD decode.
+    after the step-2 loader and the kernel compile.
     """
     with pytest.raises(ValueError, match="num_clusters <="):
         _cfg(backend="gpu", num_clusters=_SPARSE_MAX_CLUSTERS + 1)

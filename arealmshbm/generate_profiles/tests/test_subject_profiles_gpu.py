@@ -64,7 +64,7 @@ void zscore_unit_norm_columns(const float* __restrict__ x,
     //
     // We recover the centered L2 norm via the identity
     //   post_sumsq = sumsq - T * mean * mean
-    // -- same trick as step3's normalize_bold kernel. This is the
+    // -- same trick as step3's row_stats kernel (m_step_gpu.py). This is the
     // catastrophic-cancellation-prone form: when |mean| is comparable
     // to sqrt(sumsq / T), the subtraction loses ULPs. Precondition:
     // inputs must arrive demeaned upstream (CBIG preprocessing emits
