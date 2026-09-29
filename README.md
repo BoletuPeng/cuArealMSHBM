@@ -165,9 +165,10 @@ combined effect of several benign sources — BLAS reduction-order
 differences between numerical libraries (every backend has its own
 numerical noise band, and the GPU additionally shows small run-to-run
 variation), different numerical routes for the Bessel-type functions
-(ours is the closed-form `log I_ν` route, audited against mpmath; it is
-the d = 3 oracle in `arealmshbm/em_stop_criterion/tests/test_cdln_d3_oracle.py`
-for the shipped `arealmshbm/em_stop_criterion/_cdln.py`), and a few small, deliberate
+(ours evaluates `log I_ν` through closed-form and asymptotic expansions,
+audited against mpmath: `arealmshbm/em_stop_criterion/_cdln.py` on the
+CPU, the d = 3 closed form on the device, pinned bit-equal in fp32 by
+`arealmshbm/em_stop_criterion/tests/test_cdln_d3_oracle.py`), and a few small, deliberate
 implementation choices where the port diverges from the reference.
 The four-layer framework we use to judge whether differences of this
 kind are functionally meaningful is described in
@@ -203,8 +204,11 @@ page-locked ring and uploaded — so the host working set stops growing
 with the cohort; inside the end-to-end driver the process peak during
 step 2 is 2.8 GiB, most of it still held from steps 0–1. The `stream`
 mode for cohorts that do not fit in VRAM keeps one subject on the device
-and, host RAM permitting, a host cache of the packed cohort. Step 1
-drops the same host copy on every configuration.
+and, host RAM permitting, a host cache of the packed cohort. On
+`backend_step1: "gpu"` step 1 keeps no host copy of the packed cohort
+either, whatever its size: each session is folded into device sums as it
+is packed. The `cpu` backend's average reads every subject's `.b2nd`
+back into host memory.
 
 **Against v1.0.0, on this same machine.** v1.0.0 published a step-2 pair of
 794.0 s (CPU) / 156.7 s (dense GPU); those were taken at `max_iter_inter=2`,
@@ -406,7 +410,7 @@ backends carry the preconditions below:
 | key | values | notes |
 |---|---|---|
 | `backend_step0` | `cpu`, `gpu` | GPU step 0 is not bit-reproducible run to run — the measured band is in [`docs/step0_flow_and_subgraphs.md`](docs/step0_flow_and_subgraphs.md) |
-| `backend_step1` | `cpu`, `gpu` | packed profiles, averages, spatial mask and `group.mat` labels are bit-identical either way; `group.mat`'s `mtc` / `epsil` agree to within a few fp64 ULP (fp64 reduction order); `gpu` ingests BOLD through nvCOMP (`nvidia-nvcomp-cu12` required) |
+| `backend_step1` | `cpu`, `gpu` | packed profiles, averages, spatial mask and `group.mat` labels are bit-identical either way; `group.mat`'s `mtc` / `epsil` agree to within a few fp64 ULP (fp64 reduction order); `gpu` ingests BOLD through nvCOMP (`nvidia-nvcomp-cu12` required) and needs `step1.reduction_dtype: "float64"` (anything else is rejected at validation) |
 | `backend_step2` | `cpu`, `gpu` | `gpu` is the candidate-set session: it needs `seed_mesh: "fsaverage3"`, K ≤ 512 and, for gMSHBM, ≤ 11,772 gradient components — any other shape is rejected at validation, so select `cpu` for it; `psutil` required |
 | `backend_step3` | `cpu`, `gpu` | `gpu` is the candidate-set session for gMSHBM, cMSHBM and dMSHBM: it needs `seed_mesh: "fsaverage3"` (else `cpu`) and, for gMSHBM / cMSHBM, a CUDA toolkit at `CUDA_PATH` plus a device that supports cooperative launch |
 
@@ -420,12 +424,18 @@ session), and choose `"gpu"` or `"cpu"` where it said `"gpu_full"` or
 `"gpu_elambda"` (the dense GPU EM is gone; against the reference labels the
 candidate-set session ties or leads it). `w` must be ≥ 1 on every backend:
 at `w = 0` the E-step's `w · log θ` term is undefined outside the prior's
-support, in the reference implementation as well.
+support, in the reference implementation as well. Four things v2.0.0
+used only when it found them are requirements: `python-isal` (every
+backend), `nvidia-nvcomp-cu12` (`backend_step1: "gpu"`), `psutil`
+(`backend_step2: "gpu"`), and a CUDA toolkit at `CUDA_PATH` plus a device
+that supports cooperative launch (`backend_step3: "gpu"` with gMSHBM /
+cMSHBM) — select `"cpu"` for a step whose requirement the machine does
+not meet.
 
-**Upgrading a v1.0.0 project config.** Two `step2` keys are rejected at
-parse time: `backend_step2: "gpu_sparse"` (write `"gpu"` — there is no
-alias) and `enable_tf32` (delete it; it only ever scoped the dense port's
-sgemms, and `step0.enable_tf32` is unaffected). A config that already said
+**Upgrading a v1.0.0 project config.** The v2.0.0 note above applies.
+In addition, one `step2` key is rejected at parse time: `enable_tf32`
+(delete it; it only ever scoped the dense port's sgemms, and
+`step0.enable_tf32` is unaffected). A config that already said
 `backend_step2: "gpu"` still parses, but trains its prior on the
 candidate-set session — which matches the `cpu` reference, where the dense
 port did not.
@@ -450,10 +460,15 @@ original_paper.md           — algorithm reference (Kong et al. 2021)
 
 ## Requirements
 
-- Python 3.13; numba 0.63.1, numpy 2.2.6, scipy 1.16.0
-- `python-isal` (isal_zlib inflate in the GIFTI reader and the streaming
-  MAT reader) and
-  `blosc2` (`.b2nd` profile files)
+- Python 3.13; numba 0.63.1, numpy 2.2.6, scipy 1.16.0. numba must run
+  on a thread-safe threading layer (OpenMP or TBB, which it selects when
+  either runtime is present): the pipeline launches parallel kernels
+  from several threads, and numba's `workqueue` fallback layer aborts
+  the process on that
+- `python-isal` (pip name `isal`; isal_zlib inflate in the GIFTI reader
+  and the streaming MAT reader) and
+  `blosc2` (`.b2nd` profile files); `h5py` for inputs saved as MAT v7.3
+  (a group prior, a spatial mask or a gradient file)
 - For the GPU backends: CuPy 13.6.0 (all of them);
   `nvidia-nvcomp-cu12` (`backend_step1='gpu'` — its BOLD ingest is
   nvCOMP-only; a missing or unloadable install is an `ImportError`
@@ -461,8 +476,9 @@ original_paper.md           — algorithm reference (Kong et al. 2021)
   `CUDA_PATH` and a device that supports cooperative launch
   (`backend_step3='gpu'` with gMSHBM / cMSHBM — `cudadevrt` +
   `cooperative_groups.h` for the connected-components kernel; dMSHBM
-  does not use it). The driver checks nvCOMP, psutil and the CUDA
-  toolkit / cooperative launch before step 0. The
+  does not use it). The driver checks CuPy (import, CUDA device,
+  NVRTC), nvCOMP, psutil and the CUDA toolkit / cooperative launch
+  before step 0. The
   step-2 and step-3 `gpu` backends require `seed_mesh` `fsaverage3`.
 - Staged precomputed assets (installer-deployed; see
   [`arealmshbm/data/README.md`](arealmshbm/data/README.md)) and
@@ -573,7 +589,7 @@ GPU 一列所用后端：`backend_step0` / `backend_step1` / `backend_step3` = `
 
 与 v1.0.0 相比（同一台机器、同一配置），GPU 上 step 0–3 的计算耗时从 **15.8 s 降至 3.9 s（4.1×）**，来自 step-0 的 Δ-stepping SSSP 重写、step-1 融合的整被试 GPU 叶子算子，以及 step-3 的候选集后端（均为 v2.0.0 引入）；v2.1.0 在保持这一耗时的同时去掉了 step 1 与 step 2（显存常驻缓存模式）在主机内存中保留的位打包 profile 副本。6.2 s 的墙钟时间还额外包含约 0.9 s 的一次性包导入（Mode A 的最小输入检查为解析先验路径而载入 step-3 包）与约 0.6 s 的解释器启动 —— 这些是不随队列规模增长的固定开销。新进程中的重复运行稳定在 5.9–6.2 s；若 numba 缓存被删除，首次运行要多付约 7 s 的 JIT 编译；若 CuPy 内核缓存也被删除，则要先编译全部 GPU 内核（墙钟 31 s，每台机器一次）。
 
-¹ 皮层顶点，剔除内侧壁。两个 Python 后端彼此的一致率为 98.21%。MATLAB↔Python 的位级一致本就不可达：残余分歧是多个良性来源叠加的结果——不同数值库之间的 BLAS 归约顺序差异（每个后端各有自己的数值噪声带，GPU 还存在小幅的逐次运行波动）、贝塞尔类函数所采用的不同数值路径（我们采用 `log I_ν` 的闭式路径，经 mpmath 审计；它是 `arealmshbm/em_stop_criterion/tests/test_cdln_d3_oracle.py` 中的 d = 3 oracle，用于校验实际发布的 `arealmshbm/em_stop_criterion/_cdln.py`），以及移植中少数几处与参考实现有意为之的细小实现差异。我们用于判断此类差异是否具有功能意义的四层评估框架见 `docs/precision_impact_analysis.md`。
+¹ 皮层顶点，剔除内侧壁。两个 Python 后端彼此的一致率为 98.21%。MATLAB↔Python 的位级一致本就不可达：残余分歧是多个良性来源叠加的结果——不同数值库之间的 BLAS 归约顺序差异（每个后端各有自己的数值噪声带，GPU 还存在小幅的逐次运行波动）、贝塞尔类函数所采用的不同数值路径（我们通过 `log I_ν` 的闭式解与渐近展开求值，经 mpmath 审计：CPU 上是 `arealmshbm/em_stop_criterion/_cdln.py`，设备上是 d = 3 的闭式解，两者的 fp32 输出由 `arealmshbm/em_stop_criterion/tests/test_cdln_d3_oracle.py` 钉为逐位相同），以及移植中少数几处与参考实现有意为之的细小实现差异。我们用于判断此类差异是否具有功能意义的四层评估框架见 `docs/precision_impact_analysis.md`。
 
 ### Mode B —— 在本地队列上训练组先验
 
@@ -586,7 +602,7 @@ GPU 一列所用后端：`backend_step0` / `backend_step1` / `backend_step3` = `
 | step 2 在 40 被试全队列下的设备内存 | **≈ 370–490 GB RAM**（预估²） | — | **峰值 5.6 GiB / 24 GB 显存** |
 | step 2 单独运行（独立的 `arealmshbm.step2_pipeline.profile` 进程）在 40 被试全队列下的主机内存 | （同上，≈ 370–490 GB²） | 11.1 GiB | **峰值 1.1 GiB** |
 
-step 2 的 GPU 一列取自 `gpu` 后端，即候选集 session（自 v2.0.0 起；v1.0.0 中占用该名字的稠密 CuPy 移植已不存在）。该数字为新进程中的单次运行（进程内的预热重复运行为 14.1 s）。CPU 一列同样是新进程中的单次运行、48 次 EM 迭代（v2.0.0 代码在同一形状上测得 2,638.7 s；CPU 的 EM 内核代码未变，差异属于笔记本上一次 49 分钟全核运行的逐次波动）。全流程一行是两次生产运行；较快的一次中 step 2 为 14.2 s，另有 step 0 38.0 s、step 1 8.1 s、step 3 8.1 s；两次运行 5.4 s 的差值中 step 0 占 2.8 s、step 2 占 1.5 s、step 1 占 0.6 s。主机内存一行是 v2.1.0 新增的，在独立的 step-2 进程中测得：在显存常驻缓存模式下（`eager_bitpacked`；`bold_cache_mode` 为 `auto` 时，只要位打包队列、session 的常驻状态与一段安全余量放得进空闲显存就选用它），session 不再在主机内存中保留位打包队列的副本 —— 每名被试直接解码进一个两槽页锁定环形缓冲并上传 —— 主机工作集因此不再随队列规模增长；在端到端驱动器运行中，step 2 期间的进程峰值为 2.8 GiB，其中大部分是 step 0–1 遗留的内存。放不进显存的队列走 `stream` 模式：设备上只保留一名被试，并在主机内存允许时在主机内存中缓存整个位打包队列。step 1 在所有配置下都去掉了同一份主机副本。
+step 2 的 GPU 一列取自 `gpu` 后端，即候选集 session（自 v2.0.0 起；v1.0.0 中占用该名字的稠密 CuPy 移植已不存在）。该数字为新进程中的单次运行（进程内的预热重复运行为 14.1 s）。CPU 一列同样是新进程中的单次运行、48 次 EM 迭代（v2.0.0 代码在同一形状上测得 2,638.7 s；CPU 的 EM 内核代码未变，差异属于笔记本上一次 49 分钟全核运行的逐次波动）。全流程一行是两次生产运行；较快的一次中 step 2 为 14.2 s，另有 step 0 38.0 s、step 1 8.1 s、step 3 8.1 s；两次运行 5.4 s 的差值中 step 0 占 2.8 s、step 2 占 1.5 s、step 1 占 0.6 s。主机内存一行是 v2.1.0 新增的，在独立的 step-2 进程中测得：在显存常驻缓存模式下（`eager_bitpacked`；`bold_cache_mode` 为 `auto` 时，只要位打包队列、session 的常驻状态与一段安全余量放得进空闲显存就选用它），session 不再在主机内存中保留位打包队列的副本 —— 每名被试直接解码进一个两槽页锁定环形缓冲并上传 —— 主机工作集因此不再随队列规模增长；在端到端驱动器运行中，step 2 期间的进程峰值为 2.8 GiB，其中大部分是 step 0–1 遗留的内存。放不进显存的队列走 `stream` 模式：设备上只保留一名被试，并在主机内存允许时在主机内存中缓存整个位打包队列。在 `backend_step1: "gpu"` 下，step 1 同样不在主机内存中保留位打包队列的副本，且与队列规模无关：每个 session 一打包就累加进设备端的求和。`cpu` 后端求平均时会把每名被试的 `.b2nd` 读回主机内存。
 
 **与 v1.0.0 的同机对比。** v1.0.0 公布的 step 2 数字是 794.0 s（CPU）/ 156.7 s（稠密 GPU），但那是在 `max_iter_inter=2` —— 短跑基准的迭代上限 —— 下测得的，并非生产默认值 10，见 [`docs/step2_flow_and_subgraphs.md`](docs/step2_flow_and_subgraphs.md) 的 § Production-cohort walls。在 v2.0.0 代码上重跑同样的形状，`gpu` 后端为 **11.1 s**：比 v1.0.0 的 GPU 数字快 **14×**，比其 CPU 数字快 **72×**。其实测显存峰值在 `max_iter_inter=2` 与 `=10` 下**同为 6.7 GiB** —— 不随外层迭代数增长，因为候选集 session 只分配一次并全程复用。v1.0.0 的稠密 GPU 后端在同一形状下实测为 **21 GiB**，在 `inter=10` 时已溢出到主机内存；v2.0.0 将其移除，除了显存原因，也因为它的 fp32 清零（flush-to-zero）E-step 是两者中精度较低的一个。
 
@@ -683,15 +699,15 @@ Mode A 读取 `<project>/priors/<variant>/beta<B>/Params_Final.mat`（dMSHBM 为
 | 配置项 | 可选值 | 说明 |
 |---|---|---|
 | `backend_step0` | `cpu`、`gpu` | GPU 版 step 0 不保证逐次运行的位级可复现，实测波动范围见 [`docs/step0_flow_and_subgraphs.md`](docs/step0_flow_and_subgraphs.md) |
-| `backend_step1` | `cpu`、`gpu` | 位打包 profile、平均 profile、空间掩膜与 `group.mat` 的标签在两个后端上逐位一致；`group.mat` 的 `mtc` / `epsil` 一致到几个 fp64 ULP 以内（fp64 归约顺序）；`gpu` 通过 nvCOMP 读入 BOLD（需要 `nvidia-nvcomp-cu12`） |
+| `backend_step1` | `cpu`、`gpu` | 位打包 profile、平均 profile、空间掩膜与 `group.mat` 的标签在两个后端上逐位一致；`group.mat` 的 `mtc` / `epsil` 一致到几个 fp64 ULP 以内（fp64 归约顺序）；`gpu` 通过 nvCOMP 读入 BOLD（需要 `nvidia-nvcomp-cu12`），并要求 `step1.reduction_dtype: "float64"`（其他取值在校验阶段即被拒绝） |
 | `backend_step2` | `cpu`、`gpu` | `gpu` 即候选集 session：要求 `seed_mesh: "fsaverage3"`、K ≤ 512、gMSHBM 还要求梯度分量数 ≤ 11,772；其他形状在校验阶段即被拒绝，请为其选择 `cpu`；需要 `psutil` |
 | `backend_step3` | `cpu`、`gpu` | `gpu` 即候选集 session，覆盖 gMSHBM、cMSHBM 与 dMSHBM：要求 `seed_mesh: "fsaverage3"`（否则选 `cpu`）；gMSHBM / cMSHBM 还需要 `CUDA_PATH` 指向的 CUDA 工具包以及支持 cooperative launch 的设备 |
 
 设计说明与后端之间实测的一致性数据见 [`docs/step2_sparse_design.md`](docs/step2_sparse_design.md) 与 [`docs/step3_sparse_design.md`](docs/step3_sparse_design.md)。
 
-**从 v2.0.0 升级项目配置。** `backend_step3` 只接受 `cpu` 与 `gpu`：原来写 `"gpu_sparse"` 的请改写为 `"gpu"`（同一个 session）；原来写 `"gpu_full"` 或 `"gpu_elambda"` 的请改为 `"gpu"` 或 `"cpu"`（稠密 GPU EM 已不存在；对照参考实现的标签，候选集 session 与它持平或更优）。`w` 在所有后端上都必须 ≥ 1：`w = 0` 时 E-step 的 `w · log θ` 项在先验支撑集之外没有定义，参考实现同样如此。
+**从 v2.0.0 升级项目配置。** `backend_step3` 只接受 `cpu` 与 `gpu`：原来写 `"gpu_sparse"` 的请改写为 `"gpu"`（同一个 session）；原来写 `"gpu_full"` 或 `"gpu_elambda"` 的请改为 `"gpu"` 或 `"cpu"`（稠密 GPU EM 已不存在；对照参考实现的标签，候选集 session 与它持平或更优）。`w` 在所有后端上都必须 ≥ 1：`w = 0` 时 E-step 的 `w · log θ` 项在先验支撑集之外没有定义，参考实现同样如此。v2.0.0 中"找得到才用"的四项依赖是硬性要求：`python-isal`（所有后端）、`nvidia-nvcomp-cu12`（`backend_step1: "gpu"`）、`psutil`（`backend_step2: "gpu"`），以及 `CUDA_PATH` 指向的 CUDA 工具包加上支持 cooperative launch 的设备（`backend_step3: "gpu"` 搭配 gMSHBM / cMSHBM）—— 机器不满足某一步的要求时，请为该步选择 `"cpu"`。
 
-**从 v1.0.0 升级项目配置。** `step2` 块中有两个键会在解析阶段被拒绝：`backend_step2: "gpu_sparse"`（请改写为 `"gpu"` —— 没有保留别名）与 `enable_tf32`（直接删除；它从来只作用于稠密移植的 sgemm，`step0.enable_tf32` 不受影响）。原本就写 `backend_step2: "gpu"` 的配置仍可解析，但其组先验由候选集 session 训练 —— 后者与 `cpu` 参考实现一致，而稠密移植并不一致。
+**从 v1.0.0 升级项目配置。** 上面 v2.0.0 的说明同样适用。此外，`step2` 块中有一个键会在解析阶段被拒绝：`enable_tf32`（直接删除；它从来只作用于稠密移植的 sgemm，`step0.enable_tf32` 不受影响）。原本就写 `backend_step2: "gpu"` 的配置仍可解析，但其组先验由候选集 session 训练 —— 后者与 `cpu` 参考实现一致，而稠密移植并不一致。
 
 ## 仓库结构
 
@@ -713,9 +729,9 @@ original_paper.md           — 算法出处（Kong et al. 2021）
 
 ## 环境要求
 
-- Python 3.13；numba 0.63.1、numpy 2.2.6、scipy 1.16.0
-- `python-isal`（GIFTI 读取器与流式 MAT 读取器中的 isal_zlib 解压）与 `blosc2`（`.b2nd` profile 文件）
-- GPU 后端：CuPy 13.6.0（全部 GPU 后端）；`nvidia-nvcomp-cu12`（`backend_step1='gpu'` —— 其 BOLD 读入只走 nvCOMP，未安装或无法加载会在 step 0 之前以 `ImportError` 报错）；`psutil`（`backend_step2='gpu'`）；`CUDA_PATH` 指向的 CUDA 工具包以及支持 cooperative launch 的设备（`backend_step3='gpu'` 搭配 gMSHBM / cMSHBM —— 连通分量内核需要 `cudadevrt` 与 `cooperative_groups.h`；dMSHBM 不使用它）。驱动器会在 step 0 之前检查 nvCOMP、psutil 以及 CUDA 工具包 / cooperative launch。step 2 与 step 3 的 `gpu` 后端要求 `seed_mesh` 为 `fsaverage3`。
+- Python 3.13；numba 0.63.1、numpy 2.2.6、scipy 1.16.0。numba 必须运行在线程安全的线程层上（OpenMP 或 TBB；两者任一运行时存在时 numba 会自动选用）：流水线会从多个线程发起并行内核，numba 的后备线程层 `workqueue` 遇到这种情况会直接中止进程
+- `python-isal`（pip 包名为 `isal`；GIFTI 读取器与流式 MAT 读取器中的 isal_zlib 解压）与 `blosc2`（`.b2nd` profile 文件）；以 MAT v7.3 保存的输入（组先验、空间掩膜或梯度文件）需要 `h5py`
+- GPU 后端：CuPy 13.6.0（全部 GPU 后端）；`nvidia-nvcomp-cu12`（`backend_step1='gpu'` —— 其 BOLD 读入只走 nvCOMP，未安装或无法加载会在 step 0 之前以 `ImportError` 报错）；`psutil`（`backend_step2='gpu'`）；`CUDA_PATH` 指向的 CUDA 工具包以及支持 cooperative launch 的设备（`backend_step3='gpu'` 搭配 gMSHBM / cMSHBM —— 连通分量内核需要 `cudadevrt` 与 `cooperative_groups.h`；dMSHBM 不使用它）。驱动器会在 step 0 之前检查 CuPy（导入、CUDA 设备、NVRTC）、nvCOMP、psutil 以及 CUDA 工具包 / cooperative launch。step 2 与 step 3 的 `gpu` 后端要求 `seed_mesh` 为 `fsaverage3`。
 - 已部署的预计算资产（由安装程序部署；见[`arealmshbm/data/README.md`](arealmshbm/data/README.md)），以及指向 `<targ_mesh>/label/` 下含 Schaefer2018 + aparc `.annot` 文件目录的 `MSHBM_ATLAS_DIR`（图谱目录在运行时的唯一用途）
 
 BOLD 输入仅支持 GIFTI `.func.gii`。
