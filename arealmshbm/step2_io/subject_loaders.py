@@ -360,15 +360,7 @@ class SubjectProfileLoader:
         invariant — MW rows trip the ``has_zero`` gate and stay at
         their demeaned value (which is 0 for an all-zero row).
         """
-        D_bytes = (D + 7) // 8
-        packed_NTDb = np.empty((N, T, D_bytes), dtype=np.uint8)
-        pview = self._open_b2nd(s)
-        try:
-            for t in range(T):
-                # (N, D_bytes) uint8 chunk decode — zero fp32 cost.
-                packed_NTDb[:, t, :] = np.asarray(pview[t])
-        finally:
-            del pview
+        packed_NTDb = self._read_packed_from_b2nd(s, N, T, D)
         _widen_normalize_bitpacked_to_f32_NTD_kernel(
             packed_NTDb, out, np.int64(D),
         )

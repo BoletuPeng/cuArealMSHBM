@@ -544,6 +544,21 @@ def read_fields(path: str | Path,
     return got
 
 
+_HDF5_SIGNATURE = b"\x89HDF\r\n\x1a\n"
+
+
+def _is_hdf5(raw: bytes) -> bool:
+    """Whether ``raw`` carries an HDF5 superblock: its signature sits at
+    offset 0 or at 512 * 2**k (MATLAB v7.3 writes a 512-byte userblock).
+    """
+    off = 0
+    while off + 8 <= len(raw):
+        if raw[off:off + 8] == _HDF5_SIGNATURE:
+            return True
+        off = 512 if off == 0 else off * 2
+    return False
+
+
 def read_sparse(path: str | Path, name: str):
     """Read one top-level variable as a scipy ``csc_matrix``.
 
@@ -582,9 +597,11 @@ def read_sparse(path: str | Path, name: str):
     try:
         m = loadmat(str(p), squeeze_me=False)
     except (NotImplementedError, ValueError):
-        import h5py
-        if not h5py.is_hdf5(str(p)):
+        # Only an HDF5 file goes to h5py; anything else keeps scipy's
+        # own error.
+        if not _is_hdf5(raw):
             raise
+        import h5py
         LAST_PATH = "h5py"
         with h5py.File(p, "r") as f:
             if nm_want not in f:

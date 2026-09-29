@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import os
 import struct
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -237,6 +238,36 @@ def test_not_a_mat_file_falls_back(tmp_path: Path) -> None:
     with pytest.raises(Exception):
         ms.read_fields(p, {"a"})
     assert ms.LAST_PATH == "scipy"
+
+
+def test_read_sparse_keeps_scipys_error_for_a_non_mat_file(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A file that is neither MAT v5 nor HDF5 never reaches ``h5py``:
+    the error is scipy's, with or without ``h5py`` installed."""
+    p = tmp_path / "mask.mat"
+    p.write_bytes(b"<!DOCTYPE html>\n<html><body>not found</body></html>\n"
+                  * 8)
+    monkeypatch.setitem(sys.modules, "h5py", None)
+    with pytest.raises(ValueError, match="Unknown mat file type"):
+        ms.read_sparse(p, "lh_boundary")
+
+
+@pytest.mark.parametrize("userblock", [0, 512, 1024])
+def test_is_hdf5_finds_the_superblock(userblock: int) -> None:
+    raw = b"\x01" * userblock + ms._HDF5_SIGNATURE + b"\x00" * 64
+    assert ms._is_hdf5(raw)
+    assert not ms._is_hdf5(b"\x01" * (userblock + 72))
+
+
+def test_read_sparse_sends_an_hdf5_file_to_h5py(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A raw HDF5 file is an h5py read, so without ``h5py`` the error
+    names the package."""
+    p = tmp_path / "mask_v73.mat"
+    p.write_bytes(ms._HDF5_SIGNATURE + b"\x00" * 4096)
+    monkeypatch.setitem(sys.modules, "h5py", None)
+    with pytest.raises(ImportError, match="h5py"):
+        ms.read_sparse(p, "lh_boundary")
 
 
 # ─────────────────────────────────────────────────────────────────────

@@ -20,6 +20,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import pytest
 from numba import njit, prange
 
 from arealmshbm.data_io.cohort import (
@@ -157,6 +158,37 @@ def test_profile_loader_load_into_zero_alloc(tmp_path: Path) -> None:
     for s_1 in range(1, S + 1):
         loader.load_into(s_1, scratch)
         np.testing.assert_array_equal(scratch, loader.load(s_1))
+
+
+# ─────────────────────────────────────────────────────────────────────
+# SubjectProfileLoader — every subject is checked against subject 1
+# ─────────────────────────────────────────────────────────────────────
+@pytest.mark.parametrize("cache_mode", ["stream", "eager_bitpacked"])
+@pytest.mark.parametrize("sub2_T,sub2_D,match", [
+    (4, 40, "packed shape"),       # a longer file left by another run
+    (2, 40, "packed shape"),
+    (3, 39, "D_unpacked"),         # same byte width, another D
+    (3, 48, "D_unpacked"),
+])
+def test_profile_loader_rejects_a_subject_unlike_subject_1(
+        tmp_path: Path, cache_mode: str, sub2_T: int, sub2_D: int,
+        match: str) -> None:
+    S, T, N, D = 2, 3, 9, 40
+    _, cohort = _build_b2nd_fixture(tmp_path, S, T, N, D)
+    rng = np.random.default_rng(11)
+    other = (rng.random((sub2_T, N, sub2_D)) < 0.1).astype(np.float32)
+    write_subject_profile_tnd(
+        profile_path(tmp_path, "2", "fsaverage6", "fsaverage3"),
+        np.ascontiguousarray(other))
+
+    loader = SubjectProfileLoader(
+        cohort=cohort, project_dir=tmp_path,
+        targ_mesh="fsaverage6", seed_mesh="fsaverage3",
+        cache_mode=cache_mode,
+    )
+    assert loader.load(1).shape == (N, T, D)
+    with pytest.raises(ValueError, match=match):
+        loader.load(2)
 
 
 # ─────────────────────────────────────────────────────────────────────
