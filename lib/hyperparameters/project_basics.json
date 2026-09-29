@@ -127,7 +127,7 @@
       "default": "fsaverage3",
       "source": "arealmshbm/pipeline/inputs.py (BoldInputs.seed_mesh)",
       "description": "Seed mesh for step1 RSFC profile.",
-      "notes": "Drives D = 1175 / 4661 / 18715 verts respectively."
+      "notes": "Drives D = 1175 / 4690 / 18741 verts respectively."
     },
     {
       "key": "bold_inputs.subjects",
