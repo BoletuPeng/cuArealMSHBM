@@ -3,8 +3,7 @@
 Per-source Δ-stepping SSSP for ``gradient_geodesic_distance`` — one CTA
 per source, distance rows in L2-resident global memory, the frontier as
 a pair of shared-memory bitmasks drained through a compacted int32
-worklist. The GPU solver since 2026-09, when it replaced a bit-identical
-batched pull-based Bellman-Ford. Run-to-run deterministic: ``min`` and
+worklist. Run-to-run deterministic: ``min`` and
 ``atomicMin`` are order-free, so the fixed point of
 ``d[u] = min_v fl(d[v] + w(v, u))`` does not depend on the relaxation
 schedule.
@@ -45,10 +44,7 @@ DEFAULT_DELTA_MULT = 3.0
 # bitmasks, the int32 worklist and 16 B of bookkeeping. The 48 KiB
 # static limit therefore bounds N; MAX_N is that bound at DEFAULT_CAP
 # (188352, above fsaverage7's 163842, so no supported mesh reaches it)
-# and :func:`get_delta_module` refuses the actual (N, cap) pair. The
-# worklist was int16 -- N < 32768 -- while a Bellman-Ford fallback
-# existed for larger meshes; widened when that fallback was removed
-# (2026-09): bit-neutral, same register count, same wall.
+# and :func:`get_delta_module` refuses the actual (N, cap) pair.
 _SMEM_STATIC_LIMIT = 48 * 1024
 
 
@@ -68,8 +64,8 @@ _SRC = r"""
 #define NREAD %(NREAD)d
 #define INF_BITS 0x7f800000u
 
-// ─────────────────────────────────────────────────────────────────────
-// Kernel 0 — neighbour-table topology probe.
+// ---------------------------------------------------------------------
+// Kernel 0 - neighbour-table topology probe.
 //
 // The relax step PUSHES along `v -> nbors[v]`, so an asymmetric table
 // describes the transposed graph and is a hard error (see the module
@@ -81,7 +77,7 @@ _SRC = r"""
 // it runs first. At N = 12962 / M = 6 that is 466k int loads, paid
 // once per call on the neighbour table only -- not once per gradient
 // field.
-// ─────────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------
 extern "C" __global__ void probe_topology(
         const int* __restrict__ vertex_nbors,   // (N, MSLOT) int32, 1-indexed
         int N,
@@ -104,14 +100,14 @@ extern "C" __global__ void probe_topology(
 }
 
 
-// ─────────────────────────────────────────────────────────────────────
-// Kernel 1 — fuse vertex_nbors + grad_data into the packed edge table.
+// ---------------------------------------------------------------------
+// Kernel 1 - fuse vertex_nbors + grad_data into the packed edge table.
 //
 // tab[v * SLOTS + m] = { u, bitcast<int>((g[v] + g[u]) * 0.5f) } for the
 // m-th neighbour of v, and { -1, 0 } for absent / padding slots. One
 // thread per vertex: SLOTS is a compile-time 8 so the store is a clean
 // 64 B block and the loop unrolls away.
-// ─────────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------
 extern "C" __global__ void build_edge_table(
         const int*   __restrict__ vertex_nbors,   // (N, MSLOT) int32, 1-indexed
         const float* __restrict__ grad_data,      // (N,) fp32
@@ -140,26 +136,26 @@ extern "C" __global__ void build_edge_table(
 }
 
 
-// ─────────────────────────────────────────────────────────────────────
-// Kernel 2 — per-source Δ-stepping SSSP.
+// ---------------------------------------------------------------------
+// Kernel 2 - per-source Delta-stepping SSSP.
 //
 // grid : any number of CTAs; each grid-strides over sources [0, NS).
-//        Sized as blocks_per_sm × SM count so the live set of distance
+//        Sized as blocks_per_sm x SM count so the live set of distance
 //        rows stays inside L2 instead of thrashing it.
 // block: TPB threads (64). Shared state per CTA:
-//        mnear[NW], mfar[NW]  frontier bitmasks   (2 × 1624 B)
+//        mnear[NW], mfar[NW]  frontier bitmasks   (2 x 1624 B)
 //        list[CAP]            compacted worklist  (2048 B)
 //        cnt[2], minfar, smax bookkeeping
 //        => 5312 B/CTA at the shipped NW/CAP (1624 + 1624 + 2048 + 16),
 //        confirmed by the compiled kernel (38 registers, 5312 B), i.e.
 //        19 CTAs/SM by shared memory (100 KB/SM) and 24 by threads.
-//        The launch uses 16/SM on purpose — see DEFAULT_BLOCKS_PER_SM.
+//        The launch uses 16/SM on purpose - see DEFAULT_BLOCKS_PER_SM.
 //
 // gmax accumulates the global max |dist| as a raw fp32 bit pattern via
 // atomicMax on uint32. Distances are non-negative so the IEEE-754 bit
 // pattern orders exactly like the float, and +inf (0x7f800000) is the
-// largest value — which doubles as the disconnected-mesh detector.
-// ─────────────────────────────────────────────────────────────────────
+// largest value - which doubles as the disconnected-mesh detector.
+// ---------------------------------------------------------------------
 extern "C" __global__ void sssp_delta_rows(
         float*        __restrict__ Drows,   // (NS, N) fp32 source-major work buffer
         const int2*   __restrict__ tab,     // (N, SLOTS) packed edges
@@ -207,7 +203,7 @@ extern "C" __global__ void sssp_delta_rows(
         while (true) {
             // cnt is double buffered on the round parity so the reset of
             // the *next* round's counter can be issued before the barrier
-            // that publishes this round's count — 2 barriers per round
+            // that publishes this round's count - 2 barriers per round
             // instead of 3.
             const int cur = it & 1;
 
@@ -254,7 +250,7 @@ extern "C" __global__ void sssp_delta_rows(
                 if (lmin != INF_BITS) atomicMin(&minfar, lmin);
                 __syncthreads();
                 const unsigned int mf = minfar;   // warp-uniform after the barrier
-                if (mf == INF_BITS) break;        // both piles empty → converged
+                if (mf == INF_BITS) break;        // both piles empty -> converged
                 thrb = __float_as_uint(__uint_as_float(mf) + delta);
                 // pass B: promote everything at or below the new bound. The
                 // `<=` (not `<`) guarantees the minimum itself moves, so the
@@ -283,7 +279,7 @@ extern "C" __global__ void sssp_delta_rows(
             for (int i = tid; i < n; i += TPB) {
                 const int v = list[i];
                 const float dv = __ldcg(dist + v);
-                // NPAIR × 16 B covers all MSLOT neighbours (two {u,w} pairs
+                // NPAIR x 16 B covers all MSLOT neighbours (two {u,w} pairs
                 // per int4); the whole 64 B vertex block is 2 L2 sectors.
                 const int4* p = (const int4*)(tab + (size_t)v * SLOTS);
                 int4 blk[NPAIR];
@@ -330,14 +326,14 @@ extern "C" __global__ void sssp_delta_rows(
 }
 
 
-// ─────────────────────────────────────────────────────────────────────
-// Kernel 3 — 32×32 tiled transpose with the normalisation multiply
+// ---------------------------------------------------------------------
+// Kernel 3 - 32x32 tiled transpose with the normalisation multiply
 // fused into the store (saves a full 1.34 GB read+write pass).
 //
 // The 33-wide shared tile skews the column stride by one bank so the
 // transposed read ``tile[threadIdx.x][threadIdx.y + j]`` is conflict
 // free; both the load and the store are 128 B coalesced.
-// ─────────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------
 extern "C" __global__ void transpose_scale(
         const float* __restrict__ in,    // (N, N) source-major
         float*       __restrict__ out,   // (N, N) destination-major

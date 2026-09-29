@@ -13,14 +13,14 @@ Input artifacts (resolved against project_dir via cohort.json):
     * ``subjects[subid-1].profile_b2nd`` — bitpacked per-subject .b2nd
       (one file, all T sessions).
     * ``subjects[subid-1].gradient_lh`` / ``gradient_rh`` — per-hemi
-      diffusion-embedding (``.npy`` from step0, or legacy ``.mat`` from
+      diffusion-embedding (``.npy`` from step0, or ``.mat`` from CBIG
       MATLAB step0; reader sniffs the suffix).
 
 Output shape contract:
     data["series"]       : (N, T, ⌈D/8⌉) uint8 — bit-packed bilateral
-                           BOLD profile, T sessions, D features. Each
-                           consumer (CPU or GPU Session) runs its own
-                           unpack + demean + L2-norm step on this
+                           BOLD profile, T sessions, D features. The
+                           consumer (the cpu VmfClusteringSession) runs
+                           its own unpack + demean + L2-norm step on this
                            buffer; the on-disk packed format flows
                            through this layer untouched (modulo MW
                            zeroing for algorithmic parity with MATLAB).
@@ -47,8 +47,8 @@ def _read_b2nd_series_packed(b2nd_path: Path,
 
     Reads the on-disk packed bytes directly — no fp32 round-trip,
     verifies shape, reorders ``(T, N, D_bytes)`` (on-disk) ->
-    ``(N, T, D_bytes)`` (the layout the GPU Session H2Ds), then
-    zeros MW rows.
+    ``(N, T, D_bytes)`` (the layout the cpu :class:`VmfClusteringSession`
+    unpacks on host), then zeros MW rows.
 
     The MW-zero pass mirrors MATLAB's CBIG_ArealMSHBM step-3 reader
     (``series(medial_mask, :) = 0;`` right after ``CBIG_MSHBM_read_fmri``,
@@ -61,9 +61,9 @@ def _read_b2nd_series_packed(b2nd_path: Path,
     Stores packed before that clamp are **not** MW-zero and the pass
     is load-bearing there: an internal sub-001 dev store written
     2026-05-17 has 1 098 864 of 6 153 714 MW bytes non-zero,
-    measured 2026-09-07. The
-    ``gpu_sparse`` backend does not come through here and zeros MW on
-    device instead.
+    measured 2026-09-07. The step-3
+    ``gpu`` backend does not come through here and zeros MW on device
+    instead.
 
     Returns ``(packed_NTD_bytes, D_unpacked)``. Raises ``ValueError``
     on shape mismatch.
@@ -102,15 +102,15 @@ def _read_b2nd_series_packed(b2nd_path: Path,
     return out, int(D)
 
 
-def _read_gradient_emb(path: str | Path, n_components: int = 100) -> np.ndarray:
-    """Load a CBIG diffusion-embedding gradient ``.mat`` or ``.npy`` →
-    ``(N_hemi, n_components)`` fp32 C-contig.
+def read_gradient_emb(path: str | Path, n_components: int = 100) -> np.ndarray:
+    """Load a per-hemisphere diffusion-embedding gradient ``.npy`` or
+    ``.mat`` → ``(N_hemi, n_components)`` fp32 C-contig.
 
-    Auto-detects format from the suffix:
+    The one gradient reader for steps 2 and 3. Format from the suffix:
 
       * ``.npy`` — raw fp32 ndarray written by step0. ~6× faster to
         load than the MATLAB struct path.
-      * ``.mat`` — legacy CBIG file with an ``emb`` field. Both v5/v7
+      * ``.mat`` — CBIG MATLAB file with an ``emb`` field. Both v5/v7
         (``scipy.io.loadmat``) and v7.3 (``h5py``) are supported.
 
     The cohort.json roster records the exact path written by step0 /
@@ -125,20 +125,25 @@ def _read_gradient_emb(path: str | Path, n_components: int = 100) -> np.ndarray:
 
     if suffix == ".npy":
         emb = np.load(p)
-        if emb.ndim != 2:
-            raise ValueError(
-                f"gradient .npy must be 2-D; got shape {emb.shape} from {p}"
-            )
     else:
         try:
             from scipy.io import loadmat
             m = loadmat(p, squeeze_me=False)
-            emb = np.asarray(m["emb"])
         except (NotImplementedError, ValueError):
             import h5py
             with h5py.File(p, "r") as f:
+                if "emb" not in f:
+                    raise KeyError(f"gradient mat missing 'emb' field: {p}")
                 # h5py is transposed wrt MATLAB.
                 emb = np.asarray(f["emb"]).T
+        else:
+            if "emb" not in m:
+                raise KeyError(f"gradient mat missing 'emb' field: {p}")
+            emb = np.asarray(m["emb"])
+    if emb.ndim != 2:
+        raise ValueError(
+            f"gradient emb must be 2-D; got shape {emb.shape} from {p}"
+        )
     if emb.shape[1] < n_components:
         raise ValueError(
             f"gradient emb has {emb.shape[1]} cols; need >= {n_components} "
@@ -166,11 +171,9 @@ def fetch_data(project_dir: str | Path,
     manifest — no probing, no .txt manifests.
 
     BOLD is always returned bit-packed ``(N, T, ⌈D/8⌉) uint8`` plus
-    ``D_unpacked``. Each consumer (CPU / gpu_elambda / gpu_full
-    :class:`VmfClusteringSession`) runs its own unpack + demean +
-    L2-norm step on this buffer — host-side via
-    :func:`arealmshbm.data_io.bitpacked_norm.unpack_normalize_packed_NTD_host`
-    for CPU paths, on-device via the fused CUDA kernel for gpu_full.
+    ``D_unpacked``. The consumer, the cpu :class:`VmfClusteringSession`,
+    runs its own unpack + demean + L2-norm step on this buffer via
+    :func:`arealmshbm.data_io.bitpacked_norm.unpack_normalize_packed_NTD_host`.
 
     Parameters
     ----------
@@ -298,9 +301,9 @@ def fetch_data(project_dir: str | Path,
         )
     elif with_gradient:
         with ThreadPoolExecutor(max_workers=2) as ex:
-            f_lh = ex.submit(_read_gradient_emb, lh_grad_path,
+            f_lh = ex.submit(read_gradient_emb, lh_grad_path,
                               n_grad_components)
-            f_rh = ex.submit(_read_gradient_emb, rh_grad_path,
+            f_rh = ex.submit(read_gradient_emb, rh_grad_path,
                               n_grad_components)
             packed_NTD, D_unpacked = _read_b2nd_series_packed(
                 b2nd_path, T, N, lh_mw, rh_mw,

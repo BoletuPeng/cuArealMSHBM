@@ -3,21 +3,19 @@
   "schema_version": "1",
   "description": "Step 3 - single-subject parcellation EM. All three variants supported with per-entry applies_to_variants gating.",
   "source_note": "`source` fields name the file owning the field's authoritative default. Line numbers are intentionally omitted — they drift on every reformat and the file/symbol name is the stable contract.",
-  "range_policy": "advisory — `min`/`max` fields are UI hints documenting the values authors have validated; the parser/validator enforces only positivity (numeric fields) and enum membership (enum fields). Out-of-range-but-positive values are accepted at parse time.",
+  "range_policy": "advisory — `min`/`max` fields are UI hints documenting the values authors have validated; the parser/validator enforces only positivity (numeric fields), finiteness (float fields: NaN and Infinity are refused) and enum membership (enum fields). Out-of-range values that are positive and finite are accepted at parse time.",
   "entries": [
     {
       "key": "backend_step3",
       "type": "enum",
       "values": [
         "cpu",
-        "gpu_elambda",
-        "gpu_full",
-        "gpu_sparse"
+        "gpu"
       ],
       "default": "cpu",
       "source": "arealmshbm/pipeline/config.py (PipelineConfig.backend_step3)",
-      "description": "step3 backend.",
-      "notes": "gpu_full recommended default GPU backend (fused unpack+normalize for bitpacked BOLD). gpu_sparse: opt-in candidate-set EM on the theta support, ~10x faster than gpu_full, gMSHBM/dMSHBM only, requires bold_inputs.json seed_mesh='fsaverage3' (the packed-BOLD kernels cap ceil(D/8) at 256); validated against the stock-MATLAB reference on the 10-subject YS cohort (see docs/step3_sparse_design.md)."
+      "description": "step3 backend. 'cpu' is the numba session (VmfClusteringSession), the numerical reference. 'gpu' is the candidate-set EM on the theta support (VmfClusteringSessionSparseCUDA): BOLD stays bit-packed on device and the whole intra_em loop is device-resident.",
+      "notes": "'gpu' contract: docs/step3_sparse_design.md; all three variants, run-to-run deterministic; MATLAB-reference agreement in its section 3. 'gpu' requires seed_mesh 'fsaverage3' in bold_inputs.json (the packed-BOLD kernels cap ceil(D/8) at 256); any other configuration is rejected at config / driver validation, so select backend_step3='cpu' for it."
     },
     {
       "key": "step3.connect_th",
@@ -106,12 +104,12 @@
       "max": 50,
       "unit": "vertices",
       "default": 5,
-      "source": "arealmshbm/step3_pipeline/config.py (Step3Config.cMSHBM_isolated_component_min_size) ; arealmshbm/vmf_clustering/vmf_clustering.py (VmfClusteringSession.cMSHBM_isolated_component_min_size)",
+      "source": "arealmshbm/step3_pipeline/config.py (Step3Config.cMSHBM_isolated_component_min_size) ; arealmshbm/vmf_clustering/vmf_clustering.py (VmfClusteringSession.cMSHBM_isolated_component_min_size) ; arealmshbm/vmf_clustering/vmf_clustering_gpu.py (VmfClusteringSessionSparseCUDA -> ConnectednessGPU.isolated_component_min_size)",
       "applies_to_variants": [
         "cMSHBM"
       ],
       "description": "Minimum component size for cMSHBM remove_isolated_surface_components.",
-      "notes": "Threaded through to both inner pre_predicate (vmf_clustering) and outer final (step3_pipeline.save) call sites."
+      "notes": "Threaded through to both inner pre_predicate (vmf_clustering; on gpu the device port in check_connectedness/connectedness_gpu.py) and outer final (step3_pipeline.save) call sites."
     }
   ]
 }

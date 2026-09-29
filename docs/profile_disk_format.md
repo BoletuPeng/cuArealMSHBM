@@ -2,8 +2,9 @@
 
 `profiles_raw/sub<S>/sub<S>_<targ>_roi<seed>.profile.b2nd` is the
 production format for the binary 0/1 RSFC profile that step1 emits and
-step1's avg_profiles / step2's BOLD loader / step3's `fetch_data`
-consume. One on-disk format: **bitpacked uint8**.
+step1's avg_profiles / step2's BOLD loader / step3's `fetch_data` (`cpu`)
+and `fetch_packed_bold_TND` (`gpu`) consume. One on-disk format:
+**bitpacked uint8**.
 
 ## Format
 
@@ -59,15 +60,23 @@ at the end owes one chunk instead of the whole subject.
 |----------------------------------------------|----------------------------------|-------|
 | `open_subject_profile_packed_tnd(p)`         | `blosc2.NDArray` (lazy, packed)  | `arr[t] -> (N, ⌈D/8⌉) uint8`, zero unpack cost. Carries `.D_unpacked` (int). |
 | `read_subject_profile_packed_tnd(p)`         | `(packed, D_unpacked)`           | One-shot full-load packed. |
+| `decode_subject_profile_packed_into(h, out)` | `None`                           | Decompress the whole payload behind an open handle straight into a caller-owned C-contiguous uint8 `(T, N, ⌈D/8⌉)` buffer (pinned or pageable); no intermediate array. |
 
-Only bit-packed readers are exposed — the legacy fp32-view path
-(`read_subject_profile_tnd` / `open_subject_profile_tnd` /
-`SubjectProfileFp32View`) was removed 2026-06. Every consumer fuses
-`bit-unpack → demean → L2-norm` in a single numba/RawKernel pass
-straight from the packed bytes; the unpack-to-fp32-then-normalize
-reference would otherwise materialize a ~2.3 GB (T, N, D) intermediate
-at fsa6 T=6. (The step2 CPU stream-mode loader still allocates a
-small ~72 MB (N, T, ⌈D/8⌉) **packed** transient per subject visit
+Only bit-packed readers are exposed. Host consumers that normalize
+(the step-2 `cpu` loader, step-3 `cpu`) fuse `bit-unpack → demean →
+L2-norm` in one numba pass straight from the packed bytes; step-1
+`avg_profiles` only accumulates set bits; the GPU consumers (step-1 avg
+accumulate, step-2 and step-3 `gpu`) popcount or
+bit-select-sum the packed bytes directly (padding bits must be zero).
+The one exception is step-2 `gpu`'s iteration-1 out-of-P row max (K7,
+only while `theta_out != 0`): `widen_exact` expands 8192-row tiles into
+a normalized fp32 `(tile, T·D)` slab (~230 MB at T=6, D=1175) for a
+cuBLAS sgemm; the one-tile slab is reused across subjects and freed
+after iteration 1's last subject — never a whole-subject (N, T, D)
+array.
+The unpack-to-fp32-then-normalize reference would otherwise materialize
+a ~2.3 GB (T, N, D) intermediate at fsa6 T=6. (The step2 CPU
+stream-mode loader allocates a small ~72 MB (N, T, ⌈D/8⌉) **packed** transient per subject visit
 so the fused kernel can consume the whole subject's packed bytes in
 one pass — that's the buffer the kernel reads, not a widened fp32
 copy, so it stays at the 1-bit/cell density.)
@@ -75,40 +84,41 @@ copy, so it stays at the 1-bit/cell density.)
 ## Consumers
 
 The .b2nd format is the **sole** on-disk BOLD source — every consumer
-discovers it via `cohort.json` and reads it directly. No legacy
-nii.gz fallback.
+discovers it via `cohort.json` and reads it directly.
 
 Step 2's `gpu` backend reads the packed bytes straight into its device
 cache (`step2_io/sparse_inputs.py`, `bold_reader`); the `cpu` backend's
 `SubjectProfileLoader` widens them through the fused numba kernel.
 
-Step3's `fetch_data` always returns `(N, T, ⌈D/8⌉) uint8` plus
-`D_unpacked`; each backend's :class:`VmfClusteringSession` runs its
-own unpack+normalize on this payload:
+Step 3 reads the same bytes two ways, one per backend:
 
-* `gpu_full`: on-device fused `bit-unpack → demean → L2-norm` kernel
-  `_normalize_bold_NTD_from_packed` in
-  [`vmf_clustering_gpu.py`](arealmshbm/vmf_clustering/vmf_clustering_gpu.py).
-  H2D ships packed bytes only — 8× smaller than the fp32 alternative.
-* `cpu` / `gpu_elambda`: host numba kernel
-  `_normalize_session_bitpacked_numba` in
-  [`bitpacked_norm.py`](arealmshbm/data_io/bitpacked_norm.py), called
-  per session from
-  [`unpack_normalize_packed_NTD_host`](arealmshbm/data_io/bitpacked_norm.py)
+* `cpu`: `fetch_data` returns `(N, T, ⌈D/8⌉) uint8` plus `D_unpacked`
+  (MW rows zeroed on the host), normalized per session by the numba
+  kernel `_normalize_session_bitpacked_numba` in
+  [`bitpacked_norm.py`](../arealmshbm/data_io/bitpacked_norm.py), called
+  from
+  [`unpack_normalize_packed_NTD_host`](../arealmshbm/data_io/bitpacked_norm.py)
   in the CPU Session's `__init__`. Output is bit-identical to the
   naive "unpack to fp32 + standard per-row demean + L2-norm" reference
   on binary input (proof: popcount in fp64 == Σ fp32(0/1); identical
   fp64 sumsq accumulation order).
+* `gpu`: `fetch_packed_bold_TND` in
+  [`step3_pipeline/sparse_inputs.py`](../arealmshbm/step3_pipeline/sparse_inputs.py)
+  ships the on-disk `(T, N, ⌈D/8⌉)` bytes to the device untransposed;
+  the MW rows are zeroed on the device, and the `acc_bits` (E-step) and
+  `x_dot_sl_bits` (M-step) kernels bit-sum them against the per-row
+  mean / inverse norm with no unpack. Padding bits must be zero
+  (checked per subject).
 
 Step1's `avg_profiles` subgraph reads packed bytes and accumulates over
 set bits without ever materializing a fp32 BOLD slab:
 
 * CPU: numba kernel `_accum_packed_session_inplace_kernel` (in
-  [`avg_profiles/_kernels.py`](arealmshbm/avg_profiles/_kernels.py))
+  [`avg_profiles/_kernels.py`](../arealmshbm/avg_profiles/_kernels.py))
   reads `(V_h, ⌈D/8⌉) uint8` per (session, hemi) slab and adds
   `1.0f` to the running fp32 accumulator for each set bit.
 * GPU: CUDA RawKernel `accum_packed_session_NhDb` (lazy-compiled in
-  [`avg_profiles_gpu.py`](arealmshbm/avg_profiles/avg_profiles_gpu.py))
+  [`avg_profiles_gpu.py`](../arealmshbm/avg_profiles/avg_profiles_gpu.py))
   — one block per hemi vertex, threads stride over D_bytes, no
   atomics (each (n, d) slot is owned by exactly one thread).
 
@@ -126,7 +136,9 @@ does not depend on which representation reached the kernel; the step-2
 `gpu` backend consumes the packed bytes directly, and its numerics
 contract against the CPU reference is
 [`step2_sparse_design.md`](step2_sparse_design.md) §7/§9 (not bit-exact
-across backends).
+across backends). Step 3's `gpu` backend does the same; its contract
+against `cpu` is [`step3_sparse_design.md`](step3_sparse_design.md)
+§§3–4 (not bit-exact across backends).
 
 ## Disk size + wall
 
@@ -139,6 +151,6 @@ Reference cohort (S=3 fsa6 T=2 D=1175):
 
 Step 2's `gpu` backend walls (0.32-0.36 s at S=1, 16 s for the 40-subject
 cohort) are in [`step2_flow_and_subgraphs.md`](step2_flow_and_subgraphs.md)
-§ Wall. Step 3
-single-subject (sub-001 / fsa6 / T=6 / L=300) on the `gpu_full` backend
-runs in ~4.13 s total / ~0.12 s fetch_data / ~0.16 s session_init.
+§ Wall. Step 3 single-subject (sub-001 / fsa6 / T=6 / L=300) on `gpu`:
+load_inputs 0.16–0.20 s + session_init 0.02–0.04 s + EM 0.10 s (~0.30 s
+warm; [`step3_sparse_design.md`](step3_sparse_design.md) §4).

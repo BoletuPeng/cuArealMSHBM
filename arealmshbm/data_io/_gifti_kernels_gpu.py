@@ -1,18 +1,14 @@
 """_gifti_kernels_gpu.py
 
-The three CuPy ``RawKernel``s between "raw ``.func.gii`` bytes are on
-device" and "one session's ``(N_cortex, T)`` fp32 matrix is on device";
-DEFLATE in the middle is nvCOMP's. No arithmetic is done on the BOLD
-values here and no float atomics, so the output is bit-identical to the
-host route. Two rules a maintainer must not break:
-
-* ``find_gifti_tags_batch`` emits tag offsets through an ``atomicAdd``
-  counter, so **the host must sort the positions**, and scanning several
-  files in one launch is safe only while the caller pads each file's
-  region with >= ``gifti_bold_gpu._MIN_PAD`` zero bytes.
-* ``gather_transpose_clean``'s infinity branch is load bearing: the host
-  route's ``nan_to_num`` clamps +-inf to +-FLT_MAX, so a NaN-only kernel
-  would diverge from ``bold_io.concat_hemis_drop_medial``.
+The two CuPy ``RawKernel``s between "raw ``.func.gii`` bytes are on
+device" and "one session's ``(T, n_lh + n_rh)`` fp32 buffer is on
+device"; DEFLATE in the middle is nvCOMP's. No arithmetic is done on
+the BOLD values here and no float atomics, so the output is
+bit-identical to the host reader. One rule a maintainer must not break:
+``find_gifti_tags_batch`` emits tag offsets through an ``atomicAdd``
+counter, so **the host must sort the positions**, and scanning several
+files in one launch is safe only while the caller pads each file's
+region with >= ``gifti_bold_gpu._MIN_PAD`` zero bytes.
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """
@@ -109,60 +105,11 @@ void base64_decode_checked(
 }
 """
 
-_SRC_EPILOGUE = r"""
-#define TILE 32
-#define ROWS 8
-extern "C" __global__
-void gather_transpose_clean(
-    const float* __restrict__ src,       // (T, N_full) row-major
-    int                       T,
-    int                       N_full,
-    const int*   __restrict__ cidx,      // (N_cortex,) kept vertex ids
-    int                       N_cortex,
-    float*       __restrict__ dst)       // (N_cortex, T) row-major
-{
-    __shared__ float tile[TILE][TILE + 1];
-
-    const int c0 = blockIdx.x * TILE;
-    const int t0 = blockIdx.y * TILE;
-
-    // ── read phase: coalesced along the cortex axis ──
-    for (int j = 0; j < TILE; j += ROWS) {
-        const int c = c0 + threadIdx.x;
-        const int t = t0 + threadIdx.y + j;
-        float v = 0.0f;
-        if (c < N_cortex && t < T) {
-            v = src[(long long)t * (long long)N_full + (long long)cidx[c]];
-            // np.nan_to_num(copy=False, nan=0.0) semantics, including
-            // the default +-inf -> +-finfo(float32).max clamp.
-            if (isnan(v)) {
-                v = 0.0f;
-            } else if (isinf(v)) {
-                v = (v > 0.0f) ? 3.4028234663852886e+38f
-                               : -3.4028234663852886e+38f;
-            }
-        }
-        tile[threadIdx.y + j][threadIdx.x] = v;
-    }
-    __syncthreads();
-
-    // ── write phase: coalesced along the time axis ──
-    for (int j = 0; j < TILE; j += ROWS) {
-        const int t = t0 + threadIdx.x;
-        const int c = c0 + threadIdx.y + j;
-        if (c < N_cortex && t < T) {
-            dst[(long long)c * (long long)T + (long long)t] =
-                tile[threadIdx.x][threadIdx.y + j];
-        }
-    }
-}
-"""
-
 
 def get_gifti_gpu_kernels():
-    """Compile (once) and return the RawKernels + the b64 decode table.
+    """Build (once) and return the RawKernels + the b64 decode table.
 
-    Returns ``(find_tags, b64_decode, epilogue, table_dev)``, the last
+    Returns ``(find_tags, b64_decode, table_dev)``, the last
     being the 256-entry uint8 base64 lookup (255 = outside the
     alphabet). The cache is **not** keyed by device: a multi-GPU port
     must add the device id here. Every caller that can run on a
@@ -177,7 +124,6 @@ def get_gifti_gpu_kernels():
 
         find_tags = cp.RawKernel(_SRC_FIND_TAGS, "find_gifti_tags_batch")
         b64 = cp.RawKernel(_SRC_B64, "base64_decode_checked")
-        epi = cp.RawKernel(_SRC_EPILOGUE, "gather_transpose_clean")
 
         table = np.full(256, 255, dtype=np.uint8)
         for i, ch in enumerate(
@@ -188,5 +134,5 @@ def get_gifti_gpu_kernels():
         # Padding contributes no real byte; the kernel is what
         # enforces that it only ever appears as the tail pad.
         table[ord("=")] = 0
-        _CACHE["k"] = (find_tags, b64, epi, cp.asarray(table))
+        _CACHE["k"] = (find_tags, b64, cp.asarray(table))
         return _CACHE["k"]

@@ -15,8 +15,9 @@ Public API:
     save_parcellation — argmax labels + save Ind_parcellation_*.mat.
     derive_labels     — argmax(s_lambda) → (lh_labels, rh_labels).
 
-``gifti_bold_gpu.read_subject_bold_gpu`` decodes one subject's sessions
-straight to device; cupy/nvcomp are soft deps, so it is not re-exported.
+``gifti_bold_gpu.iter_subject_bold_gpu`` decodes one subject's sessions
+straight to device; it needs cupy + nvCOMP (GPU-backend dependencies),
+so it is not re-exported.
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """

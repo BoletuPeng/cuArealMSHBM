@@ -417,11 +417,3 @@ class ELambdaSession:
         # new buffer with a different ``ctypes.data``, which defeats the
         # elision. The view is already C-contig fp32.
         return self._s_lambda_curr, self._V_temp_full, lambda_iter
-
-
-# ─────────────────────────────────────────────────────────────────────────
-# Module-level warmup
-# ─────────────────────────────────────────────────────────────────────────
-def warmup() -> None:
-    """Pre-compile the local numba kernels. Idempotent."""
-    _kernels.warmup()

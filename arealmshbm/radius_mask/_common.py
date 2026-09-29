@@ -8,7 +8,7 @@ drift ~1.45x and per-parcel Jaccard collapses to ~0.6 on fsaverage6) in
 one place.
 
 Four helpers:
-    _read_aparc(hemi, mesh, cbig_code_dir=None) -> (V,) int64
+    _read_aparc(hemi, mesh, atlas_dir=None) -> (V,) int64
         Resolve & parse a FreeSurfer aparc.annot at
         ``<atlas>/<mesh>/label/<hemi>.aparc.annot``. Returns labels
         offset by +1 (so precentral=25, postcentral=23, insula=36 — the
@@ -46,12 +46,12 @@ from ..data_io.load_avg_mesh import _atlas_dir
 
 
 def _read_aparc(hemi: str, mesh: str,
-                cbig_code_dir: Optional[str] = None) -> np.ndarray:
+                atlas_dir: Optional[str] = None) -> np.ndarray:
     """Read fsaverage* aparc.annot as a (V,) integer label vector with
     MATLAB's 1-indexed convention (insula=36, precentral=25,
     postcentral=23). Unmapped vertices (-1) become 0.
     """
-    base = Path(cbig_code_dir) if cbig_code_dir else _atlas_dir()
+    base = Path(atlas_dir) if atlas_dir else _atlas_dir()
     p = base / mesh / "label" / f"{hemi}.aparc.annot"
     if not p.exists():
         raise FileNotFoundError(f"aparc.annot for {hemi} on {mesh} not found: {p}")
@@ -137,10 +137,9 @@ def _build_mesh_csr(vertices: np.ndarray,
     indptr = np.zeros(n + 1, dtype=np.int64)
     np.cumsum(counts, out=indptr[1:])
 
-    # ── the three invariants the retired faces+np.unique route gave for
-    # free, and which the geodesics silently depend on. All exact, all
-    # vectorized; the reverse-edge test only scans each endpoint's
-    # <= max_neigh column.
+    # ── three graph invariants the geodesics silently depend on. All
+    # exact, all vectorized; the reverse-edge test only scans each
+    # endpoint's <= max_neigh column.
     # No duplicate neighbour: after the sort a repeat is an adjacent
     # equal pair below the pad sentinel.
     dup = (filled[:-1] == filled[1:]) & (filled[1:] <= n)

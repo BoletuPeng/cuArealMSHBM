@@ -1,21 +1,16 @@
 """Every ``arealmshbm.*`` sub-package must import standalone.
 
-Regression guard for the circular import that ``arealmshbm/__init__.py``'s
-PEP-562 lazy re-export un-masked: ``arealmshbm.vmf_clustering`` imported
-``arealmshbm.step3_pipeline.variant`` at module scope, whose package
-``__init__`` imported ``step3_pipeline.pipeline``, which imported
-``arealmshbm.vmf_clustering`` back — an ImportError in a fresh
-interpreter. The eager ``arealmshbm/__init__.py`` used to pre-order the
-two, so ``python -m pytest arealmshbm/`` stayed green while
-``python -c "import arealmshbm.vmf_clustering"`` and
-``pytest arealmshbm/vmf_clustering/tests`` both failed.
+An import cycle between sub-packages (e.g. ``vmf_clustering`` →
+``step3_pipeline.variant`` → ``step3_pipeline.pipeline`` →
+``vmf_clustering``) is an ImportError in a fresh interpreter, but
+in-process collection pre-imports modules and can hide it.
 
 The check has to run outside this interpreter: by the time pytest gets
-here, conftest / collection has already imported half the tree, which is
-exactly the pre-ordering that hides the bug. So we spawn ONE fresh
-interpreter that imports every sub-package one at a time, purging
-``arealmshbm*`` from ``sys.modules`` between packages so each import
-re-executes from scratch, and report every package that fails.
+here, conftest / collection has already imported half the tree. So we
+spawn ONE fresh interpreter that imports every sub-package one at a
+time, purging ``arealmshbm*`` from ``sys.modules`` between packages so
+each import re-executes from scratch, and report every package that
+fails.
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """

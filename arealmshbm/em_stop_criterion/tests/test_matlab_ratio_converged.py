@@ -1,7 +1,7 @@
 """Truth table for the shared MATLAB convergence rule.
 
 Pins ``matlab_ratio_converged`` to IEEE fp64 semantics and records the
-one cell where it differs from the pre-fix branch implementation.
+one cell where it differs from the branch formulation (``_pre_fix``).
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """
@@ -32,7 +32,7 @@ def _reference(update_cost: float, cost: float) -> bool:
 
 
 def _pre_fix(update_cost: float, cost: float) -> bool:
-    """The branch implementation this replaced."""
+    """The branch formulation, transcribed here as the oracle."""
     if cost == 0.0:
         ratio = NAN if update_cost == 0.0 else INF
     else:
@@ -83,7 +83,7 @@ def test_convergence_test_stops_on_nan_cost_zero():
     assert float(np.asarray(cost_em).ravel()[0]) == 0.0
 def test_no_warning_when_the_ratio_overflows():
     """A huge/tiny ratio is Inf (not converged), silently — the
-    branch implementation this replaced used Python float arithmetic."""
+    branch formulation (``_pre_fix``) uses Python float arithmetic."""
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         assert matlab_ratio_converged(1e300, 1e-300) is False

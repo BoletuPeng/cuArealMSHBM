@@ -10,19 +10,24 @@ Given a feature dimension ``D`` and a mean cosine ``rbar`` in (0, 1),
 
 Numerical notes:
     * MATLAB ``besseli(nu, x)`` overflows fp64 around ``x ~ 700`` for
-      ``nu ~ 587`` (D=1175 case). MATLAB falls back to a closed-form
-      approximation when ``besseli`` returns ``Inf``/``NaN``/``0``.
+      ``nu ~ 587`` (D=1175 case). MATLAB's ``invAd`` computes a
+      closed-form approximation when ``besseli`` returns
+      ``Inf``/``NaN``/``0``.
     * We use ``scipy.special.ive`` (exponentially scaled
       ``exp(-|x|) * I_nu(x)``) and form the ratio
-      ``ive(D/2, k) / ive(D/2-1, k)`` so the ``exp(-x)`` factors cancel
-      and the ratio stays well-conditioned in the range we see
-      (``kappa ~ 100..2000``).
+      ``ive(D/2, k) / ive(D/2-1, k)`` so the ``exp(-x)`` factors cancel.
+      ``ive`` underflows to 0 for small ``kappa``, where ``_ad`` does
+      not return A_d, so a root below that edge is not found: the edge
+      is about 173 at the fsaverage3 seed (D = 1174; ``rbar`` about
+      0.10-0.14, up to ~44 % off) and lies above every root the brentq
+      branch looks for at the fsaverage4/5 seeds.
     * The "is besseli pathological?" probe before fzero in MATLAB is
       reproduced via the unscaled ``iv`` (it overflows to ``Inf`` —
-      that's the same trigger MATLAB uses) so we take the same fallback
-      branch in the same regime. This is necessary for behaviour parity
-      because the saved ``epsil`` depends on whether MATLAB went down
-      the fzero or the closed-form path.
+      that's the same trigger MATLAB uses) so this port takes the
+      closed-form branch in the same regime. Every step-1 ``epsil``
+      measured on disk (151 ``group.mat`` files, 1126-4841) comes from
+      that branch, where this function and ``m_step._invad.invad`` are
+      bit-equal.
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """
@@ -37,11 +42,13 @@ from scipy import special as _spec
 
 
 def _ad(kappa: float, D: float) -> float:
-    """``A_d(kappa) = I_{D/2}(k) / I_{D/2-1}(k)`` via ``ive`` (stable).
+    """``A_d(kappa) = I_{D/2}(k) / I_{D/2-1}(k)`` via ``ive``.
 
     The exponentially scaled Bessels share the same ``exp(-|x|)`` factor,
-    which cancels in the ratio, so we get a finite result for any
-    ``kappa > 0`` while ``iv`` itself overflows past ``kappa ~ 700``.
+    which cancels in the ratio, so the ratio stays finite where ``iv``
+    itself overflows. For small ``kappa`` ``ive(D/2-1, k)`` underflows
+    to 0 (below ``kappa ~ 172`` at D = 1174); there this returns the
+    large-kappa asymptotic instead of the ratio.
     """
     nu_top = D / 2.0
     nu_bot = D / 2.0 - 1.0
@@ -50,8 +57,9 @@ def _ad(kappa: float, D: float) -> float:
     if bot == 0.0 or not np.isfinite(top) or not np.isfinite(bot):
         # Both overflow / underflow regimes: fall back to large-kappa
         # asymptotic A_d(k) ~ 1 - (D-1)/(2k) (DLMF 10.41 / Banerjee 2005
-        # eq. (4.4)) so the residual still has the right sign for the
-        # bracket search.
+        # eq. (4.4)). It lies below A_d, so when the root lies below the
+        # ive underflow edge the residual has the wrong sign just above
+        # the root and the bracket search does not return the root.
         return 1.0 - (D - 1.0) / (2.0 * kappa)
     return float(top / bot)
 
@@ -59,14 +67,19 @@ def _ad(kappa: float, D: float) -> float:
 def invAd(D: float, rbar: float) -> float:
     """Inverse of ``A_d`` — vMF concentration estimate for mean cosine ``rbar``.
 
-    Mirrors MATLAB ``CBIG_ArealMSHBM_invAd``:
+    Computes what stock CBIG's local ``function [outu] = invAd(D, rbar)``
+    computes into ``out``:
 
         outu = (D-1)*rbar/(1-rbar^2) + D/(D-1)*rbar      # warm start
         if besseli(D/2-1, outu) is Inf/NaN/0:
-            return outu - D/(D-1)*rbar/2                  # closed form
+            out = outu - D/(D-1)*rbar/2                   # closed form
         else:
             try fzero on (A_d(k) - rbar) starting at outu
-            return fzero result if converged else closed form
+            out = fzero result if converged else closed form
+
+    MATLAB then returns ``outu`` (the warm start) and discards ``out``;
+    this function returns ``out`` (with a bracketed brentq in place
+    of fzero), so it is not the MATLAB return value.
 
     Parameters
     ----------

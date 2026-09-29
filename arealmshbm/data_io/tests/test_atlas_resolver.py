@@ -1,15 +1,15 @@
 """test_atlas_resolver.py — `_atlas_dir()` fail-fast + avg_mesh asset contract.
 
 ``MSHBM_ATLAS_DIR`` is the runtime atlas resolver, used ONLY for the live
-``label/*.annot`` reads in step 1 (aparc + Schaefer). Mesh geometry no
-longer touches it — it comes wholly from the shipped avg_mesh ``.npz``
+``label/*.annot`` reads in step 1 (aparc + Schaefer). Mesh geometry does
+not touch it — it comes wholly from the shipped avg_mesh ``.npz``
 bundles, which ``load_avg_mesh`` reads as assets with no raw-FreeSurfer
 fallback.
 
 Coverage:
   * unset / empty env ⇒ RuntimeError (guards against a silent default)
   * set env  ⇒ Path(env) returned as-is
-  * error message describes the annot layout the resolver now serves
+  * error message describes the annot layout the resolver serves
   * a missing avg_mesh bundle is a hard FileNotFoundError naming the
     asset — NOT a recoverable cache miss
 

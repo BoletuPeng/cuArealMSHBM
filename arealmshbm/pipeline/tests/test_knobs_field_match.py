@@ -166,10 +166,9 @@ def test_step3_knobs_field_names_match_step3config() -> None:
 # Catalog ↔ Knobs entry-key 1:1 — drift detection
 #
 # The catalog is docs-only (correct call: pipeline doesn't read it at
-# runtime). But nothing was previously pinning catalog entry keys to
-# Knobs field names. Reviewer flagged: rename `smooth_sigma` in
-# Step0Knobs and every other test still passes while step0.json
-# references a phantom field. These tests close the loop.
+# runtime), so these tests pin catalog entry keys to Knobs field names:
+# renaming `smooth_sigma` in Step0Knobs must not leave step0.json
+# referencing a phantom field.
 # ─────────────────────────────────────────────────────────────────────
 def test_catalog_step0_keys_match_step0knobs() -> None:
     catalog = _catalog_step_keys("step0")

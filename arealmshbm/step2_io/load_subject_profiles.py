@@ -8,8 +8,12 @@ Provides the private leaf used by
   bitpacked uint8 input. The on-disk packed bytes flow into this
   kernel without an intermediate fp32 widening.
 
-fp32 throughout (reductions / row-norms in fp32, matching step-1 /
-step-3 across the fork).
+fp32 throughout (reductions / row-norms in fp32). Step 1 and step 3
+do their demean / L2-norm reductions in fp64, so step 3's
+normalisation of the same packed bytes
+(:mod:`arealmshbm.data_io.bitpacked_norm`,
+:mod:`arealmshbm.m_step.m_step_gpu`) is close to this one, not
+bit-identical.
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """

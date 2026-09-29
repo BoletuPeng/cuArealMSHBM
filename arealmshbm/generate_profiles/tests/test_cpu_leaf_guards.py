@@ -2,7 +2,7 @@
 
 ``compute_profile_arrays`` takes ``precomputed_bold_runs`` as a public
 kwarg, so a caller can hand the CPU leaf device buffers (e.g. straight
-out of ``read_subject_bold_gpu``). The guard sits ahead of every file
+out of ``iter_subject_bold_gpu``). The guard sits ahead of every file
 read, so the check below needs no project on disk -- and it is a
 module-name test (``type(x).__module__`` under ``cupy``, so the CPU
 leaf never imports cupy), so a stand-in with that module name

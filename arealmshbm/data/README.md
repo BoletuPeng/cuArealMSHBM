@@ -1,9 +1,11 @@
 # arealmshbm/data — precomputed assets
 
 This directory ships **empty** in the source repository: subject-invariant
-data is kept out of git so clones stay small. A missing asset is reported
-as a hard `FileNotFoundError` telling you to (re)install — it is never
-silently rebuilt at runtime.
+data is kept out of git so clones stay small. A missing mesh bundle
+(`avg_mesh`) is reported as a hard `FileNotFoundError` telling you to
+(re)install — it is never silently rebuilt at runtime. A missing step-0
+cache is the exception: it goes to the live rebuild described in the
+note under Layout.
 
 ## Where to get the assets
 
@@ -20,7 +22,9 @@ changes). Verify downloads against the release's `SHA256SUMS.txt`.
 
 ```bash
 curl -L -O https://github.com/BoletuPeng/cuArealMSHBM/releases/download/assets-v1/avg_mesh-fsaverage6.tar.gz
+curl -L -O https://github.com/BoletuPeng/cuArealMSHBM/releases/download/assets-v1/step0_inputs-fsaverage6_sigma2.55_khop3.tar.gz
 tar -xzf avg_mesh-fsaverage6.tar.gz -C arealmshbm/data/precomputed/
+tar -xzf step0_inputs-fsaverage6_sigma2.55_khop3.tar.gz -C arealmshbm/data/precomputed/
 ```
 
 **From a CBIG checkout** — the group priors and spatial masks below are
@@ -57,9 +61,9 @@ arealmshbm/data/
   uses is correct.
 - **Group priors** are model *inputs*, not required by the package: Mode A
   reads the prior only from `<project>/priors/<variant>/beta<B>/Params_Final.mat`
-  and staging it there is the project creator's job; Mode B trains one
-  from your own cohort. Copy one from CBIG's `lib/group_priors/`, or from
-  another project's Mode B output.
+  (no `beta<B>/` segment for dMSHBM) and staging it there is the project
+  creator's job; Mode B trains one from your own cohort. Copy one from
+  CBIG's `lib/group_priors/`, or from another project's Mode B output.
 - **Spatial masks** are likewise not required: step 1 generates the mask
   your project uses into `<project>/spatial_mask/spatial_mask_<mesh>.mat`.
   CBIG's `lib/spatial_mask/` copies are useful as a cross-check.

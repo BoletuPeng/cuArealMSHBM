@@ -3,30 +3,9 @@
 Read a single-hemi surface BOLD ``.func.gii`` and reshape it to the
 ``(N, T)`` matrix the rest of the step-0 pipeline expects.
 
-Format history
---------------
-The pipeline originally consumed a "fake 4-D NIFTI" mirror produced
-by CBIG's MATLAB driver
-(``CBIG_save_data_to_surface_mat.m → MRIwrite``) — a ``(I, J, K, T)``
-volume where ``I*J*K = N_hemi``, decompressed with isal igzip and
-Fortran-reshaped to ``(N, T)``. That mirror is gone — the offline
-converter and its e2e consistency harness were retired alongside the
-NIFTI reader (the project's git history before the strip carries
-``profile_nifti_io.py`` + ``convert_ys_bold_parallel.py``). The
-pipeline now reads the source GIFTI directly via
-:func:`arealmshbm.data_io.gifti_io.read_surface_gifti`. End-to-end
-bit-equality between the direct-GIFTI route and the converted-NIFTI
-route was verified at strip time on real YS sub-001 data (with CPU
-step0 to bypass GPU eigsh non-determinism); every numerical artifact
-downstream — profile.b2nd, avg_profile_{lh,rh}.npy,
-ind_parcellation_*.mat, gradients/* — matched bit-for-bit. The
-verification result table lives in the PR #54 description and in
-``docs/v2_schema_apple_to_apple_verification.md`` for the v2-schema
-refactor that preceded the strip.
-
 The hemi concatenation + NaN→0 + medial-mask drop is the inner content
-of the MATLAB scan loop in ``CBIG_SPGrad_RSFC_gradients.m`` lines
-264–285. We faithfully reproduce its order:
+of the MATLAB scan loop in ``CBIG_SPGrad_RSFC_gradients.m``. We
+reproduce its order:
 
     1. Read lh_curr_data, replace NaN with 0.
     2. Read rh_curr_data, replace NaN with 0.
@@ -53,8 +32,8 @@ def read_surface_bold(path: PathLike,
     """Read a single-hemi surface BOLD ``.func.gii`` and return ``(N, T)`` fp32.
 
     Thin wrapper around
-    :func:`arealmshbm.data_io.gifti_io.read_surface_gifti`. Keeps the
-    historical ``expected_n`` guard so a future GIFTI writer that
+    :func:`arealmshbm.data_io.gifti_io.read_surface_gifti`. Adds an
+    ``expected_n`` guard so a GIFTI writer that
     changed the vertex count is caught at read time rather than
     producing shuffled-but-correctly-sized data downstream.
 
@@ -62,10 +41,7 @@ def read_surface_bold(path: PathLike,
     ----------
     path : str | Path
         Path to a ``.func.gii`` surface BOLD file with the BOLD
-        contract (FLOAT32 / GZipBase64Binary / LittleEndian). NIFTI
-        ``.nii.gz`` inputs are no longer supported — convert by
-        re-running DeepPrep, or fall back to a git revision before
-        the NIFTI strip.
+        contract (FLOAT32 / GZipBase64Binary / LittleEndian).
     expected_n : int, optional
         If given, refuse the file when its ``Dim0`` (vertex count)
         disagrees with this number. Default is no check.
@@ -79,7 +55,7 @@ def read_surface_bold(path: PathLike,
     Notes
     -----
     NaN values are NOT replaced here — that is the caller's job
-    (matches the historical MATLAB order: NaN→0 happens after the
+    (matches the MATLAB order: NaN→0 happens after the
     reshape, in the scan loop in
     :func:`concat_hemis_drop_medial`).
     """
@@ -87,9 +63,7 @@ def read_surface_bold(path: PathLike,
     if p.suffix.lower() != ".gii":
         raise ValueError(
             f"read_surface_bold: only ``.gii`` surface BOLD is "
-            f"supported (typically ``.func.gii``); got {p}. The "
-            f"historical NIFTI mirror path was removed after the "
-            f"GIFTI direct-read landed."
+            f"supported (typically ``.func.gii``); got {p}."
         )
     vol = read_surface_gifti(p)
     if expected_n is not None and vol.shape[0] != expected_n:
@@ -112,6 +86,10 @@ def concat_hemis_drop_medial(
         rh_curr_data(isnan(rh_curr_data)) = 0;
         curr_data = [curr_data; rh_curr_data];
         curr_data(medial_mask, :) = [];
+
+    One difference: ``np.nan_to_num`` also clamps ``+inf`` / ``-inf`` to
+    the largest / smallest finite fp32, where the MATLAB lines leave an
+    infinity in place.
 
     Parameters
     ----------

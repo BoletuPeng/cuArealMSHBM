@@ -7,8 +7,8 @@ The reader-level GIFTI-only guard at
 :func:`arealmshbm.pipeline.inputs.read_bold_inputs` — the one that
 fires BEFORE any reader runs, when ``Pipeline(project_dir).run()``
 first parses the manifest. Surfacing the GIFTI-only contract at parse
-time is what catches stale projects (e.g. pre-PR-#54 ``.nii.gz``
-paths) before any expensive setup happens.
+time is what catches a wrong input (e.g. ``.nii.gz`` paths) before
+any expensive setup happens.
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """
@@ -44,8 +44,8 @@ def _make_manifest(lh: str, rh: str) -> dict:
 def test_rejects_nii_gz_path_at_parse_time(tmp_path: Path):
     """A bold_inputs.json carrying ``.nii.gz`` paths is refused at
     parse time with an error that names the offending field and the
-    GIFTI-only contract. This guards against stale pre-strip projects
-    silently running and then failing deep inside the BOLD reader."""
+    GIFTI-only contract, instead of failing deep inside the BOLD
+    reader."""
     p = tmp_path / "bold_inputs.json"
     p.write_text(json.dumps(_make_manifest(
         lh="/data/sub-001_ses-01_hemi-L_bold.nii.gz",
@@ -92,4 +92,17 @@ def test_rejects_unknown_suffix(tmp_path: Path):
         rh="/data/sub-001_ses-01_hemi-R_bold.dat",
     )), encoding="utf-8")
     with pytest.raises(ValueError, match=r"\.func\.gii"):
+        read_bold_inputs(p)
+
+
+@pytest.mark.parametrize("lh", ["", None])
+def test_rejects_missing_hemi_path(tmp_path: Path, lh):
+    """An empty or null ``lh``/``rh`` is refused as a missing path, not
+    as a wrong suffix (``Path("")`` renders as ``"."``, ``str(None)``
+    as ``"None"``)."""
+    p = tmp_path / "bold_inputs.json"
+    p.write_text(json.dumps(_make_manifest(
+        lh=lh, rh="/data/sub-001_ses-01_hemi-R_bold.func.gii",
+    )), encoding="utf-8")
+    with pytest.raises(ValueError, match=r"missing lh/rh path"):
         read_bold_inputs(p)

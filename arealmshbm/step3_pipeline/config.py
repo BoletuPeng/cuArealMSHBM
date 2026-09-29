@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Optional
 
 from .variant import VariantSpec, VALID_PIPELINE_TYPES
+from arealmshbm.pipeline.config import _VALID_BACKENDS
 
 
 _SUPPORTED_MESHES = frozenset({
@@ -47,7 +48,8 @@ class Step3Config:
     subid : 1-based positional index into the cohort's ``subjects``
             list (i.e. the n-th subject step1 was invoked with).
     mesh : surface space; 'fsaverage6' / 'fsaverage5' / 'fsaverage'.
-    w : weight on the group spatial prior log(theta).
+    w : weight on the group spatial prior log(theta); must be > 0 so
+        the w*log(theta) term excludes cells outside supp(theta).
     c : weight on the MRF Potts smoothness prior.
     beta_scalar : raw beta (e.g. 5). The internal beta vector replicated
                   to (L,) is ``beta_scalar * 1000`` per the MATLAB rule
@@ -55,9 +57,12 @@ class Step3Config:
                   1, num_clusters)``). Keep both representations so a
                   future GUI binds to the user-facing scalar without
                   losing the MATLAB-equivalent internal weight.
-    backend : 'cpu' | 'gpu_elambda' | 'gpu_full' | 'gpu_sparse'. See
-              :class:`arealmshbm.vmf_clustering.VmfClusteringSession`.
-              'gpu_sparse' is gMSHBM/dMSHBM only.
+    backend : 'cpu' | 'gpu'. 'cpu' is the numba session
+              (:class:`arealmshbm.vmf_clustering.VmfClusteringSession`);
+              'gpu' is the candidate-set EM on the theta support
+              (``docs/step3_sparse_design.md``), serving all three
+              variants. 'gpu' requires ceil(D/8) <= 256 (seed_mesh
+              fsaverage3).
     connect_th : connectedness threshold for the distributed-parcel test.
     epsilon : convergence tolerance shared across the four nested loops.
     max_iter_intra_em : outer loop cap (MATLAB hardcodes 50).
@@ -113,7 +118,8 @@ class Step3Config:
     # cMSHBM-only: minimum size (in surface vertices) for parcels to
     # survive ``remove_isolated_surface_components``. Used at two sites:
     #   * inner ``check_connectedness`` pre-predicate inside the EM body
-    #     (vmf_clustering.py / vmf_clustering_gpu.py).
+    #     (vmf_clustering.py; on gpu the device port inside
+    #     ConnectednessGPU.step).
     #   * outer post-EM final cleanup before save (Step3Pipeline.save).
     # gMSHBM / dMSHBM never read this. Default 5 matches the CBIG
     # MATLAB driver (the only value the reference implementation uses).
@@ -127,7 +133,7 @@ class Step3Config:
     # and ``beta_scalar`` per the CBIG layout. Set explicitly when the
     # native variant prior is unavailable (e.g. cMSHBM/dMSHBM validation
     # against MATLAB GT borrows the gMSHBM ``Params_Final.mat`` — see
-    # ``docs/pipeline_variants.md`` §4.4).
+    # ``docs/pipeline_variants.md``).
     group_prior_path_override: Optional[str | Path] = None
 
     # ── frozen / derived (filled in __post_init__) ──
@@ -149,10 +155,9 @@ class Step3Config:
             raise ValueError(
                 f"Step3Config: subid must be >= 1 (got {self.subid})"
             )
-        if self.backend not in ("cpu", "gpu_elambda", "gpu_full", "gpu_sparse"):
+        if self.backend not in _VALID_BACKENDS:
             raise ValueError(
-                f"Step3Config: backend must be one of "
-                f"'cpu' / 'gpu_elambda' / 'gpu_full' / 'gpu_sparse' "
+                f"Step3Config: backend must be one of {' / '.join(_VALID_BACKENDS)} "
                 f"(got {self.backend!r})"
             )
         if self.pipeline_type not in VALID_PIPELINE_TYPES:
@@ -163,15 +168,6 @@ class Step3Config:
         # Resolve VariantSpec early — every default-derivation below
         # branches on it.
         self._variant = VariantSpec.from_pipeline_type(self.pipeline_type)
-        if self.backend == "gpu_sparse" and (
-            self.pipeline_type == "cMSHBM"
-            or self._variant.pre_predicate_remove_isolated
-        ):
-            raise ValueError(
-                "Step3Config: backend='gpu_sparse' does not implement the "
-                "cMSHBM pre-E-step isolated-vertex removal; use 'gpu_full' "
-                f"or 'cpu' for pipeline_type={self.pipeline_type!r}"
-            )
         if self.mesh not in _SUPPORTED_MESHES:
             raise ValueError(
                 f"Step3Config: mesh must be one of {sorted(_SUPPORTED_MESHES)} "
@@ -179,11 +175,10 @@ class Step3Config:
             )
         # Numeric guards. The hot path doesn't validate these; a negative
         # epsilon or zero iter cap would silently produce wrong / never-
-        # terminating runs. ``w/c/beta_scalar`` are non-negative weights.
-        # Note ``w=0`` does NOT switch the group prior off: the dense
-        # E-step still evaluates 0*log(theta) = NaN outside supp(theta)
-        # (MATLAB behaves the same), so it is rejected on gpu_sparse
-        # rather than silently producing a support-restricted answer.
+        # terminating runs. ``c/beta_scalar`` are non-negative weights.
+        # ``w`` must be > 0: the E-step's w*log(theta) term excludes cells
+        # outside supp(theta), and at w=0 it evaluates 0*log(0) = NaN there
+        # (stock CBIG degenerates the same way).
         if self.epsilon <= 0.0:
             raise ValueError(
                 f"Step3Config: epsilon must be positive (got {self.epsilon})"
@@ -202,15 +197,8 @@ class Step3Config:
             raise ValueError(
                 f"Step3Config: connect_th must be >= 0 (got {self.connect_th})"
             )
-        if self.w < 0.0:
-            raise ValueError(f"Step3Config: w must be >= 0 (got {self.w})")
-        if self.w == 0.0 and self.backend == "gpu_sparse":
-            raise ValueError(
-                "Step3Config: backend='gpu_sparse' requires w > 0. The "
-                "candidate-set E-step only visits supp(theta), so it "
-                "matches the dense E-step only while the w*log(theta) "
-                "term is active; use 'gpu_full' or 'cpu' for w=0."
-            )
+        if self.w <= 0.0:
+            raise ValueError(f"Step3Config: w must be > 0 (got {self.w})")
         if self.c < 0.0:
             raise ValueError(f"Step3Config: c must be >= 0 (got {self.c})")
         if self.beta_scalar < 0.0:

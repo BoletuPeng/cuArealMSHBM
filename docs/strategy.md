@@ -12,11 +12,16 @@ one orchestrator folder per step. New steps follow the same shape:
   `V_lambda/`, `vmf_clustering/`, `data_io/`:
   - `__init__.py` — small public API, usually one or two functions.
   - `<leaf>.py` — top-level entry that orchestrates the kernels.
-  - `_kernels.py` — numba CPU kernels (present in every leaf).
-  - `_kernels_gpu.py` — CuPy / CUDA kernels, **only** where the GPU
-    path diverges from numba. When the same kernel runs on both via
-    numba, keep just `_kernels.py` (most leaves are this case; only
-    `vmf_clustering/` carries both).
+  - `_kernels.py` — numba CPU kernels, where the leaf has any.
+  - `_kernels_gpu.py` — CuPy / CUDA kernel sources for the leaf's GPU
+    path (`<leaf>_gpu.py` or a session module drives them). Leaves
+    with a CPU and a GPU path carry both (`vmf_clustering/`,
+    `generate_profiles/`, `ini_params/`, `radius_mask/`,
+    `step2_em_iter_master/`); `graph_distance/` and `watershed/` carry
+    `_kernels_gpu.py` and keep their numba CPU kernels in a named
+    module (`graph_distance.py`, `watershed_repaired.py`); many leaves
+    keep their kernels inline or in a named module instead
+    (`m_step/_xdot_kernel.py`, `data_io/_gifti_kernels*.py`).
   - `_cdln.py` / `_invad.py` / etc. — math helpers private to the
     leaf.
 - **Pipeline orchestrator** — `<stepN>_pipeline/` per step, layout:
@@ -35,35 +40,38 @@ one orchestrator folder per step. New steps follow the same shape:
 
 ## 2. Backend dispatch
 
-`Step3Config.backend` is a single string knob (`'cpu' | 'gpu_elambda'
-| 'gpu_full'`) routed to alternative session classes inside
-`vmf_clustering/` (`vmf_clustering.py` / `vmf_clustering_gpu.py`). New
-steps adopt the same shape: a config-level `backend` field, side-by-
+`Step3Config.backend` is `'cpu' | 'gpu'`, like every step;
+`Step3Pipeline` routes it to `VmfClusteringSession`
+(`vmf_clustering/vmf_clustering.py`) or the candidate-set session
+`VmfClusteringSessionSparseCUDA` (`vmf_clustering/vmf_clustering_gpu.py`).
+New steps adopt the same shape: a config-level `backend` field, side-by-
 side `<leaf>.py` / `<leaf>_gpu.py` files only where GPU divergence is
 real.
 
 GPU steps must release the cupy memory pool between subjects in batch
-loops; the `with Step3Pipeline(cfg) as pipe` pattern is the reference.
-The failure mode when this is skipped is a non-decreasing `nvidia-smi`
-memory curve across the batch.
+loops; the `with Step3Pipeline(cfg) as pipe` pattern is the reference
+(`Step3Pipeline.__exit__` → `close()` frees the default and pinned
+pools, `arealmshbm/step3_pipeline/pipeline.py`). Skipping it shows up
+as a non-decreasing `nvidia-smi` memory curve across subjects.
 
 ## 3. Numba AOT cache hygiene
 
 Every CPU kernel is decorated `@njit(cache=True)`. Numba persists the
 compiled object next to the source under `__pycache__/` (the standard
 gitignored cache dir — there is no separate `.numba_cache`). The cache
-is keyed on numba version + source hash, **not** on the host CPU's
-feature set. If you migrate a checkout between machines with materially
-different CPUs (e.g. clone from an AVX-512 box onto a CPU without it)
-clear the cache once so kernels recompile for the new target:
+is keyed on each kernel's signature, its bytecode and the host CPU
+(target triple, CPU name and feature set); numba discards a kernel's
+entries when the numba version or the mtime/size of the kernel's own
+source file changes. A checkout moved to a different CPU, or a numba
+upgrade, therefore recompiles by itself. The key does not cover
+`@njit` helpers called from other files (`graph_distance/_heap.py`,
+`em_stop_criterion/_cdln.py`, `m_step/_invad.py`): after editing one,
+clear the cache, or its callers keep running the old compiled copy:
 
 ```bash
-# from the repo root, on the destination machine, once after first clone:
+# from the repo root:
 find arealmshbm -type d -name __pycache__ -prune -exec rm -rf {} +
 ```
-
-Same applies if numba is upgraded across a major version. Day-to-day
-edits inside a single checkout invalidate per-file automatically.
 
 ## 4. Testing
 

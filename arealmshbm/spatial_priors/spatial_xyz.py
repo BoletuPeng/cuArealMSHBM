@@ -11,8 +11,8 @@ Public API:
     XyzSession              — caches the bilateral sphere coords once;
                               recomputes the (N, L) prior each call.
     compute_unit_sphere_xyz — load + row-normalize bilateral sphere
-                              coords (also used by the GPU full-device
-                              path).
+                              coords (shared with the step-3 ``gpu``
+                              session, vmf_clustering_gpu).
 
 Per call:
     1. ``lambda_X = sphere_xyz.T @ s_lambda``                  — (3, L) fp32 gemm
@@ -23,8 +23,9 @@ Per call:
        with ``NaN → 0`` cleanup
 
 Steps 1, 3 are fp32 sgemm via numpy. Step 5 is a fused numba kernel
-(:func:`_kernels.assemble_xyz_vmf`). Cdln is a numba leaf
-(:func:`_cdln.cdln_d3_to_f32`). All intermediates are fp32; output is fp32.
+(:func:`_kernels.assemble_xyz_vmf`). Cdln is the general-d numba leaf
+(:func:`arealmshbm.em_stop_criterion._cdln.cdln_general_to_f32`) at d=3.
+All intermediates are fp32; output is fp32.
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """
@@ -35,13 +36,11 @@ from typing import Tuple
 
 import numpy as np
 
+from arealmshbm.em_stop_criterion._cdln import cdln_general_to_f32
+
 from . import _kernels
-from ._cdln import cdln_d3_to_f32
 
 
-# Step functions — one per algorithmic step in the original derivation.
-# Historically each was wired into the MATLAB-GT validate.py harness
-# (now retired) to bisect intermediate-quantity drift.
 def compute_unit_sphere_xyz(vertices: np.ndarray) -> np.ndarray:
     """Mirror of MATLAB lines 412-420 (sphere mesh load + row-normalize).
 
@@ -127,6 +126,7 @@ class XyzSession:
         "_xyz_gamma_f64",           # (L,)      fp64 — scratch (Cdln input)
         "_xyz_gamma_f32",           # (L,)      fp32 — scratch (assemble multiplier)
         "_cdln_per_k",              # (L,)      fp32 — scratch
+        "_cdln_scratch_f64",        # (L,)      fp64 — scratch (Cdln fp64 pass)
         # Output buffer — full sgemm overwrites every cell on every call;
         # the np.empty allocation here is pure scratch.
         "_spatial_xyz_vmf_f32",     # (N, L)    fp32 C-contig — output
@@ -169,6 +169,7 @@ class XyzSession:
         self._xyz_gamma_f64 = np.empty(L, dtype=np.float64)
         self._xyz_gamma_f32 = np.empty(L, dtype=np.float32)
         self._cdln_per_k    = np.empty(L, dtype=np.float32)
+        self._cdln_scratch_f64 = np.empty(L, dtype=np.float64)
 
         # Output buffer. Step 3 below is a FULL sgemm sphere @ s_muc → vmf,
         # so every cell is overwritten on every call — np.empty (uninit)
@@ -251,7 +252,8 @@ class XyzSession:
                   out=self._spatial_xyz_vmf_f32)
 
         # ── Step 4 (Cdln) ──
-        cdln_d3_to_f32(self._xyz_gamma_f64, self._cdln_per_k)
+        cdln_general_to_f32(self._xyz_gamma_f64, 3, self._cdln_per_k,
+                            self._cdln_scratch_f64)
 
         # ── Step 5 (FULL contig assemble — auto-vectorized) ──
         # In-place over the (N, L) C-contig buffer. NaN cleanup matters

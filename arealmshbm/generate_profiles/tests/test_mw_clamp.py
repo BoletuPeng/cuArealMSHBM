@@ -8,9 +8,7 @@ bitpacked ``.b2nd`` contract requires zero rows at medial-wall
 vertices.
 
 This is the unit-level guard — fully synthetic, fast (<1s), no disk
-I/O. The pre-decoupling MATLAB-GT validate.py used to catch the same
-regression via a read-back assertion after a full step1 run; that
-script is gone, so this test is now the only in-tree gate.
+I/O.
 
 Run::
 

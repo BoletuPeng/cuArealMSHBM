@@ -253,7 +253,7 @@ def read_cohort(project_dir: str | Path) -> CohortManifest:
     if not p.exists():
         raise FileNotFoundError(
             f"cohort.json not found at {p}. Run step1 to produce it, "
-            f"or build one manually for legacy / GT cohorts."
+            f"or build one manually (e.g. for GT cohorts)."
         )
     with p.open("r", encoding="utf-8") as f:
         data = json.load(f)

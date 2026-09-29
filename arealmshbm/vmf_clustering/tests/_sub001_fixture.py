@@ -1,4 +1,4 @@
-"""_sub001_fixture.py — real-data fixture for the ``gpu_sparse`` kernels.
+"""_sub001_fixture.py — real-data fixture for the ``gpu`` kernels.
 
 Loads sub-001 (fsaverage6, T=6, L=300) from the local profile store and
 builds the :class:`CandidateLayout`. Cached in-process so a test module
@@ -89,7 +89,7 @@ def load_sub001() -> Optional[Sub001Fixture]:
         return None
 
     from arealmshbm.step3_pipeline import Step3Config, Step3Pipeline
-    from arealmshbm.vmf_clustering.sparse_layout import (
+    from arealmshbm.vmf_clustering.tests._layout_oracle import (
         build_candidate_layout_dense,
     )
 
@@ -103,7 +103,7 @@ def load_sub001() -> Optional[Sub001Fixture]:
         inp.Params["theta"], inp.boundary_mask,
         inp.lh_inflated["vertexNbors"], inp.rh_inflated["vertexNbors"],
     )
-    # (N, T, Db) → (T, N, Db) on-disk layout used by the sparse backend.
+    # (N, T, Db) → (T, N, Db) on-disk layout used by the gpu backend.
     packed_TND = np.ascontiguousarray(
         np.transpose(inp.data["series"], (1, 0, 2)))
     _CACHE = Sub001Fixture(

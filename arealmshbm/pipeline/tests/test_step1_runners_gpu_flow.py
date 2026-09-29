@@ -3,23 +3,18 @@ through ``step1_runners`` on a tiny synthetic cohort.
 
 Pins the runner-level contract the driver relies on:
 
-  * ``run_generate_profiles(backend='gpu', packed_sink=…,
-    write_handles=…)`` returns one .b2nd path per subject, fills the
-    sink with ``(packed, K)`` and — single subject — defers the .b2nd
-    join to ``join_step1_writers``.
-  * The packed slab handed over in memory is byte-identical to what
-    the .b2nd on disk decodes to (so ``avg_profiles`` from the sink
-    equals ``avg_profiles`` from disk).
-  * ``run_avg_profiles(packed_subjects=…)`` and
+  * ``run_generate_profiles(backend='gpu', avg_accumulator=…,
+    write_handles=…)`` returns one .b2nd path per subject, folds every
+    session into the accumulator on device and — single subject —
+    defers the .b2nd join to ``join_step1_writers``.
+  * The average built on device while the leaf packed equals the
+    disk-mediated ``avg_profiles`` that re-reads the .b2nd files.
+  * ``run_avg_profiles(accumulator=…)`` and
     ``run_ini_params(precomputed_*_avg_dev=…, save_async=True)``
     produce the same artifacts as the disk-mediated path, and
     ``join_step1_writers`` leaves every file on disk.
   * The multi-subject case joins per subject (no pending handles).
-  * The verbose per-subject line names the ingest the leaf used.
-
-The nvCOMP-vs-CPU-reader ingest equality is the leaf's contract and is
-pinned once, in ``generate_profiles/tests/test_generate_subject_profiles_gpu.py``;
-the runner has no ingest branch of its own.
+  * ``verbose=True`` prints one line per subject on the fused path.
 
 Synthetic GIFTI generation is the same minimal writer the prefetcher
 tests use. The end-to-end tests carry ``_needs_gpu`` (cupy + nvcomp +
@@ -42,8 +37,8 @@ import pytest
 from arealmshbm.data_io.profile_io import read_subject_profile_packed_tnd
 from arealmshbm.pipeline import step1_runners
 from arealmshbm.pipeline.step1_runners import (
-    join_step1_writers, run_avg_profiles, run_generate_profiles,
-    run_ini_params,
+    join_step1_writers, make_avg_accumulator, run_avg_profiles,
+    run_generate_profiles, run_ini_params,
 )
 
 _MESH = "fsaverage6"
@@ -92,23 +87,41 @@ def _stage_project(tmp_path: Path, subjects, sessions, T=5):
     return proj
 
 
-def _gpu_stack_present() -> bool:
+def _nvcomp_installed() -> bool:
+    """Package presence only, without importing the binding.
+
+    ``importlib.util.find_spec`` imports the *parent* first, so on a
+    box with no ``nvidia`` namespace package at all it raises instead
+    of returning ``None`` -- that is "not installed" too.
+    """
+    import importlib.util
     try:
-        import cupy  # noqa: F401
-        from arealmshbm.data_io import _nvcomp_batched
-        from arealmshbm.data_io.load_avg_mesh import load_avg_mesh
-        if not _nvcomp_batched.nvcomp_available():
-            return False
-        load_avg_mesh("lh", _MESH, "inflated")
-        load_avg_mesh("rh", _MESH, "inflated")
-        return True
-    except Exception:      # noqa: BLE001 — no cupy / nvcomp / bundles
+        return importlib.util.find_spec("nvidia.nvcomp") is not None
+    except ModuleNotFoundError:
         return False
 
 
-_needs_gpu = pytest.mark.skipif(
-    not _gpu_stack_present(),
-    reason="cupy / nvcomp / fsaverage6 avg_mesh bundles not staged")
+def _gpu_skip_reason() -> str:
+    """Empty when the end-to-end tests can run. Only the nvCOMP
+    *package* is probed: an installed binding that fails to load must
+    fail these tests, not skip them."""
+    try:
+        import cupy  # noqa: F401
+    except ImportError as e:
+        return f"cupy unavailable ({e})"
+    if not _nvcomp_installed():
+        return "nvidia-nvcomp-cu12 not installed"
+    try:
+        from arealmshbm.data_io.load_avg_mesh import load_avg_mesh
+        load_avg_mesh("lh", _MESH, "inflated")
+        load_avg_mesh("rh", _MESH, "inflated")
+    except Exception as e:      # noqa: BLE001 — absent, stale or corrupt
+        return f"fsaverage6 avg_mesh bundles not loadable ({e})"
+    return ""
+
+
+_GPU_SKIP = _gpu_skip_reason()
+_needs_gpu = pytest.mark.skipif(bool(_GPU_SKIP), reason=_GPU_SKIP)
 
 
 @_needs_gpu
@@ -116,24 +129,24 @@ def test_single_subject_in_memory_chain_matches_disk(tmp_path, monkeypatch):
     subjects, sessions = ["1"], ["1", "2"]
     proj = _stage_project(tmp_path, subjects, sessions)
 
-    sink: dict = {}
+    acc = make_avg_accumulator(targ_mesh=_MESH, seed_mesh=_SEED,
+                               num_sess=len(sessions))
     handles: list = []
     paths = run_generate_profiles(
         project_dir=proj, subjects=subjects, sessions=sessions,
         seed_mesh=_SEED, targ_mesh=_MESH, backend="gpu", verbose=False,
-        packed_sink=sink, write_handles=handles,
+        avg_accumulator=acc, write_handles=handles,
     )
     assert [p[0] for p in paths] == ["1"]
     assert len(handles) == 1, "single subject defers its .b2nd join"
-    packed, K = sink["1"]
-    assert packed.dtype == np.uint8 and packed.shape[0] == len(sessions)
+    assert acc.n_pairs == len(sessions)
 
     avg_mem = run_avg_profiles(
         project_dir=proj, num_sub=1, num_sess=len(sessions),
         seed_mesh=_SEED, targ_mesh=_MESH, backend="gpu", verbose=False,
-        packed_subjects=[packed], D=K,
+        accumulator=acc,
     )
-    assert avg_mem.lh_avg_dev is not None and avg_mem.writer is not None
+    assert avg_mem.lh_avg_dev is acc.lh and avg_mem.writer is not None
 
     # Labels: a synthetic 4-parcel partition of the cortex per hemi.
     from arealmshbm.data_io.load_avg_mesh import load_avg_mesh
@@ -160,12 +173,12 @@ def test_single_subject_in_memory_chain_matches_disk(tmp_path, monkeypatch):
     assert avg_mem.lh_path.exists() and avg_mem.rh_path.exists()
     assert path.exists()
 
-    # The in-memory slab equals what the .b2nd decodes to.
+    # The .b2nd carries the packed layout the accumulator was sized for.
     on_disk, D_disk = read_subject_profile_packed_tnd(paths[0][1])
-    assert D_disk == K
-    assert np.array_equal(on_disk, packed)
+    assert D_disk == acc.D
+    assert on_disk.shape == (len(sessions), acc.V_lh + acc.V_rh, acc.D_bytes)
 
-    # Disk-mediated avg (re-reads the .b2nd) equals the in-memory avg.
+    # Disk-mediated avg (re-reads the .b2nd) equals the on-device avg.
     import scipy.io as sio
     ref_lh = np.load(avg_mem.lh_path)
     avg_disk = run_avg_profiles(
@@ -195,66 +208,105 @@ def test_single_subject_in_memory_chain_matches_disk(tmp_path, monkeypatch):
 def test_multi_subject_joins_per_subject(tmp_path):
     subjects, sessions = ["1", "2"], ["1"]
     proj = _stage_project(tmp_path, subjects, sessions, T=4)
-    sink: dict = {}
+    acc = make_avg_accumulator(targ_mesh=_MESH, seed_mesh=_SEED,
+                               num_sess=len(sessions))
     handles: list = []
     paths = run_generate_profiles(
         project_dir=proj, subjects=subjects, sessions=sessions,
         seed_mesh=_SEED, targ_mesh=_MESH, backend="gpu", verbose=False,
-        packed_sink=sink, write_handles=handles,
+        avg_accumulator=acc, write_handles=handles,
     )
     assert [p[0] for p in paths] == ["1", "2"]
     assert handles == [], "multi-subject cohorts join each write inline"
-    for sub_id, p in paths:
+    assert acc.n_pairs == 2
+    for _sub_id, p in paths:
         on_disk, D = read_subject_profile_packed_tnd(p)
-        packed, K = sink[sub_id]
-        assert D == K and np.array_equal(on_disk, packed)
-    # Pageable copies: mutating one must not alias the other.
-    assert not np.shares_memory(sink["1"][0], sink["2"][0])
+        assert D == acc.D
+        assert on_disk.shape == (1, acc.V_lh + acc.V_rh, acc.D_bytes)
+
+    # The sums built on device while the leaf packed equal the
+    # disk-mediated average of the two .b2nd files it wrote.
+    avg_mem = run_avg_profiles(
+        project_dir=proj, num_sub=2, num_sess=1,
+        seed_mesh=_SEED, targ_mesh=_MESH, backend="gpu", verbose=False,
+        accumulator=acc,
+    )
+    join_step1_writers(None, avg_mem, None)
+    avg_disk = run_avg_profiles(
+        project_dir=proj, num_sub=2, num_sess=1,
+        seed_mesh=_SEED, targ_mesh=_MESH, backend="gpu", verbose=False,
+    )
+    join_step1_writers(None, avg_disk, None)
+    assert np.array_equal(avg_mem.lh_avg, avg_disk.lh_avg)
+    assert np.array_equal(avg_mem.rh_avg, avg_disk.rh_avg)
 
 
-def test_cpu_backend_rejects_the_packed_handoff(tmp_path):
-    """The CPU avg leaf reads the .b2nd files back; it has no packed
-    in-memory entry point."""
+class _FakeAccumulator:
+    def __init__(self, num_sess: int) -> None:
+        self.num_sess = num_sess
+        self.n_pairs = 0
+
+    def add(self, sess_index, packed_dev):        # the leaf's hook
+        self.n_pairs += 1
+
+
+def test_cpu_backend_rejects_the_accumulator_handoff(tmp_path):
+    """The CPU avg leaf reads the .b2nd files back; it has no in-memory
+    entry point, and the CPU profile stage cannot feed one."""
     with pytest.raises(ValueError, match="GPU-only"):
         run_avg_profiles(
             project_dir=tmp_path, num_sub=1, num_sess=1,
             seed_mesh=_SEED, targ_mesh=_MESH, backend="cpu",
-            packed_subjects=[np.zeros((1, 2, 1), np.uint8)], D=3,
+            accumulator=_FakeAccumulator(1),
+        )
+    lists = tmp_path / "data_list" / "fMRI_list"
+    lists.mkdir(parents=True)
+    (lists / "lh_sub1_sess1.txt").write_text("lh.func.gii\n")
+    (lists / "rh_sub1_sess1.txt").write_text("rh.func.gii\n")
+    with pytest.raises(ValueError, match="GPU-only"):
+        run_generate_profiles(
+            project_dir=tmp_path, subjects=["1"], sessions=["1"],
+            seed_mesh=_SEED, targ_mesh=_MESH, backend="cpu",
+            avg_accumulator=_FakeAccumulator(1),
         )
 
 
-def _stub_packed_avg(monkeypatch, calls: list):
-    """Replace the GPU avg leaf so the packed branch's argument checks
-    can run without a device."""
+def _stub_accumulator_avg(monkeypatch, calls: list):
+    """Replace the GPU avg leaf so the accumulator branch's argument
+    checks can run without a device."""
     mod = types.ModuleType("arealmshbm.avg_profiles.avg_profiles_gpu")
-    mod.avg_profiles_from_packed_gpu = (
+    mod.avg_profiles_from_accumulator = (
         lambda *a, **k: calls.append((a, k)) or "avg"
     )
     monkeypatch.setitem(
         sys.modules, "arealmshbm.avg_profiles.avg_profiles_gpu", mod)
 
 
-def test_packed_handoff_rejects_a_session_count_mismatch(tmp_path, monkeypatch):
-    """Same invariant the disk branch enforces on the decoded .b2nd:
-    the slab's T must be ``num_sess``."""
+def test_accumulator_handoff_rejects_a_num_sess_mismatch(
+        tmp_path, monkeypatch):
+    """The disk branch checks ``T == num_sess`` on every .b2nd; the
+    accumulator counted each subject's sessions against its own
+    ``num_sess``, which must be this cohort's. ``num_sub`` is the disk
+    branch's discovery bound and is not consulted."""
     calls: list = []
-    _stub_packed_avg(monkeypatch, calls)
-    packed = np.zeros((2, 4, 1), np.uint8)          # T=2
+    _stub_accumulator_avg(monkeypatch, calls)
+    acc = _FakeAccumulator(2)
 
-    with pytest.raises(ValueError, match=r"T=2 but num_sess=6"):
+    with pytest.raises(ValueError,
+                       match=r"built for num_sess=2 but num_sess=6"):
         run_avg_profiles(
             project_dir=tmp_path, num_sub=1, num_sess=6,
             seed_mesh=_SEED, targ_mesh=_MESH, backend="gpu",
-            packed_subjects=[packed], D=3,
+            accumulator=acc,
         )
     assert calls == [], "the leaf must not be reached"
 
     assert run_avg_profiles(
-        project_dir=tmp_path, num_sub=1, num_sess=2,
+        project_dir=tmp_path, num_sub=7, num_sess=2,
         seed_mesh=_SEED, targ_mesh=_MESH, backend="gpu",
-        packed_subjects=[packed], D=3,
+        accumulator=acc,
     ) == "avg"
-    assert len(calls) == 1
+    assert len(calls) == 1 and calls[0][0][0] is acc
 
 
 def test_cpu_backend_forwards_save_async(tmp_path, monkeypatch):
@@ -305,7 +357,6 @@ def test_fused_gpu_path_reports_each_subject_when_verbose(
     class _Res:
         packed = np.zeros((2, 4, 7), np.uint8)
         K = 55
-        ingest = "cpu-reader"
         out_path = tmp_path / "sub1.b2nd"
 
         def wait(self):
@@ -319,9 +370,6 @@ def test_fused_gpu_path_reports_each_subject_when_verbose(
         sys.modules,
         "arealmshbm.generate_profiles.profiles_subject_gpu", leaf)
 
-    import arealmshbm.data_io._nvcomp_batched as nvc
-    monkeypatch.setattr(nvc, "nvcomp_available", lambda: True)
-
     def _call(verbose: bool):
         capsys.readouterr()
         step1_runners.run_generate_profiles(
@@ -332,5 +380,4 @@ def test_fused_gpu_path_reports_each_subject_when_verbose(
 
     out = _call(True)
     assert "sub=1" in out and "sessions=2" in out and "K=55" in out
-    assert "ingest=cpu-reader" in out
     assert _call(False) == ""

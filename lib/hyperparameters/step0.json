@@ -3,7 +3,7 @@
   "schema_version": "1",
   "description": "Step 0 - RSFC gradient + diffusion embedding. Variant-invariant, mode-invariant. Backend selector + all step0 internal knobs.",
   "source_note": "`source` fields name the file owning the field's authoritative default. Line numbers are intentionally omitted — they drift on every reformat and the file/symbol name is the stable contract.",
-  "range_policy": "advisory — `min`/`max` fields are UI hints documenting the values authors have validated; the parser/validator enforces only positivity (numeric fields) and enum membership (enum fields). Out-of-range-but-positive values are accepted at parse time.",
+  "range_policy": "advisory — `min`/`max` fields are UI hints documenting the values authors have validated; the parser/validator enforces only positivity (numeric fields), finiteness (float fields: NaN and Infinity are refused) and enum membership (enum fields). Out-of-range values that are positive and finite are accepted at parse time.",
   "entries": [
     {
       "key": "backend_step0",
@@ -23,7 +23,7 @@
       "source": "arealmshbm/pipeline/config.py (Step0Knobs.enable_tf32)",
       "conditional": "backend_step0 == 'gpu'",
       "description": "Opt-in TF32 cuBLAS sgemm math mode for step0 (affects fc_similarity only).",
-      "notes": "~15% step0 speedup with minor fp32 precision drift. Relocated from top-level ``enable_tf32_step0`` into the step0 block in 2026-06 — the field belongs in the step that consumes it, and the relocation lines the step0.json catalog file up with the actual config namespace."
+      "notes": "~15% step0 speedup with minor fp32 precision drift."
     },
     {
       "key": "step0.sub_FC",
@@ -133,7 +133,7 @@
       "default": false,
       "source": "arealmshbm/step0_pipeline/config.py (Step0Config.save_edge_density)",
       "description": "Persist edge_density.npy (cortex-only fp32 watershed boundary count) to disk.",
-      "notes": "Step-0 intermediate with no production downstream reader (subgraph B consumes it in-memory). Only the internal CPU-vs-GPU diff harness reads the disk artifact. Default false since 2026-06."
+      "notes": "Step-0 intermediate with no production downstream reader (subgraph B consumes it in-memory). Only the internal CPU-vs-GPU diff harness reads the disk artifact."
     }
   ]
 }

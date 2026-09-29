@@ -11,10 +11,11 @@
     grid, same cparams, same vlmeta. Plus its own failure modes — a
     session never written, an aborted subject, a bad slab, and a file
     whose ``close()`` never ran.
+  * **Into-buffer reader** — ``decode_subject_profile_packed_into``
+    fills a caller-owned buffer with the bytes the full load returns
+    and refuses a buffer blosc2 could not fill safely.
 
-The one-shot writer takes unpacked binary ``(T, N, D)`` only; its
-pre-packed input mode went with its last caller (the stage pipeline's
-retired GPU branch), and ``test_removed_symbols.py`` pins that. The
+The one-shot writer takes unpacked binary ``(T, N, D)`` only. The
 unpacked path's own contract is exercised by ``step2_io`` through the
 public writer entry.
 
@@ -29,6 +30,7 @@ import pytest
 
 from arealmshbm.data_io.profile_io import (
     SubjectProfileStreamWriter,
+    decode_subject_profile_packed_into,
     open_subject_profile_packed_tnd,
     read_subject_profile_packed_tnd,
     write_subject_profile_tnd,
@@ -256,3 +258,30 @@ def test_stream_writer_rejects_bad_geometry(tmp_path: Path, bad) -> None:
     with pytest.raises(ValueError):
         SubjectProfileStreamWriter(tmp_path / "nope.b2nd", **bad)
     assert not (tmp_path / "nope.b2nd").exists()
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Into-buffer reader
+# ─────────────────────────────────────────────────────────────────────
+def test_decode_into_matches_the_full_load_and_rejects_a_wrong_buffer(
+        tmp_path: Path) -> None:
+    T, N, D = 3, 64, 21
+    pk = _packed(T, N, D, seed=11)
+    p = tmp_path / "s.b2nd"
+    write_subject_profile_tnd(p, _unpacked(pk, D))
+    ref, D_ref = read_subject_profile_packed_tnd(p)
+    assert D_ref == D and np.array_equal(ref, pk)
+
+    out = np.empty(ref.shape, dtype=np.uint8)
+    h = open_subject_profile_packed_tnd(p)
+    try:
+        decode_subject_profile_packed_into(h, out)
+        assert np.array_equal(out, ref)
+        Db = ref.shape[2]
+        for bad in (np.empty(ref.shape, np.float32),
+                    np.empty((T, N, Db + 1), np.uint8),
+                    np.empty((T, N, 2 * Db), np.uint8)[:, :, ::2]):
+            with pytest.raises(ValueError, match="C-contiguous uint8"):
+                decode_subject_profile_packed_into(h, bad)
+    finally:
+        del h

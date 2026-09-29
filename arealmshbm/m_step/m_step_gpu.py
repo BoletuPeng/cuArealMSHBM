@@ -1,10 +1,10 @@
-"""m_step_gpu_sparse.py
+"""m_step_gpu.py
 
-GPU M-step for the step-3 ``gpu_sparse`` backend (design contract:
+GPU M-step for the step-3 ``gpu`` backend (design contract:
 ``docs/step3_sparse_design.md`` section 1 + section 2.3).
 
-Differences vs the dense backends
----------------------------------
+Differences vs the cpu M-step
+-----------------------------
 * ``X`` is **never materialised**. The BOLD lives on device as the
   on-disk bit-packed ``(T, N, D_bytes)`` uint8 buffer plus the two
   per-row fp32 statistics ``row_mean`` / ``row_inv``; the M-step's only
@@ -38,10 +38,14 @@ Numerical mirroring of the CPU reference
 * ``cos``: ``new*old`` in fp32, summed in fp64, stored fp32.
 * empty parcels: ``cn == 0 -> inv_cn = inf -> 0*inf = NaN`` (IEEE, not
   trapping). Note CuPy appends ``-ftz=true`` to every nvrtc compile, so
-  fp32 denormals flush to zero in this module; none of the quantities
-  here get within ~1e-30 of that boundary.
+  fp32 denormals flush to zero in this module, and ``s_lambda`` reaches
+  that boundary: the first M-step of a step-3 session gets
+  ``s_lambda = theta``, whose subnormal cells (a prior can hold a few)
+  are read as 0 here, and E-step posteriors go down to ~1e-38, so the
+  fp32 weight ``s_lambda * row_inv`` in :func:`x_dot_sl_bits` can
+  flush to 0.
 * This module compiles with FMA contraction ON (``options=("-std=c++14",)``
-  — no ``-fmad=false``, unlike ``vmf_clustering/_kernels_gpu_sparse``).
+  — no ``-fmad=false``, unlike ``vmf_clustering/_kernels_gpu``).
   That is the flag the design contract was validated under; leave it.
 * ``kappa`` comes from the host scalar root-finder :func:`invad`.
 
@@ -52,14 +56,11 @@ from __future__ import annotations
 
 from typing import Any, Dict, Tuple
 
+import cupy as cp
 import numpy as np
 
-try:  # cupy is optional at import time (CPU-only boxes import the package)
-    import cupy as cp
-except Exception:  # pragma: no cover - exercised only without cupy
-    cp = None  # type: ignore
-
 from ._invad import invad
+from ._xdot_kernel import XDOT_SL_BITS_SRC
 
 
 # ---------------------------------------------------------------------
@@ -67,9 +68,10 @@ from ._invad import invad
 # ---------------------------------------------------------------------
 ROW_STATS_BLOCK = 128          # 4 warps -> 4 rows per block
 XDOT_BLOCK = 128               # threads own BYTES of the packed row
-XDOT_MAX_NB = 2                # bytes per thread -> D_bytes <= MAX_D_BYTES
-                               # (vmf_clustering/sparse_layout.py)
-XDOT_CHUNK = 64                # members staged per shared-memory chunk
+XDOT_MAX_NB = 2                # bytes per thread -> D_bytes <= XDOT_BLOCK *
+                               # XDOT_MAX_NB (= acc_bits' MAX_D_BYTES today,
+                               # vmf_clustering/sparse_layout.py)
+XDOT_CHUNK = 64                # members per fp32->fp64 fold (fixes the op order)
 FUSED_BLOCK = 256              # block-reduce over D
 REDUCE_BLOCK = 256
 REDUCE_GRID = 1024             # FIXED grid -> fixed reduction order
@@ -129,123 +131,7 @@ void row_stats(const unsigned char* __restrict__ packed,   // (n_rows, D_bytes)
     }
 }
 
-// ---------------------------------------------------------------------
-// (b) X_dot_sl[t, l, d] = sum_{n in members(l)} sl[n,l] * X[n,t,d]
-//     One block per (t, l); threads own BYTES of the packed row so a
-//     single shared-memory byte load feeds 8 accumulators.
-// ---------------------------------------------------------------------
-#define XDOT_MAX_NB XDOT_MAX_NB_VALUE
-#define XDOT_BS     XDOT_BS_VALUE
-
-extern "C" __global__
-void x_dot_sl_bits(const unsigned char* __restrict__ packed,  // (T, N, Db)
-                   const float* __restrict__ row_mean,        // (T, N)
-                   const float* __restrict__ row_inv,         // (T, N)
-                   const int* __restrict__ col_ptr,           // (L+1,)
-                   const int* __restrict__ csc_row,           // (P,)
-                   const int* __restrict__ csc_pidx,          // (P,)
-                   const float* __restrict__ s_lambda_P,      // (P,)
-                   float* __restrict__ out,                   // (T, L, D)
-                   int N, int L, int D, int D_bytes, int chunk)
-{
-    extern __shared__ unsigned char smem_raw[];
-    float* sh_w = (float*)smem_raw;                          // chunk floats
-    unsigned char* sh_bytes = smem_raw + (size_t)chunk * 4;  // chunk*D_bytes
-    __shared__ double sh_red[XDOT_BS];
-    __shared__ double sh_B;
-
-    const int tid = threadIdx.x;
-    const int bs  = blockDim.x;
-    const int blk = blockIdx.x;
-    const int t   = blk / L;
-    const int l   = blk - t * L;
-
-    const int start = col_ptr[l];
-    const int end   = col_ptr[l + 1];
-
-    const unsigned char* base_t =
-        packed + (size_t)t * (size_t)N * (size_t)D_bytes;
-    const float* rm_t = row_mean + (size_t)t * (size_t)N;
-    const float* ri_t = row_inv  + (size_t)t * (size_t)N;
-    float* out_tl = out + ((size_t)t * (size_t)L + (size_t)l) * (size_t)D;
-
-    // --- B = sum_n w_nt * row_mean[t, n]  (per-(t,l), independent of d) ---
-    double bl = 0.0;
-    for (int i = start + tid; i < end; i += bs) {
-        const int n = csc_row[i];
-        const float w = s_lambda_P[csc_pidx[i]] * ri_t[n];
-        bl += (double)(w * rm_t[n]);
-    }
-    bl = block_reduce_f64(bl, sh_red);
-    if (tid == 0) sh_B = bl;
-    __syncthreads();
-    const double B = sh_B;
-
-    // --- A_d = sum_{n : bit(t,n,d)} w_nt ---
-    float  a32[XDOT_MAX_NB * 8];
-    double acc[XDOT_MAX_NB * 8];
-    #pragma unroll
-    for (int k = 0; k < XDOT_MAX_NB * 8; ++k) acc[k] = 0.0;
-
-    for (int cs = start; cs < end; cs += chunk) {
-        const int cnt = (end - cs) < chunk ? (end - cs) : chunk;
-        __syncthreads();
-        // Member-outer / byte-inner staging: consecutive threads read
-        // consecutive bytes of one member row (coalesced) and there is no
-        // integer division by the runtime ``D_bytes`` in the loop.
-        for (int i = 0; i < cnt; ++i) {
-            const int n = csc_row[cs + i];
-            const unsigned char* g = base_t + (size_t)n * (size_t)D_bytes;
-            unsigned char* s = sh_bytes + (size_t)i * (size_t)D_bytes;
-            for (int b = tid; b < D_bytes; b += bs) s[b] = g[b];
-        }
-        for (int i = tid; i < cnt; i += bs) {
-            const int n = csc_row[cs + i];
-            sh_w[i] = s_lambda_P[csc_pidx[cs + i]] * ri_t[n];
-        }
-        __syncthreads();
-
-        #pragma unroll
-        for (int k = 0; k < XDOT_MAX_NB * 8; ++k) a32[k] = 0.0f;
-
-        // <= chunk (64) members folded in fp32, then one fp64 fold.
-        for (int i = 0; i < cnt; ++i) {
-            const float w = sh_w[i];
-            const unsigned char* rp = sh_bytes + (size_t)i * (size_t)D_bytes;
-            #pragma unroll
-            for (int j = 0; j < XDOT_MAX_NB; ++j) {
-                const int b = tid + j * XDOT_BS;
-                if (b < D_bytes) {
-                    const unsigned int bv = (unsigned int)rp[b];
-                    // Branch-free form. ``bit`` is exactly 0.0f or 1.0f, so
-                    // fma(w, bit, a) == a + w (bit=1) / == a (bit=0) with a
-                    // single rounding either way -- bit-identical to the
-                    // predicated ``if (bit) a += w`` but divergence-free.
-                    #pragma unroll
-                    for (int k = 0; k < 8; ++k) {
-                        const float bit = (float)((bv >> k) & 1u);
-                        a32[j * 8 + k] = fmaf(w, bit, a32[j * 8 + k]);
-                    }
-                }
-            }
-        }
-        #pragma unroll
-        for (int k = 0; k < XDOT_MAX_NB * 8; ++k) acc[k] += (double)a32[k];
-    }
-
-    #pragma unroll
-    for (int j = 0; j < XDOT_MAX_NB; ++j) {
-        const int b = tid + j * XDOT_BS;
-        if (b < D_bytes) {
-            #pragma unroll
-            for (int k = 0; k < 8; ++k) {
-                const int d = b * 8 + k;
-                if (d < D) out_tl[d] = (float)(acc[j * 8 + k] - B);
-            }
-        }
-    }
-}
-
+""" + XDOT_SL_BITS_SRC + r"""
 // ---------------------------------------------------------------------
 // sigma_psi[l, d] = sigma[l] * s_psi[l, d]
 // ---------------------------------------------------------------------
@@ -395,8 +281,6 @@ def _module():
     """Compile (once per process) and return the RawModule."""
     global _MODULE
     if _MODULE is None:
-        if cp is None:  # pragma: no cover
-            raise RuntimeError("cupy is required for the gpu_sparse M-step")
         src = (_CUDA_SRC
                .replace("XDOT_MAX_NB_VALUE", str(XDOT_MAX_NB))
                .replace("XDOT_BS_VALUE", str(XDOT_BLOCK)))
@@ -470,7 +354,7 @@ def x_dot_sl_bits(bold_packed_dev, row_mean_dev, row_inv_dev,
             f"D_bytes={D_bytes} exceeds the kernel limit "
             f"{XDOT_MAX_NB * XDOT_BLOCK} (raise XDOT_MAX_NB)"
         )
-    shared = XDOT_CHUNK * 4 + XDOT_CHUNK * D_bytes
+    shared = XDOT_CHUNK * 8          # member weight + row id (no bytes)
     _k("x_dot_sl_bits")(
         (T * L,), (XDOT_BLOCK,),
         (bold_packed_dev, row_mean_dev, row_inv_dev,
@@ -501,7 +385,7 @@ class MStepGPU:
 
     __slots__ = (
         "T", "D", "L", "P", "N", "dim", "epsilon", "max_iter",
-        "bold_packed", "row_mean", "row_inv", "layout",
+        "bold_packed", "row_mean", "row_inv",
         "col_ptr", "csc_row", "csc_pidx",
         "_st_A", "_st_B", "_X_dot_sl", "_sigma_psi", "_cos_TL",
         "_part", "_result", "_flag_acc", "_host",
@@ -511,8 +395,6 @@ class MStepGPU:
                  epsilon: float, max_iter: int,
                  bold_packed_dev, row_mean_dev, row_inv_dev,
                  layout_dev: Dict[str, Any]):
-        if cp is None:  # pragma: no cover
-            raise RuntimeError("cupy is required for MStepGPU")
         self.T = int(T)
         self.D = int(D)
         self.L = int(L)
@@ -526,7 +408,6 @@ class MStepGPU:
         self.bold_packed = bold_packed_dev
         self.row_mean = row_mean_dev
         self.row_inv = row_inv_dev
-        self.layout = layout_dev
         self.col_ptr = layout_dev["col_ptr"]
         self.csc_row = layout_dev["csc_row"]
         self.csc_pidx = layout_dev["csc_pidx"]

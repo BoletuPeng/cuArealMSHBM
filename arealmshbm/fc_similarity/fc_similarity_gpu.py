@@ -32,8 +32,7 @@ per element:
 Empirically the cascaded drift is well inside the step-0 RNG /
 orientation tolerance documented in
 ``docs/step0_flow_and_subgraphs.md``; the downstream ICC scorer
-(maintained out of tree) is the binding correctness gate after MATLAB
-decoupling.
+(maintained out of tree) is the binding correctness gate.
 
 cupy import lives at module top — this file is only loaded via the
 ``backend == 'gpu'`` dispatch branch in
@@ -182,9 +181,9 @@ def compute_FC_simi_block_gpu(
         # block = (FC_B.T @ FC_A) / (mag_b ⊗ mag_a) with NaN→0 clamp,
         # written directly into the FC_simi_block slice. Fuses 2
         # broadcast divides + cp.nan_to_num + slice copy = 4 kernel
-        # launches collapsed into 1. The cp.nan_to_num that previously
-        # ran once at the end is now per-slice (mathematically
-        # equivalent — see CPU compute_FC_simi_block for the rationale).
+        # launches collapsed into 1. The NaN clamp runs per slice
+        # (equivalent to one clamp at the end — see CPU
+        # compute_FC_simi_block for the rationale).
         block_d = FC_B_d.T @ FC_A_d                         # (kb, block_a_size)
         fused_div_nanclamp_cupy(
             block_d, mag_b_d, mag_a_d,

@@ -1,13 +1,10 @@
 # Step-2 `gpu` backend — design contract (v2)
 
-Working spec for the P-layout / bit-packed step-2 GPU backend (Mode-B
-group-prior EM). It shipped in 2026-09 as the opt-in value
-`backend='gpu_sparse'` beside the dense CuPy port that held `backend='gpu'`;
-that port was removed on 2026-09-09 and this backend is now `backend='gpu'`
-(the old name is rejected, not aliased). The **numerical reference is the
-CPU backend** (`backend='cpu'`: the numba master in
+Working spec for the P-layout / bit-packed step-2 GPU backend
+(`backend='gpu'`, Mode-B group-prior EM). The **numerical reference is
+the CPU backend** (`backend='cpu'`: the numba master in
 `step2_em_iter_master/_kernels.py` plus the numba outer leaves in
-`step2_em_outer/_kernels.py`), never that dense port. Module names follow
+`step2_em_outer/_kernels.py`). Module names follow
 the per-leaf convention — `step2_em_iter_master/_kernels_gpu.py` (kernels)
 and `session_gpu.py` (`Step2SparseSession`); the class and the `step2_io`
 modules keep "sparse" in their names because it describes the layout.
@@ -25,7 +22,7 @@ Bench: `testdata/step2_bench/proj` — sub-001, fsaverage6, `N=81924 (n_lh=40962
 `ini_val=403.611`. `testdata/step2_bench/proj2` is the same with S=2
 (reference-cohort sub1+sub2). RTX 5090 Laptop (sm_120, 82 SMs, 64 MB L2, 24 GB), cupy 13.6, NVRTC 12.9.
 
-| the dense CuPy port (retired 2026-09), fresh process, S=1 | wall |
+| the dense CuPy port (2026-09-03), fresh process, S=1 | wall |
 |---|---:|
 | load_inputs | 0.19-0.32 s (boundary .mat → dense (N,L) 0.11) |
 | initialize_params.compose (CPU numba) | 0.52 s |
@@ -51,7 +48,7 @@ Structure that makes the rewrite possible:
   EM iter on. Converged `nnz(theta) = 73 655` (S=1) / `110 495` (S=2).
 * BOLD is binary (density 9.7 %); `X[n,t,d] = (bit − mean)·inv` is never
   materialised — every contraction with `X` is a bit-sum plus a rank-1 term.
-* **The old dense GPU port is wrong at S=1**: fp32 `exp` (CuPy is flush-to-zero,
+* **The dense GPU port is wrong at S=1**: fp32 `exp` (CuPy is flush-to-zero,
   cliff at −87.3 vs −745 for the CPU's fp64) kills 5 528 alive vertices vs 1 303 on
   the CPU; cost −5 %, `kappa` 954 vs 922, 4 744 theta-argmax flips (S=2: 5 071).
   The rewrite restores the CPU semantics (fp64 `exp`, full-row `rmax` at iteration 1,
@@ -59,7 +56,7 @@ Structure that makes the rewrite possible:
 
 Measured warm at S=1 (`step2_pipeline/profile.py`): EM iter ~3.1 ms,
 `Step2Pipeline.run()` 0.32-0.36 s, run-to-run identical (`np.array_equal` on
-every saved field), CPU-parity band far tighter than the old GPU's (§7, §9).
+every saved field), CPU-parity band in §7, §9.
 
 ## 1. Numerics contract
 
@@ -125,12 +122,16 @@ X_dot_sl[s,t,l,d] = Σ_{n ∈ members(l)} s_lambda[s,n,l] · X[s,n,t,d]
                   = Σ_{n: bit(s,t,n,d)} w_n − Σ_n w_n · mean[s,t,n],   w_n = s_lambda[s,n,l] · inv[s,t,n]
 ```
 
-`members(l)` = the **active** CSC column (§2.3). Port `x_dot_sl_bits`
-(step-3 `m_step/m_step_gpu_sparse.py:133-240`) verbatim: block per `(s,t,l)`,
-128 threads, members staged in shared memory in chunks of 64, fp32 `fmaf`
-folds into an fp64 running sum, fp32 store. Measured 3.7-4.05 ms on the full P,
-0.57 ms on the active support. `w_n` is a native fp32 multiply (FTZ, §1.10 —
-accepted: a subnormal `s_lambda` contributes < 1e-38 relative).
+`members(l)` = the **active** CSC column (§2.3). `x_dot_sl_bits` is the one
+kernel text shared with step 3 (`m_step/_xdot_kernel.py`; launched here at
+256 threads × 1 byte): one launch per subject `s` (on that subject's packed
+BOLD, row stats and `s_lambda[s]`), grid `T·L` with a block per `(t,l)`,
+member weights + row ids staged in shared memory in chunks of 64, member
+bytes read with a 4-deep `__ldg` prefetch, fp32 `fmaf` folds into an fp64
+running sum every chunk, fp32 store (per-launch numbers: §9, the table's
+per-launch row and the "Kernel history of the perf pass" paragraph). `w_n` is a native
+fp32 multiply (FTZ, §1.10 — accepted: a subnormal `s_lambda` contributes
+< 1e-38 relative).
 
 ### 1.4 Phase B — M-step
 
@@ -173,8 +174,9 @@ bench) single-threaded; acceptable (§8).
 
 ### 1.5 Phase C — spatial_connect (gMSHBM) — exact except `u_update`/`cross` order
 
-Per subject (CPU `_kernels.py:432-547`), all `t`-invariant because the gradient
-is session-invariant; evaluated on the active support (§2.3):
+Per subject (CPU `_kernels.py::_spatial_connect_per_subject_numba`), all
+`t`-invariant because the gradient is session-invariant; evaluated on the active
+support (§2.3):
 
 ```
 sum_lambda[l] = serial ascending-n fp32 sum over members(l) of s_lambda      (exact; native fp32, §1.10 note)
@@ -219,7 +221,8 @@ Such cells are `-inf` whenever `theta_out == 0`, i.e. from the first E.2 on. So:
   (§3 K7) with the same fp32 op order;
 * afterwards `rmax = rmax_P(n)` — bit-identical to the dense CPU rmax.
 
-Cost (fp32, per row, ascending `l` over P(n); CPU `_kernels.py:742-805`):
+Cost (fp32, per row, ascending `l` over P(n); CPU
+`_kernels.py::_fused_estep_per_subject_NTD`, its "Step 3: per-subject cost" block):
 
 ```
 row_sum = serial fp32 Σ_l f32(scr[p]) * 1.0f
@@ -334,16 +337,17 @@ class Step2Layout:
 ```
 
 Invariants (raise `ValueError`): `N == 2*n_lh`, `L == 2*L_lh`, no cross-hemisphere
-cell, every value exactly 1.0 after `eliminate_zeros`, `P > 0`. Builders:
+cell, every value exactly 1.0 after `eliminate_zeros`, `P > 0`. Builder:
 `build_step2_layout(lh_mask, rh_mask)` (any scipy sparse, converted to CSR
-internally) and `build_step2_layout_dense(bm_NL)` (reference for tests);
-`layouts_equal(a, b)`; `layout_to_device(layout) -> dict`.
+internally); `layout_to_device(layout) -> dict`. The dense reference
+builder `build_step2_layout_dense(bm_NL)` and `layouts_equal(a, b)` are
+test oracles in `arealmshbm/step2_io/tests/_layout_oracle.py`.
 
 ### 2.2 Device buffers (S subjects)
 
 | name | shape / dtype | notes |
 |---|---|---|
-| `packed` | `(S, T, N, Db)` uint8 (`eager_bitpacked`) or one `(T, N, Db)` slot (`stream`) | on-disk layout; padding bits zero (writer contract; cheap check on subject 1) |
+| `packed` | `(S, T, N, Db)` uint8 (`eager_bitpacked`) or one `(T, N, Db)` slot (`stream`) | on-disk layout; padding bits zero (writer contract, not checked) |
 | `row_mean`, `row_inv`, `n_alive` | `(S, T, N)` fp32 ×2, `(S, N)` int32 — device-resident for ALL S in both cache modes (computed once in the ctor; stream mode only H2Ds the packed bytes per visit) | §1.1 |
 | `n_alive` | `(S, N)` int32 | |
 | `grad`, `grad_sq` | `(S, N, Dg)` fp32, `(S, N)` fp32 | gMSHBM only; device-resident (no stream mode for grad in v1) |
@@ -360,18 +364,26 @@ internally) and `build_step2_layout_dense(bm_NL)` (reference for tests);
 | `u_update` / `u` | `(L, Dg)` fp32 | |
 | `cost_S` | `(S,)` fp64 + pinned host mirror | |
 | M-step scratch | `partials (1024,) fp64`, `cos (S,T,L) fp32`, `flag (S,T) int8`, pinned 4-double slot | |
-| iteration-1 scratch (freed after) | `X_dense (N, T·D)` fp32 770 MB, `lv_dense (N, L)` fp32, `cross_dense (N, L)` fp32 | §3 K7 |
+| iteration-1 scratch (freed after) | one 8192-row tile: `X_tile (8192, T·D)` fp32 (~230 MB at T=6), `lv_tile (8192, L)` fp32, `cross_tile (8192, L)` fp32; `nu` transposed to `(T·D, L)` fp32 | §3 K7 |
 
 Sizing rule for `bold_cache_mode='auto'` (device bytes, evaluated after draining the cupy pools so `mem_info` reflects what this process can allocate): `packed` + `S·P·4` (`s_lambda`) + `2·S·L·D·4` (psi ping-pong) + `2·S·T·N·4` (row stats) + `S·N·4` (`n_alive`) +
-`grad`/`grad_sq` + `2·S·T·L·D·4` (`s_t_nu`, `X_dot_sl`) + `2·S·L·D·4` + the 1 GB
-iteration-1 scratch + `bold_cache_safety_margin_gb` must fit in free memory,
+`grad`/`grad_sq` + `2·S·T·L·D·4` (`s_t_nu`, `X_dot_sl`) + `2·S·L·D·4` + the
+iteration-1 scratch `8192·(T·D + 2·L)·4 + T·D·L·4` + `bold_cache_safety_margin_gb` must fit in free memory,
 else `stream`. An explicit `eager_bitpacked` that does not fit raises
-`ValueError` with the sizes (the old backend's contract); `auto` warns and falls
-back. an explicit `stream` still validates that the resident state fits (named `ValueError` otherwise). `stream` = per-visit H2D of one subject's packed bytes (no row-stats recompute) from a **host**
-packed cache `(S, T, N, Db)` uint8 (pageable numpy, decoded once in
-`load_inputs`; S·72 MB host RAM — document it) into the pinned slot; two visits
-per subject per EM iter (X_dot_sl needs every subject before the M-step; K6 needs
-the post-M-step `s_t_nu`). If `grad` alone does not fit, raise (S > ~150 on 24 GB).
+`ValueError` with the sizes; `auto` warns and falls
+back. An explicit `stream` still validates that the resident state fits (named `ValueError` otherwise).
+`eager_bitpacked` fills the device cache straight from `inputs.bold_reader` through a
+2-slot page-locked ring (one decode runs ahead of the H2D + row stats; a blosc2 decode
+holds the GIL, so decodes do not overlap and deeper rings measured within noise) allocated outside cupy's
+pinned pool and released once the cache is full — no host memory of the cohort outlives
+the constructor in eager mode. `stream` = per-visit
+H2D of one subject's packed bytes (no row-stats recompute) from a **host**
+packed cache `(S, T, N, Db)` uint8 (pageable numpy the Session builds in its
+constructor when `S·T·N·Db ≤ 0.5 × available host RAM`, psutil; S·72 MB host RAM —
+else every visit decodes through the reader and a `RuntimeWarning` says so) into the
+pinned slot; two visits per subject per EM iter (X_dot_sl needs every subject before
+the M-step; K6 needs the post-M-step `s_t_nu`). If `grad` alone does not fit, raise
+(S > ~150 on 24 GB).
 
 ### 2.3 Active support (dynamic, exact)
 
@@ -406,25 +418,26 @@ One `cupy.RawModule` (`-std=c++17 -fmad=false`, lazily compiled, process-global)
 in `arealmshbm/step2_em_iter_master/_kernels_gpu.py`. Rules: no
 floating-point atomics; every reduction is a fixed-shape tree over a fixed grid;
 kernels never allocate; `long long` indexing where products can exceed 2^31;
-each kernel has a thin host wrapper validating shapes/dtypes/contiguity. Measured
+every `RawModule` kernel launch goes through the session's `_call` (the
+static limits are `check_dims`, once in the session ctor). Measured
 host floors on this box: 6.1 µs per launch, 15 µs per null-stream sync, 44 µs per
 pinned-slot D2H (`.get(out=pinned)`).
 
 | # | kernel | geometry | contract |
 |---|---|---|---|
 | K0 | `row_stats_exact` | thread per (s,t,n) row | §1.1; writes `row_mean`, `row_inv`; a second kernel counts `n_alive` |
-| K1a | `init_hard_labels` | block per 8 rows (s,n): 256 threads; lanes/warps own `l`; `g[d, :]` staged per d-tile and reused across the 8 rows | §1.2; per-(n,l) accumulator stays a private serial ascending-d fp32 sum; warp argmax with first-index tie rule; `norm_sq` serial fp32 |
+| K1a | `init_hard_labels` | block per 32 rows (s,n) (8 warps × 4 rows): 256 threads; lanes own `l`, each warp owns 4 rows; the rows' `a_d` staged in smem per d-tile; `g[d, :]` read from global, each load reused across the warp's 4 rows | §1.2; per-(n,l) accumulator stays a private serial ascending-d fp32 sum; warp argmax with first-index tie rule; `norm_sq` serial fp32 |
 | K1b | `init_compose` | thread per (s,n); then thread per p | §1.2: binary-search `l_act` in `col[row_ptr[n]:row_ptr[n+1]]`; `theta[p]` from `Σ_s s_lambda[s,p] > 0` |
 | K2 | `sigma_psi_SLD` | grid-stride | exact |
-| K3 | `x_dot_sl_bits` | block per (s,t,l), 128 thr, dyn smem `64*4 + 64*Db` (≤ 17.7 KiB) | verbatim step-3 port over the **active** CSC; wrapper requires `Db ≤ 256` (raise `ValueError` naming the seed mesh: `backend='gpu'` supports `ceil(D/8) ≤ 256`, i.e. seed mesh fsaverage3) |
+| K3 | `x_dot_sl_bits` | one launch per subject s: grid T·L (block per (t,l)), 256 thr × 1 byte, dyn smem `64*8` B (member weights + row ids) | the kernel text shared with step 3 (`m_step/_xdot_kernel.py`) over the **active** CSC; no host wrapper — `check_dims` (session ctor) rejects `Db > 256` (the kernel's `XDOT_BLOCK × XDOT_MAX_NB`) with a `ValueError` naming the seed mesh: `backend='gpu'` supports `ceil(D/8) ≤ 256`, i.e. seed mesh fsaverage3 |
 | K4a | `kappa_sum_stage1` / `reduce_stage2` | fixed grid 1024×256 / 1 block | fp32 product, fp64 tree |
 | K4b | `mstep_flags_kappa` | (S·T) blocks for the flags; the last block (or a 1-thread tail) computes `rbar`, device `invad`, clamps, `drift`, `kappa_f32`, `all_flag` → pinned slot | one launch fewer than a separate kappa kernel; the flag pass and the scalar epilogue are ordered by launching the epilogue as a 1-block kernel after the flags (2 launches) if a single-launch grid-wide ordering is not available — either way ≤ 6 launches per iter_m |
 | K4c | `mstep_fused_body` | block per (s,t,l), 256 thr, dyn smem `4*D` | §1.4; `kappa_f32` read from the device slot; **read `old` into a register before the in-place store**; writes `cos[s,t,l]` |
 | K4e | `cdln_after_loop` | 1 thread | `cdln_val = f32(Cdln(kappa_final))`, once per `run_iter` |
 | K5a | `connect_u` | grid (L, ntile=4): member tiles, fixed-tree combine in a second stage | `sum_lambda` serial fp32 (ascending members, one thread), `u_update` fp64, `inv_l`, `u`, `u_sq` serial fp32 |
 | K5b | `connect_scv_P` | thread per active p | `cross` fp32 serial over d; `vmf`; T sequential adds; NaN kept |
-| K6 | `acc_P` (lv_sum on active P) | block per (s,l,tile): 256 thr; members of the active column in chunks of 256; inner loop over t restages `nu[s,t,l,:]` **as `Db*8` floats with the tail zero-filled** + `S[t,l]` in smem | thread per member: 147 packed bytes (`__ldg`), `pt = serial ascending-d fp32 Σ` via branch-free `fmaf((float)bit, nu_sm[d], pt)` (measured bit-identical to set-bit iteration and 1.9× faster), `part += (double)inv * ((double)pt − (double)mean * S)`; after T: `lv_sum[p] = f32(part)`. `S[t,l]` from a block-per-(s,t,l) fp64 row-sum kernel. Measured 3.07 ms on full P → ~0.4 ms on the active support |
-| K7 | iteration-1 dense pass (only while `theta_out != 0`) | (i) `widen_exact`: `X_dense[n, t·D+d] = (f32(bit) − mean)·inv` (thread per row; exact); (ii) `lv_dense = X_dense @ nu.reshape(T·D, L)` via cuBLAS sgemm (**16.6 ms**; `nu` transposed to `(T,D,L)` first); (iii) `cross_dense = grad @ u.T` (sgemm, 0.3 ms); (iv) `rmax_out_k`: warp per (s,n), lanes over l ∉ P(n) (smem scatter of the row's P cols), gMSHBM: same-hemisphere only, `lc = T-fold of ((2f·cross − grad_sq) − u_sq[l])`; dMSHBM: all l, no lc term; `lam = (kappa_f32·lv + f32(n_alive)·cdln) + f32(log(theta_out)) [+ beta_f32·lc]`; NaN skipped; `-inf` if none | ~35-40 ms once per run (S=1), 1 GB transient freed after. No TF32 scope wraps step 2 (the dense port's `enable_tf32` knob went with it), so the sgemm runs strict fp32 |
+| K6 | `acc_P` (lv_sum on active P) | one launch per subject s: grid L (block per l), `ACC_BLOCK` = 768 thr; members of the active column in chunks of 768; inner loop over t restages `nu[s,t,l,:]` **as `Db*8` floats with the tail zero-filled** in smem | thread per member: 147 packed bytes (`__ldg`), `pt = serial ascending-d fp32 Σ` via branch-free `fmaf((float)bit, nu_sm[d], pt)` (measured bit-identical to set-bit iteration and 1.9× faster), `part += (double)inv * ((double)pt − (double)mean * S)`; after T: `lv_sum[p] = f32(part)`. `S[t,l]` from a block-per-(s,t,l) fp64 row-sum kernel. Measured 3.07 ms on full P → ~0.4 ms on the active support |
+| K7 | iteration-1 dense pass (only while `theta_out != 0`) | (i) `widen_exact`: `X_tile[i, t·D+d] = (f32(bit) − mean)·inv` (8192-row tiles, warp per (n, t) row; exact); (ii) `lv_tile = X_tile @ nu.reshape(T·D, L)` via cuBLAS sgemm (**16.6 ms**; `nu` transposed to `(T,D,L)` first); (iii) `cross_tile = grad @ u.T` (sgemm, 0.3 ms); (iv) `rmax_out_k`: warp per (s,n), lanes over l ∉ P(n) (smem scatter of the row's P cols), gMSHBM: same-hemisphere only, `lc = T-fold of ((2f·cross − grad_sq) − u_sq[l])`; dMSHBM: all l, no lc term; `lam = (kappa_f32·lv + f32(n_alive)·cdln) + f32(log(theta_out)) [+ beta_f32·lc]`; NaN skipped; `-inf` if none | ~35-40 ms once per run (S=1), one-tile transient freed after. No TF32 scope wraps step 2, so the sgemm runs strict fp32 |
 | K8 | `estep_row1` | thread per row n (measured: better than warp-per-row at ≤ 15 cells) | §1.6 up to `scr`; reads `rmax_out` when the flag is set; skips `lv_sum` reads for inactive cells; writes `log_vmf[p]`, `scr[p]`, `rmax[n]` |
 | K9 | `dead_col` | grid (L, ntile) over active members + fixed-tree combine | fp64 NaN-skipping sum; if 0 → write 0 to those `scr[p]` |
 | K10 | `estep_row2` | thread per row n | cost row (fp32) → block partials fp64; E.1 (§1.7, `f32_rn` store) → `s_lambda[s,p]`; `tmp_idx` from `n_alive`; explicit zeros for inactive cells |
@@ -456,8 +469,9 @@ class Step2SparseSession:
     def __init__(self, inputs: "Step2SparseInputs", *, mode, num_clusters, dim, ini_val,
                  beta_internal, eps_m_step, max_iter_m, eps_intra_var, max_iter_intra_var,
                  bold_cache_mode="auto", bold_cache_safety_margin_gb=4.0)
-    # ctor: layout → device; sizing rule (§2.2); packed BOLD → device cache (filled through
-    #       inputs.bold_reader into ONE pinned (T,N,Db) slot, subject by subject) or stream slot;
+    # ctor: layout → device; sizing rule (§2.2); packed BOLD → device cache (eager: filled through
+    #       inputs.bold_reader on a 2-slot page-locked ring, released afterwards) or stream slot (+ the
+    #       §2.2 host cache when it fits);
     #       K0 row stats; grad + grad_sq (via one pinned (N,Dg) slot); mtc; allocate every
     #       buffer (zero-filled where §1.2 says so); compile the module. No EM work.
     S: int                                    # subject count (seeds the shared EM loop's cost vector)
@@ -498,9 +512,8 @@ class Step2SparseInputs:
     S: int; T: int; N: int; D: int; D_grad: int; n_lh: int; n_rh: int
     mtc: np.ndarray                     # (D, L) fp64, verbatim group.mat 'mtc' (D = 1175 here; dim = D-1)
     dim: int
-    bold_reader: Callable[[int, np.ndarray], None]   # bold_reader(s_1, out_TNDb): fill a caller buffer (any mode)
-    packed_host: Optional[np.ndarray]   # (S, T, N, Db) uint8, PAGEABLE, present when the host cache was built
-                                        # (default for every mode except when S·T·N·Db exceeds the host budget)
+    bold_reader: Callable[[int, np.ndarray], None]   # bold_reader(s_1, out_TNDb): one .b2nd decode into a caller buffer;
+                                        # the Session may call it from up to _INGEST_DEPTH worker threads at once (distinct subjects and buffers)
     grad_reader: Optional[Callable[[int, np.ndarray], None]]   # grad_reader(s_1, out_NDg) (gMSHBM), else None
     timings: Dict[str, float]
     @classmethod
@@ -513,17 +526,20 @@ def load_step2_sparse_inputs(cfg: Step2Config, *, overlap: bool = True) -> Step2
 * cohort.json + the same consistency checks as today (`num_sub`, `num_session`,
   mesh targ/seed); MW contract verification of subject 1 / session 1 (packed
   bytes at MARS rows must be zero); dims from vlmeta.
-* BOLD: `blosc2.open(path, mode='r')`, `a[:]` (≈ 45 ms per subject, GIL-released)
-  on a ≤ 4-worker pool into the pageable host cache; `bold_reader` copies from the
-  cache when present, else decodes from disk. Host budget: build the cache when
-  `S·T·N·Db ≤ 0.5 × available RAM` (psutil if present, else 16 GB), else
-  `packed_host = None` and stream mode decodes per visit (document the 2·S·45 ms
-  per EM iter bill).
-* gradient: suffix-sniffed like `SubjectGradientLoader` (`.npy` → `np.load[:, :Dg]`,
-  `.mat` → `load_subject_gradient._read_emb_100`), concatenated to `(N, Dg)` fp32,
-  no T replication.
+* BOLD: subject 1's header + one chunk (the MW contract) are read here, from one open;
+  `bold_reader` is `blosc2.open(path, mode='r')` + `get_slice_numpy` straight into the
+  caller's buffer (`profile_io.decode_subject_profile_packed_into`; ≈ 47 ms per subject
+  at fsaverage6 / T=6 — `a[:]` + copy was 63 ms and a second 72 MB host
+  copy), with the per-subject header checks on every call. Residency is the Session's
+  (§2.2): the eager device cache is filled through the reader on a 2-slot page-locked
+  ring; the stream-mode host cache is built when `S·T·N·Db ≤ 0.5 × available host RAM`
+  (psutil), else stream mode decodes per visit (2·S·47 ms per EM iter).
+* gradient: `data_io.fetch_data.read_gradient_emb` per hemisphere (`.npy` or `.mat`,
+  the same reader step 3 uses), concatenated to `(N, Dg)` fp32, no T replication.
+  All subjects share one suffix: `SubjectGradientLoader` rejects a mixed cohort on
+  both backends.
 * `group.mat`: `mat5_stream.read_fields(path, {'mtc'})` — streaming inflate
-  (isal when installed, stdlib `zlib` otherwise) that never inflates the 22 MB
+  (isal_zlib) that never inflates the 22 MB
   `lambda` field's body: the container cursor advances by the raw element size,
   and a skipped compressed element is inflated only far enough to read its name.
   Header walk confirms `epsil`, `lh_labels`, `rh_labels` exist. Falls back to
@@ -550,9 +566,8 @@ build rather than materialising the matrix this module returns.
 ## 6. Pipeline, config, save, driver
 
 * `Step2Config.backend ∈ {'cpu', 'gpu'}`; `'gpu'` = this backend.
-  `PipelineConfig.backend_step2` takes the same two values as step0/step1
-  (`_VALID_BACKENDS_STEP012`). `pipeline.__exit__` frees the pools on `'gpu'`.
-  There is no step-2 TF32 scope or `enable_tf32` knob (see the K7 note).
+  `PipelineConfig.backend_step{0,1,2,3}` all validate against
+  `_VALID_BACKENDS` = `("cpu", "gpu")`. `pipeline.__exit__` frees the pools on `'gpu'`.
 * `Step2Pipeline.run()` dispatches: `'gpu'` → `load_inputs_sparse()` →
   `_run_em_sparse()`; the CPU path is untouched. `Step2Inputs` and
   `Step2SparseInputs` are both re-exported from `step2_pipeline/__init__.py`.
@@ -561,7 +576,7 @@ build rather than materialising the matrix this module returns.
   §4 API. `Step2Result.timings` gains `init_device`, `closure_total`, `save`.
 * Save: `_save_params` moves to `step2_pipeline/_save.py::save_params_final(Params,
   path)` (T2 lands this first; `pipeline.py` keeps a one-line delegation). `mu`
-  is transposed to `(D, L)` as before, and the file is the legacy dense fp64
+  is transposed to `(D, L)`, and the file is the MATLAB-layout dense fp64
   `theta` block with `do_compression=True` on every backend — the sparse
   backend's `export_params()` hands over a `csc_matrix` and the writer
   densifies it, because CBIG's MATLAB `log(Params.theta)` does not accept a
@@ -576,7 +591,7 @@ build rather than materialising the matrix this module returns.
   `backend_step2 == 'gpu'`. `Pipeline.__init__`
   (`_validate_inputs_vs_config` → `_require_fsaverage3_seed`) rejects a
   `seed_mesh` other than `fsaverage3` for `backend_step2` (Mode B only) and
-  for `backend_step3`, so a cohort that the sparse kernels cannot take does
+  for `backend_step3='gpu'`, so a cohort that the sparse kernels cannot take does
   not get discovered after step 1 (the other two static limits,
   `num_clusters <= 32*INIT_MAXJ` = 512 and
   `n_grad_components <= (49152 - 2064)/4` = 11772 — `connect_u`'s dynamic
@@ -597,10 +612,7 @@ build rather than materialising the matrix this module returns.
   `--runs`, `--prewarm`, `--num-sub/--num-session/--num-clusters`, `--beta`;
   prints the per-stage table (load, init, ctor, em_total with per-iter mean and
   iter count, closure, save, total) plus the Session's cumulative host walls.
-  Stage timing only — the per-kernel cuda-event timers this Session once
-  carried were removed (a host-blocking `synchronize()` per timed group, worth
-  ~6-10 % of `em_total`, in production code); use Nsight for a per-kernel
-  breakdown.
+  Stage timing only; use Nsight for a per-kernel breakdown.
 * A/B: an internal step-2 comparison harness — runs `cpu`/`gpu`
   (or loads existing `Params_Final.mat`), densifies theta through a
   `_densify` shim before any comparison, reports per-inter `Record`, `kappa`,
@@ -608,8 +620,7 @@ build rather than materialising the matrix this module returns.
   dead-alive rows (alive from the packed BOLD), EM iter counts, and run-to-run
   identity on `(theta.indptr, theta.indices, theta.data)` + every other field.
 * Docs: this file; `docs/step2_flow_and_subgraphs.md` "Backends" + wall table;
-  `docs/step2_em_iter_master_kernel.md` corrections (R1 §13: LOG_EPS20 value,
-  fp32 GPU-dense caveats, `(N,T,D)` layout, retired E-step paragraph);
+  `docs/step2_em_iter_master_kernel.md` (LOG_EPS20 value, `(N,T,D)` layout);
   `lib/hyperparameters/step2.json` description text for `backend_step2`.
 
 ## 7. Validation
@@ -626,8 +637,9 @@ Fixtures: `testdata/step2_bench/proj` (S=1) and `proj2` (S=2), env override
    labels/medial/s_lambda/theta `np.array_equal` vs `compose_init_state`; K3 vs an
    fp64 matmul: max rel ≤ 1e-4 and ≤ 10× the fp32 sgemm's error; K4c in-place: run
    with `eps = 0` for ≥ 2 iter_m, assert `cos != 1` and `s_t_nu` bit-equal to a
-   ping-pong reference; K5 `sum_lambda`, `u_sq`, `grad_sq` exact, `log_connect` on
-   P within 1e-5 rel of the CPU kernel, NaN pattern equal; K6 vs `X @ s_t_nu` fp64:
+   ping-pong reference; K5 `sum_lambda` exact, `grad_sq` within 1e-3 × max of an
+   fp32 einsum, `log_connect` on P within 1e-5 rel of the CPU kernel, NaN pattern
+   equal; K6 vs `X @ s_t_nu` fp64:
    max rel ≤ 3e-4; K7 `rmax_out` vs a dense numpy evaluation of the same expression
    (incl. the cross-hemisphere `-inf` rule); K8-K10 with the CPU
    `_fused_estep_per_subject_NTD` + `_phase_e1_normalize_per_subject_kernel` fed
@@ -642,9 +654,9 @@ Fixtures: `testdata/step2_bench/proj` (S=1) and `proj2` (S=2), env override
    `invad` is asymptotic, real `Step2Layout` from a synthetic block-diagonal mask)
    against `Step2EmIterSession` (CPU) fed the same bits through
    `InMemoryProfileLoader` after the CPU widen: bars `s_t_nu/theta/s_lambda
-   ≤ 5e-3`, `kappa ≤ 1e-4` (the retired dense port's parity bars);
+   ≤ 5e-3`, `kappa ≤ 1e-4`;
    gMSHBM and dMSHBM.
-3. **End-to-end A/B** (`compare_step2_backends.py`) on S=1 and S=2: `gpu`
+3. **End-to-end A/B** (the internal step-2 comparison harness) on S=1 and S=2: `gpu`
    twice → identical on every saved field (**required**); vs CPU: theta argmax
    flips ≤ 500,
    dead-alive rows within ±100 of the CPU's (1 303 at S=1; the dense port: 4 744 /
@@ -654,7 +666,7 @@ Fixtures: `testdata/step2_bench/proj` (S=1) and `proj2` (S=2), env override
    **Additionally REPORTED (not barred), every A/B:** `epsil` max-rel *and* the
    conditioning-aware per-parcel `|log10(epsil_a/epsil_b)|` median / max, and
    `mu` per-column cosine min / median. Both are printed by
-   `compare_step2_backends.py`. They are excluded from the bars for the reason
+   the internal step-2 comparison harness. They are excluded from the bars for the reason
    in §8 (`invAd` near `R -> 1` is ill-conditioned; `mu` max-rel measures the
    wrong thing for a unit direction) — but a summary that omits them is
    incomplete, because the headline "matches CPU" is otherwise carried entirely
@@ -709,7 +721,7 @@ Fixtures: `testdata/step2_bench/proj` (S=1) and `proj2` (S=2), env override
   element-wise `mu` max-rel of ~2.0 at S=1 is one sign-flipped near-zero
   component. Downstream, step 3 uses `epsil` only inside
   `s_psi = normalize(sigma·Σ nu + epsil·mu)`, where `epsil >> sigma` makes
-  `s_psi ≈ mu` regardless of the magnitude. `compare_step2_backends.py` prints
+  `s_psi ≈ mu` regardless of the magnitude. The internal step-2 comparison harness prints
   both the log10-ratio view of `epsil` and the per-column cosine of `mu`, and
   §7.3 requires them **reported** (not barred).
 * Potential later win: per-subject member compaction by `s_lambda[s] != 0` for K3
@@ -719,7 +731,7 @@ Fixtures: `testdata/step2_bench/proj` (S=1) and `proj2` (S=2), env override
 
 | | S=1 | S=2 |
 |---|---:|---:|
-| warm `Step2Pipeline.run()` | 0.32-0.36 s (was 6.9 s dense GPU / 71 s CPU) | 0.59-0.64 s (was 14.0 / 103 s) |
+| warm `Step2Pipeline.run()` | 0.32-0.36 s (dense GPU port 6.9 s / CPU 71 s) | 0.59-0.64 s (14.0 / 103 s) |
 | `em_total` | 0.118 s, 42 `run_iter`, ~3.1 ms each incl. K7 (~2.5 ms steady) | 0.234 s, 42 calls |
 | `load_inputs` / `session_ctor` / `init_device` / closure / save | 0.100 / 0.058 / 0.009 / 0.019 / 0.006 s | 0.174 / 0.086 / 0.017 / 0.063 / 0.006 s |
 | per-launch: K3 / K6 / K8-10 / K4 per iter_m / K5 / K12 / K7 once | 0.34 / 0.35 / 0.40 / 0.17 / 0.15 / 0.22 / 25 ms | 0.85 / 0.44 / 0.40 / 0.31 / 0.19 / 0.22 / 23 ms |
@@ -727,14 +739,17 @@ Fixtures: `testdata/step2_bench/proj` (S=1) and `proj2` (S=2), env override
 | vs CPU: theta argmax flips / support-diff rows / dead-alive rows | 0 / 1 / 1303 = 1303 | 0 / 0 / 168 = 168 |
 | vs CPU: `kappa` / first-inter `Record` rel / `sigma` max-rel | 0.0 / 4.0e-6 / 3.9e-3 | 0.0 / 1.4e-6 / 3.7e-4 |
 | run-to-run | identical on every saved field | identical |
-| step 3 labels from this prior vs from the CPU prior (sub-001, gpu_full) | identical (0 / 73 641) | — |
-| the retired dense port, for comparison: flips / dead rows / step-3 label agreement | 4 744 / 5 528 / 93.5 % | 5 071 / 1 140 / — |
+| step 3 labels from this prior vs from the CPU prior (sub-001, step-3 dense GPU EM) | identical (0 / 73 641) | — |
+| the dense GPU port (2026-09-03), for comparison: flips / dead rows / step-3 label agreement | 4 744 / 5 528 / 93.5 % | 5 071 / 1 140 / — |
 
 Kernel history of the perf pass (every step gated on bit-identical saved
-Params): K3 dropped the shared-memory member staging (coalesced `__ldg` of the
-row every thread walks anyway) and went to 256 threads × 1 byte with a 4-deep
-member prefetch (0.80 → 0.33 ms); K6 uses 768-thread blocks (the 75-533-member
-columns then take one pass) and an 8-byte prefetch (0.77 → 0.34 ms);
+Params): K3 dropped the shared-memory staging of the member bytes (coalesced
+`__ldg` of the row every thread walks anyway) and went to 256 threads × 1 byte
+with a 4-deep member prefetch (S=1 per-launch mean 0.80 → 0.34 ms; measured
+separately in two sessions on S=1 active-support snapshots, so the pairs do
+not chain: dropping the byte stage + 256×1 696 → 490 µs on a 73 693-member
+one, the 4-deep prefetch 403 → 284 µs); K6 uses 768-thread blocks (the 75-533-member
+columns then take one pass) and an 8-byte prefetch (0.77 → 0.35 ms);
 `widen_exact` is a warp per row (1.5 → 0.36 ms per 8192-row tile, K7 39 → 25
 ms); `init_hard_labels` is register-tiled (22.9 → 8.5 ms); `connect_u` stages
 the member list once per chunk (148 → 105 µs); `intra_flags_rel` is a block
@@ -746,7 +761,7 @@ with shared-memory staging (128 → 118 µs); the closure dots
 driver runs, so the default dense `theta` writer.
 
 10-subject YS Mode B on this tree (2026-09-04, step 0/1 pinned `cpu` so every
-arm's step-2 inputs are byte-identical, step 3 `gpu_full`): step 2 wall
+arm's step-2 inputs are byte-identical, step 3 on the dense GPU EM): step 2 wall
 `cpu` 538 s / the dense port 62 s / this backend 4.1 s. This backend vs `cpu`:
 2 theta-argmax flips over 74 946 alive rows, 0 dead rows, `kappa` max-rel
 5.4e-7, `mu` cos-min 0.999992, step-3 labels 99.05 % identical (7 156 of

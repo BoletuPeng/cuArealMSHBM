@@ -269,7 +269,7 @@ def warmup() -> None:
     n_lh = N // 2
     L_lh = L // 2
 
-    # Full-block kernels (legacy path, retained for the reference functions).
+    # Assemble kernels.
     vmf = np.full((N, L), 0.5, dtype=np.float32)
     cdln_per_k = np.full(L, -1.0, dtype=np.float32)
     cdln_per_k[0] = np.float32(np.nan)

@@ -9,10 +9,14 @@
 parcellation from resting-state fMRI, ported end-to-end to Python with
 numba (CPU) and CuPy (GPU) backends. Validated at large scale (300+
 subjects, 1,800+ fMRI sessions) against the original MATLAB
-implementation. **v2.0.0** adds candidate-set sparse GPU backends for
-steps 2 and 3 and a rewritten step-0 / step-1 GPU path: a single
-subject now goes from raw BOLD to parcellation in **6.4 s** end to end
-on one laptop GPU.
+implementation. **v2.1.0** makes the candidate-set session the one GPU
+backend for steps 2 and 3 (step 3: all three variants), ingests BOLD on
+the GPU through nvCOMP only, and — when the packed cohort fits on the
+device — keeps no host copy of it: a single subject goes from raw BOLD
+to parcellation in **6.2 s** end to end on one laptop GPU, and a
+40-subject cohort goes from raw BOLD through group-prior training to
+all 40 parcellations in **71–76 s** (step 2, the group-prior training,
+alone: 15.8 s).
 
 ---
 
@@ -52,10 +56,11 @@ interchangeable per-step backends:
 
 - **CPU backend** — numba-JIT kernels, no GPU required.
 - **GPU backend** — CuPy + hand-written RawKernels.
-- **Candidate-set GPU backends** (step 2's `gpu`, step 3's
-  `gpu_sparse`) — the EM runs on the candidate set implied by the group
+- **Candidate-set GPU backends** (`backend_step2` / `backend_step3` =
+  `gpu`) — the EM runs on the candidate set implied by the group
   prior's support instead of the dense (N × L) posterior, so an entire
-  cohort stays resident on the device for the whole run.
+  cohort stays resident on the device for the whole run when it fits in
+  VRAM (step 2 streams subjects otherwise).
 
 Engineering highlights:
 
@@ -69,7 +74,7 @@ Engineering highlights:
 - **Bit-packed VRAM compression.** Binarized BOLD profiles live on
   device as bit-packed `uint8 (N, T, ⌈D/8⌉)` tensors — an 8×
   compression that keeps a 40-subject × 6-session cohort's BOLD at
-  1.45 GB of VRAM (vs ~11.6 GB unpacked), with popcount-based kernels
+  2.9 GB of VRAM (vs ~23 GB unpacked), with popcount-based kernels
   consuming the packed form directly.
 - **Kernel fusion and operator tuning** across the bottleneck steps:
   fused profile-generation kernels, fused E-step softmax chains with
@@ -79,14 +84,15 @@ Engineering highlights:
 
 The result: on the heaviest step the speedup over the MATLAB
 reference reaches **three orders of magnitude** on a single Blackwell
-GPU (step-3 parcellation EM: 763.1 s → 0.6 s, ~1,300×; step-0 gradient
+GPU (step-3 parcellation EM: 763.1 s → 0.55 s, ~1,400×; step-0 gradient
 embedding: 233.6 s → 2.3 s, ~100×), and the full single-subject
 pipeline runs **~170× faster** end-to-end.
 
 ## Status
 
-**This is the second release (v2.0.0)**, containing the CPU and GPU
-backends, with candidate-set GPU paths for steps 2 and 3. In large-scale validation — over **300 subjects
+**This is the third release (v2.1.0)**, containing the CPU and GPU
+backends; the GPU backends for steps 2 and 3 are the candidate-set
+sessions, and step 3's covers all three variants. In large-scale validation — over **300 subjects
 and 1,800 fMRI sessions** to date — it shows alignment with the
 original implementation's outputs at the level the numerics permit
 (~98% per-vertex agreement; bit-exactness across BLAS/reduction-order
@@ -108,10 +114,17 @@ All numbers measured on one Windows 11 laptop: RTX 5090 Laptop GPU
 MATLAB baseline is the CBIG reference pipeline **with its compiled MEX
 hot paths** (`mtimesx`), run on the same machine — a stronger baseline
 than a typical cluster node. Every cuArealMSHBM **wall-time** figure
-below was re-measured on the v2.0.0 tree, and each "total" is
+below was re-measured on the v2.1.0 tree (2026-09-28), and each "total" is
 end-to-end driver wall time on a project with no caches (interpreter
-start and input validation included). The label-agreement rows, and Mode A's
-host peak-memory row, are carried over from the v1.0.0 measurements.
+start and input validation included), with the numba and CuPy kernel
+caches warm on disk. The label-agreement rows are carried over from the
+v1.0.0 measurements. The memory rows are measured on the v2.1.0 tree:
+host is the peak resident set of the driver process (except where a row
+names another process), device is the peak `nvidia-smi` usage above the
+idle desktop. Numerically, v2.1.0 reproduces v2.0.0: on the 40-subject
+cohort below, steps 1–3, run on the v2.1.0 tree from v2.0.0's step-0
+output, reproduce v2.0.0's packed profiles, cohort averages, spatial
+mask, `group.mat`, `Params_Final.mat` and all 40 label files bit for bit.
 
 ### Mode A — individual parcellation under a pre-trained prior
 
@@ -120,25 +133,30 @@ K = 300 parcels, gMSHBM, β = 5, w = 50, c = 10:
 
 | | MATLAB (CBIG, MEX) | cuArealMSHBM CPU | cuArealMSHBM GPU |
 |---|---|---|---|
-| step 0 — gradient embedding | 233.6 s | 25.0 s | 2.3 s |
-| step 1 — profiles + init | 47.2 s | 13.2 s | 1.0 s |
-| step 3 — parcellation EM | 763.1 s | 26.1 s | **0.6 s** |
-| **total (end-to-end wall)** | **1073.0 s** | **65.9 s (16×)** | **6.4 s (168×)** |
+| step 0 — gradient embedding | 233.6 s | 26.4 s | 2.3 s |
+| step 1 — profiles + init | 47.2 s | 10.5 s | 1.0 s |
+| step 3 — parcellation EM | 763.1 s | 22.5 s | **0.55 s** |
+| **total (end-to-end wall)** | **1073.0 s** | **60.8 s (18×)** | **6.2 s (173×)** |
 | per-vertex agreement vs MATLAB labels¹ | — | 98.33 % | 98.05 % |
-| peak memory (step 3, whole process) | ~11 GB RAM | — | **~4 GB (2.7× less)** |
+| peak host memory (whole run, driver process) | ~11 GB RAM (step 3) | 6.4 GiB | **2.7 GiB (4× less)** |
 
-GPU column: `backend_step0` / `backend_step1` = `gpu`,
-`backend_step3` = `gpu_sparse`. The MATLAB path additionally required
+GPU column: `backend_step0` / `backend_step1` / `backend_step3` = `gpu`.
+The MATLAB path additionally required
 a one-off 1,527 s GIFTI→NIfTI conversion pass; cuArealMSHBM ingests
 `.func.gii` natively.
 
 Against v1.0.0 on the same machine and config, GPU step 0–3 compute
 drops **15.8 s → 3.9 s (4.1×)**: the step-0 Δ-stepping SSSP rewrite,
-the fused whole-subject step-1 GPU leaf, and the step-3 `gpu_sparse`
-backend. The 6.4 s wall adds ~1.0 s of BOLD-manifest validation and
-~0.7 s of interpreter start — fixed costs that do not grow with the
-cohort. A first run in a cold process pays another ~2 s of numba JIT
-compilation (8.0 s wall); repeat runs land at 6.3–6.4 s.
+the fused whole-subject step-1 GPU leaf, and the step-3 candidate-set
+backend (all v2.0.0); v2.1.0 holds that wall while step 1, and step 2
+in its device-resident cache mode, stop keeping host copies of the
+packed profiles. The 6.2 s wall adds ~0.9 s of one-time package import
+(the Mode A min-input check imports the step-3 package to resolve the
+prior path) and ~0.6 s of interpreter start — fixed costs that do not grow with the cohort. Repeat runs in fresh processes land at
+5.9–6.2 s. A process whose numba cache has been deleted pays
+another ~7 s of JIT compilation; one whose CuPy kernel cache is
+also gone compiles every GPU kernel first (31 s wall, once per
+machine).
 
 ¹ Cortical vertices, medial wall excluded. The two Python backends
 agree with each other at 98.21 %. Bit-exact MATLAB↔Python equality is
@@ -147,8 +165,10 @@ combined effect of several benign sources — BLAS reduction-order
 differences between numerical libraries (every backend has its own
 numerical noise band, and the GPU additionally shows small run-to-run
 variation), different numerical routes for the Bessel-type functions
-(ours is audited against mpmath in
-`arealmshbm/spatial_priors/_cdln.py`), and a few small, deliberate
+(ours evaluates `log I_ν` through closed-form and asymptotic expansions,
+audited against mpmath: `arealmshbm/em_stop_criterion/_cdln.py` on the
+CPU, the d = 3 closed form on the device, pinned bit-equal in fp32 by
+`arealmshbm/em_stop_criterion/tests/test_cdln_d3_oracle.py`), and a few small, deliberate
 implementation choices where the port diverges from the reference.
 The four-layer framework we use to judge whether differences of this
 kind are functionally meaningful is described in
@@ -160,14 +180,35 @@ kind are functionally meaningful is described in
 
 | | MATLAB (CBIG, MEX) | cuArealMSHBM CPU | cuArealMSHBM GPU |
 |---|---|---|---|
-| step 2 — group-prior EM (production `max_iter_inter=10`; 48 EM iterations on both backends) | not feasible on a workstation² | 2,638.7 s | **16.5 s (160×)** |
-| full pipeline steps 0–3, whole cohort (production run) | not feasible on a workstation² | — | **77.0 s (≈1.3 min)** |
-| device memory, step 2, whole 40-subject cohort | **≈ 370–490 GB RAM** (estimated²) | — | **peak 6.7 GiB of 24 GB VRAM** |
+| step 2 — group-prior EM (production `max_iter_inter=10`; 48 EM iterations on both backends) | not feasible on a workstation² | 2,945.6 s | **15.8 s (186×)** |
+| full pipeline steps 0–3, whole cohort (production run) | not feasible on a workstation² | — | **70.5–75.9 s (≈1.2 min)** |
+| device memory, step 2, whole 40-subject cohort | **≈ 370–490 GB RAM** (estimated²) | — | **peak 5.6 GiB of 24 GB VRAM** |
+| host memory, step 2 alone (standalone `arealmshbm.step2_pipeline.profile` process), whole 40-subject cohort | (the same ≈ 370–490 GB²) | 11.1 GiB | **peak 1.1 GiB** |
 
-The step-2 GPU column is the `gpu` backend — in v2.0.0 that name is the
-candidate-set session; the dense CuPy port that held it in v1.0.0 has been
-removed. Measured as a single cold run in a fresh process (a warm repeat is
-14.9 s; inside a full Mode B driver run step 2 takes 15.1 s).
+The step-2 GPU column is the `gpu` backend, the candidate-set session
+(since v2.0.0; the dense CuPy port that held the name in v1.0.0 is gone).
+Measured as a single run in a fresh process (a warm in-process repeat is
+14.1 s). The CPU figure is likewise a single run in a fresh process, 48 EM
+iterations (the v2.0.0 tree measured 2,638.7 s on the same shape; the CPU
+EM kernel is the same code, so the spread is run-to-run variation of a
+49-minute all-core run on a laptop). The full-pipeline row is two production runs; in the faster
+one step 2 took 14.2 s beside step 0 38.0 s, step 1 8.1 s and step 3
+8.1 s; between the two runs step 0 accounted for 2.8 s of the 5.4 s
+difference, step 2 for 1.5 s and step 1 for 0.6 s. The host-memory row
+is new in v2.1.0 and was taken in a standalone step-2 process: in its
+device-resident cache mode (`eager_bitpacked`, which `bold_cache_mode:
+"auto"` picks whenever the packed cohort, the session's resident state
+and a safety margin fit in free VRAM) the session keeps no host copy of the
+packed cohort — each subject is decoded straight into a two-slot
+page-locked ring and uploaded — so the host working set stops growing
+with the cohort; inside the end-to-end driver the process peak during
+step 2 is 2.8 GiB, most of it still held from steps 0–1. The `stream`
+mode for cohorts that do not fit in VRAM keeps one subject on the device
+and, host RAM permitting, a host cache of the packed cohort. On
+`backend_step1: "gpu"` step 1 keeps no host copy of the packed cohort
+either, whatever its size: each session is folded into device sums as it
+is packed. The `cpu` backend's average reads every subject's `.b2nd`
+back into host memory.
 
 **Against v1.0.0, on this same machine.** v1.0.0 published a step-2 pair of
 794.0 s (CPU) / 156.7 s (dense GPU); those were taken at `max_iter_inter=2`,
@@ -206,14 +247,17 @@ a compute cluster is a hard requirement, not an optimization.
 
 cuArealMSHBM collapses all of this onto one device: each binarized
 profile exists in VRAM exactly **once**, as a bit-packed
-`uint8 (N, T, ⌈D/8⌉)` tensor (72 MB per subject, 1.45 GB for the
-entire cohort — vs ~11.6 GB unpacked, and vs the reference's ~4.6 GB
+`uint8 (N, T, ⌈D/8⌉)` tensor (72 MB per subject, 2.9 GB for the
+entire cohort — vs ~23 GB unpacked, and vs the reference's ~4.6 GB
 of fp64 per subject *before* its extra copies), shared by reference
-across all kernels. The posterior is stored fp32 instead of fp64
-(3.93 GB for all 40 subjects; fp64 scratch only where the softmax
-demands it), and kernel fusion means the N × L × T intermediates the
+across all kernels. The posterior is stored fp32 instead of fp64, and
+only on the spatial mask's support — an (S, P) array with P = 586,522
+(vertex, parcel) cells, 2.4 % of N × L (about 94 MB for all 40
+subjects, where a dense (S, N, L) layout would take 3.93 GB; fp64
+scratch only where the softmax demands it) — and kernel fusion
+means the N × L × T intermediates the
 reference round-trips through RAM and disk are never materialized at
-all. Measured peak device usage on the `gpu` backend: **6.7 GiB** — **the
+all. Measured peak device usage on the `gpu` backend: **5.6 GiB** — **the
 whole 40-subject cohort fits in less memory than the reference needs for
 a single subject**, with most of a 24 GB card left over. How far the
 cohort can grow before the (S, N, ·) terms dominate has not been
@@ -224,9 +268,11 @@ measured.
 Measured against **stock CBIG as published**, on 30 subjects across three
 cohorts — K = 300, β = 5, w = 50, c = 10, fsaverage6 target /
 fsaverage3 seed, with the same group-prior file loaded on both sides.
-Backends: `backend_step0` / `backend_step1` = `gpu`, and `backend_step3` =
-`gpu_sparse` for the variants that have a candidate-set path, `gpu_full`
-for cMSHBM, which does not.
+Backends: `backend_step0` / `backend_step1` / `backend_step3` = `gpu` —
+step 3 on the candidate-set session for all three variants. The cMSHBM
+column was re-measured on it for v2.1.0; the gMSHBM and dMSHBM columns are
+the v2.0.0 measurement, whose step-3 backend is this same session under
+its earlier name.
 
 Per-vertex label agreement over cortical vertices, medial wall excluded —
 it is label 0 on both sides and would otherwise count as free agreement.
@@ -234,9 +280,9 @@ All-vertex figures in parentheses.
 
 | cohort | subjects × sessions | gMSHBM | cMSHBM | dMSHBM |
 |---|---|---|---|---|
-| in-house | 10 × 6 | 95.12 % (95.52 %) | 99.42 % (99.46 %) | **99.99 %** (99.98 %) |
-| OpenNeuro `ds004466` | 10 × 4 | 93.20 % (93.63 %) | 98.26 % (98.35 %) ᵃ | **99.84 %** (99.69 %) |
-| OpenNeuro `ds000221` | 10 × 4 | 93.07 % (93.12 %) | 98.08 % (98.20 %) ᵇ | **99.67 %** (99.12 %) |
+| in-house | 10 × 6 | 95.12 % (95.52 %) | 99.35 % (99.40 %) | **99.99 %** (99.98 %) |
+| OpenNeuro `ds004466` | 10 × 4 | 93.20 % (93.63 %) | 98.42 % (98.49 %) ᵃ | **99.84 %** (99.69 %) |
+| OpenNeuro `ds000221` | 10 × 4 | 93.07 % (93.12 %) | 98.13 % (98.24 %) ᵇ | **99.67 %** (99.12 %) |
 
 ᵃ n = 9 · ᵇ n = 8 — the reference implementation itself
 fails on three cMSHBM subjects (`sub2ind` index-out-of-range inside
@@ -293,7 +339,9 @@ code releases). Extract into `arealmshbm/data/precomputed/`:
 
 ```bash
 curl -L -O https://github.com/BoletuPeng/cuArealMSHBM/releases/download/assets-v1/avg_mesh-fsaverage6.tar.gz
+curl -L -O https://github.com/BoletuPeng/cuArealMSHBM/releases/download/assets-v1/step0_inputs-fsaverage6_sigma2.55_khop3.tar.gz
 tar -xzf avg_mesh-fsaverage6.tar.gz -C arealmshbm/data/precomputed/
+tar -xzf step0_inputs-fsaverage6_sigma2.55_khop3.tar.gz -C arealmshbm/data/precomputed/
 ```
 
 Both are **required**. `avg_mesh` (4.3 MB) is where all mesh geometry
@@ -335,7 +383,8 @@ result = Pipeline("projects/<name>").run()
 
 Parcellations are written to
 `projects/<name>/ind_parcellation_<variant>/<N>_sess/beta<B>/` as
-`Ind_parcellation_MSHBM_sub<S>_w<W>_MRF<C>_beta<B>.mat`.
+`Ind_parcellation_MSHBM_sub<S>_w<W>_MRF<C>_beta<B>.mat` (for dMSHBM the
+`beta<B>/` directory and the `_beta<B>` suffix are absent).
 
 ### Operating modes
 
@@ -345,7 +394,8 @@ Parcellations are written to
 | `modeA_batch` (N subjects) | 0 → 1 → 3 | pre-staged in the project |
 | `modeB_train_prior` (cohort) | 0 → 1 → 2 → 3 | trained on your cohort by step 2 |
 
-Mode A reads `<project>/priors/<variant>/beta<B>/Params_Final.mat`;
+Mode A reads `<project>/priors/<variant>/beta<B>/Params_Final.mat`
+(dMSHBM: `priors/dMSHBM/Params_Final.mat`, no `beta<B>/` segment);
 staging it there is the project creator's job. Variants: gMSHBM and
 dMSHBM ship; cMSHBM step 2 is not wired (its step 3 is). See
 [`docs/pipeline_modes.md`](docs/pipeline_modes.md) and
@@ -360,19 +410,33 @@ backends carry the preconditions below:
 | key | values | notes |
 |---|---|---|
 | `backend_step0` | `cpu`, `gpu` | GPU step 0 is not bit-reproducible run to run — the measured band is in [`docs/step0_flow_and_subgraphs.md`](docs/step0_flow_and_subgraphs.md) |
-| `backend_step1` | `cpu`, `gpu` | bit-identical artifacts either way |
-| `backend_step2` | `cpu`, `gpu` | `gpu` is the candidate-set session: it needs `seed_mesh: "fsaverage3"`, K ≤ 512 and ≤ 11,772 gradient components — anything larger runs on `cpu` |
-| `backend_step3` | `cpu`, `gpu_elambda`, `gpu_full`, `gpu_sparse` | `gpu_sparse` needs `seed_mesh: "fsaverage3"` and covers gMSHBM / dMSHBM only |
+| `backend_step1` | `cpu`, `gpu` | packed profiles, averages, spatial mask and `group.mat` labels are bit-identical either way; `group.mat`'s `mtc` / `epsil` agree to within a few fp64 ULP (fp64 reduction order); `gpu` ingests BOLD through nvCOMP (`nvidia-nvcomp-cu12` required) and needs `step1.reduction_dtype: "float64"` (anything else is rejected at validation) |
+| `backend_step2` | `cpu`, `gpu` | `gpu` is the candidate-set session: it needs `seed_mesh: "fsaverage3"`, K ≤ 512 and, for gMSHBM, ≤ 11,772 gradient components — any other shape is rejected at validation, so select `cpu` for it; `psutil` required |
+| `backend_step3` | `cpu`, `gpu` | `gpu` is the candidate-set session for gMSHBM, cMSHBM and dMSHBM: it needs `seed_mesh: "fsaverage3"` (else `cpu`) and, for gMSHBM / cMSHBM, a CUDA toolkit at `CUDA_PATH` plus a device that supports cooperative launch |
 
 Design notes and the measured backend-vs-backend agreement are in
 [`docs/step2_sparse_design.md`](docs/step2_sparse_design.md) and
 [`docs/step3_sparse_design.md`](docs/step3_sparse_design.md).
 
-**Upgrading a v1.0.0 project config.** Two `step2` keys are now rejected
-at parse time: `backend_step2: "gpu_sparse"` (write `"gpu"` — there is no
-alias) and `enable_tf32` (delete it; it only ever scoped the dense port's
-sgemms, and `step0.enable_tf32` is unaffected). A config that already said
-`backend_step2: "gpu"` still parses, but now trains its prior on the
+**Upgrading a v2.0.0 project config.** `backend_step3` accepts `cpu` and
+`gpu` only: write `"gpu"` where a config said `"gpu_sparse"` (the same
+session), and choose `"gpu"` or `"cpu"` where it said `"gpu_full"` or
+`"gpu_elambda"` (the dense GPU EM is gone; against the reference labels the
+candidate-set session ties or leads it). `w` must be ≥ 1 on every backend:
+at `w = 0` the E-step's `w · log θ` term is undefined outside the prior's
+support, in the reference implementation as well. Four things v2.0.0
+used only when it found them are requirements: `python-isal` (every
+backend), `nvidia-nvcomp-cu12` (`backend_step1: "gpu"`), `psutil`
+(`backend_step2: "gpu"`), and a CUDA toolkit at `CUDA_PATH` plus a device
+that supports cooperative launch (`backend_step3: "gpu"` with gMSHBM /
+cMSHBM) — select `"cpu"` for a step whose requirement the machine does
+not meet.
+
+**Upgrading a v1.0.0 project config.** The v2.0.0 note above applies.
+In addition, one `step2` key is rejected at parse time: `enable_tf32`
+(delete it; it only ever scoped the dense port's sgemms, and
+`step0.enable_tf32` is unaffected). A config that already said
+`backend_step2: "gpu"` still parses, but trains its prior on the
 candidate-set session — which matches the `cpu` reference, where the dense
 port did not.
 
@@ -396,9 +460,26 @@ original_paper.md           — algorithm reference (Kong et al. 2021)
 
 ## Requirements
 
-- Python 3.13; numba 0.63.1, numpy 2.2.6, scipy 1.16.0
-- CuPy 13.6.0 (optional — GPU backends only); optional
-  `nvidia-nvcomp-cu12` for GPU GIFTI decode
+- Python 3.13; numba 0.63.1, numpy 2.2.6, scipy 1.16.0. numba must run
+  on a thread-safe threading layer (OpenMP or TBB, which it selects when
+  either runtime is present): the pipeline launches parallel kernels
+  from several threads, and numba's `workqueue` fallback layer aborts
+  the process on that
+- `python-isal` (pip name `isal`; isal_zlib inflate in the GIFTI reader
+  and the streaming MAT reader) and
+  `blosc2` (`.b2nd` profile files); `h5py` for inputs saved as MAT v7.3
+  (a group prior, a spatial mask or a gradient file)
+- For the GPU backends: CuPy 13.6.0 (all of them);
+  `nvidia-nvcomp-cu12` (`backend_step1='gpu'` — its BOLD ingest is
+  nvCOMP-only; a missing or unloadable install is an `ImportError`
+  before step 0); `psutil` (`backend_step2='gpu'`); a CUDA toolkit at
+  `CUDA_PATH` and a device that supports cooperative launch
+  (`backend_step3='gpu'` with gMSHBM / cMSHBM — `cudadevrt` +
+  `cooperative_groups.h` for the connected-components kernel; dMSHBM
+  does not use it). The driver checks CuPy (import, CUDA device,
+  NVRTC), nvCOMP, psutil and the CUDA toolkit / cooperative launch
+  before step 0. The
+  step-2 and step-3 `gpu` backends require `seed_mesh` `fsaverage3`.
 - Staged precomputed assets (installer-deployed; see
   [`arealmshbm/data/README.md`](arealmshbm/data/README.md)) and
   `MSHBM_ATLAS_DIR` pointing at a directory whose
@@ -449,7 +530,7 @@ field, we extend our sincere greetings and deepest respect.
 
 [English](#english) | **简体中文**
 
-**CPU/GPU 加速的 Areal-MSHBM** —— 基于静息态 fMRI 的个体化皮层分区，以 numba（CPU）与 CuPy（GPU）双后端完成端到端的 Python 移植。已在大规模数据（300+ 名被试、1,800+ 个 fMRI session）上与原版 MATLAB 实现完成对照校验。**v2.0.0** 为 step 2 / step 3 新增了候选集稀疏 GPU 后端，并重写了 step 0 / step 1 的 GPU 路径：单被试从原始 BOLD 到分区结果，在一张笔记本 GPU 上端到端只需 **6.4 秒**。
+**CPU/GPU 加速的 Areal-MSHBM** —— 基于静息态 fMRI 的个体化皮层分区，以 numba（CPU）与 CuPy（GPU）双后端完成端到端的 Python 移植。已在大规模数据（300+ 名被试、1,800+ 个 fMRI session）上与原版 MATLAB 实现完成对照校验。**v2.1.0** 将候选集 session 定为 step 2 / step 3 唯一的 GPU 后端（step 3 覆盖全部三个变体），GPU 上的 BOLD 读入只走 nvCOMP，并且当位打包队列放得进显存时不再在主机内存中保留它的副本：单被试从原始 BOLD 到分区结果，在一张笔记本 GPU 上端到端只需 **6.2 秒**；40 名被试的队列从原始 BOLD 经组先验训练到全部 40 份分区结果 **71–76 秒**完成（其中 step 2 组先验训练单独运行 15.8 秒）。
 
 ---
 
@@ -470,25 +551,25 @@ cuArealMSHBM 用 Python 重新实现了全部四个流水线步骤（RSFC 梯度
 
 - **CPU 后端** —— numba-JIT 内核，无需 GPU。
 - **GPU 后端** —— CuPy + 手写 RawKernel。
-- **候选集 GPU 后端**（step 2 的 `gpu`、step 3 的 `gpu_sparse`）—— EM 只在组先验支撑集所隐含的候选集上运行，而不是稠密的 (N × L) 后验，因此整个队列可以在整轮运行期间常驻显存。
+- **候选集 GPU 后端**（`backend_step2` / `backend_step3` = `gpu`）—— EM 只在组先验支撑集所隐含的候选集上运行，而不是稠密的 (N × L) 后验，因此整个队列在放得进显存时可以在整轮运行期间常驻显存（否则 step 2 逐被试流式载入）。
 
 工程亮点：
 
 - **更快、更精确的贝塞尔类函数数值计算。** vMF 归一化常数与浓度参数更新均改用 `log I_ν` 的闭式解与渐近展开，而非参考实现的通用贝塞尔路径。经 mpmath 50 位精度审计：d=3 的 vMF 对数归一化常数精确到 0.31 × fp32 eps —— 在 κ = 1000 处比 MATLAB 原版**精确至多 19 倍**，且无分支、对 JIT/GPU 友好。
-- **位打包的显存压缩。** 二值化 BOLD profile 在设备上以位打包的 `uint8 (N, T, ⌈D/8⌉)` 张量存放 —— 8 倍压缩，使 40 被试 × 6 session 队列的 BOLD 仅占 1.45 GB 显存（未打包约 11.6 GB），并由基于 popcount 的内核直接消费打包形式。
+- **位打包的显存压缩。** 二值化 BOLD profile 在设备上以位打包的 `uint8 (N, T, ⌈D/8⌉)` 张量存放 —— 8 倍压缩，使 40 被试 × 6 session 队列的 BOLD 仅占 2.9 GB 显存（未打包约 23 GB），并由基于 popcount 的内核直接消费打包形式。
 - **瓶颈步骤上的算子融合与算子调优**：融合的 profile 生成内核、带逐被试 fp64 暂存的融合 E-step softmax 链（fp32 存储，精度关键处fp64）、调优的归约，以及将 I/O 隐藏在 GPU 计算之后的流水线化 BOLD 解码。
 
-结果：在最重的步骤上，相对 MATLAB 参考实现的加速在单张 Blackwell GPU 上达到**三个数量级**（step-3 分区 EM：763.1 s → 0.6 s，约 1,300 倍；step-0 梯度嵌入：233.6 s → 2.3 s，约 100 倍），单被试全流程端到端提速**约 170 倍**。
+结果：在最重的步骤上，相对 MATLAB 参考实现的加速在单张 Blackwell GPU 上达到**三个数量级**（step-3 分区 EM：763.1 s → 0.55 s，约 1,400 倍；step-0 梯度嵌入：233.6 s → 2.3 s，约 100 倍），单被试全流程端到端提速**约 170 倍**。
 
 ## 项目状态
 
-**这是第二个发布版本（v2.0.0）**，包含 CPU 与 GPU 后端，step 2 与 step 3 另有候选集 GPU 路径。在迄今超过 **300 名被试、1,800 个 fMRI session** 的大规模校验中，它与原版实现的输出在数值所允许的极限水平上保持一致（逐顶点一致率约 98%；跨 BLAS/归约顺序边界的位级一致在数学上不可达），同时带来显著的速度与内存节约（见下方表格）。
+**这是第三个发布版本（v2.1.0）**，包含 CPU 与 GPU 后端；step 2 与 step 3 的 GPU 后端即候选集 session，其中 step 3 覆盖全部三个变体。在迄今超过 **300 名被试、1,800 个 fMRI session** 的大规模校验中，它与原版实现的输出在数值所允许的极限水平上保持一致（逐顶点一致率约 98%；跨 BLAS/归约顺序边界的位级一致在数学上不可达），同时带来显著的速度与内存节约（见下方表格）。
 
 项目仍在持续完善中。**所有预计算数据**（网格资产包、step-0 缓存、预训练 HCP 组先验、空间掩膜）**将由带 GUI 的发行版（开发中）的安装程序部署。** 本源码版本刻意不包含这些资产 —— 安装程序部署的目录布局见 [`arealmshbm/data/README.md`](arealmshbm/data/README.md)。
 
 ## 基准测试
 
-所有数字均在同一台 Windows 11 笔记本上测得：RTX 5090 Laptop GPU（Blackwell，24 GB）、Python 3.13、numba 0.63.1、CuPy 13.6.0。MATLAB基线为 CBIG 参考流水线**并启用其编译 MEX 热路径**（`mtimesx`），在同一台机器上运行 —— 比典型集群节点更强的基线。下表中 cuArealMSHBM 的每一个**耗时**数字都在 v2.0.0 代码上重新测得，每一项"总计"均为无缓存项目上的端到端驱动器墙钟时间（含解释器启动与输入校验）；标签一致率各行、以及 Mode A 的主机内存峰值一行，沿用 v1.0.0 的测量结果。
+所有数字均在同一台 Windows 11 笔记本上测得：RTX 5090 Laptop GPU（Blackwell，24 GB）、Python 3.13、numba 0.63.1、CuPy 13.6.0。MATLAB基线为 CBIG 参考流水线**并启用其编译 MEX 热路径**（`mtimesx`），在同一台机器上运行 —— 比典型集群节点更强的基线。下表中 cuArealMSHBM 的每一个**耗时**数字都在 v2.1.0 代码上重新测得（2026-09-28），每一项"总计"均为无缓存项目上的端到端驱动器墙钟时间（含解释器启动与输入校验），numba 与 CuPy 的内核缓存在磁盘上已预热；标签一致率各行沿用 v1.0.0 的测量结果。内存各行在 v2.1.0 代码上实测：主机为驱动器进程的常驻内存峰值（表中另注进程者除外），设备为 `nvidia-smi` 相对空闲桌面的用量峰值。数值上 v2.1.0 与 v2.0.0 完全一致：在下文的 40 被试队列上，用 v2.1.0 代码从 v2.0.0 的 step-0 输出起运行 step 1–3，得到的位打包 profile、队列均值、空间掩膜、`group.mat`、`Params_Final.mat` 与全部 40 份标签文件均逐位相同。
 
 ### Mode A —— 基于预训练先验的个体化分区
 
@@ -497,18 +578,18 @@ gMSHBM，β = 5，w = 50，c = 10：
 
 | | MATLAB (CBIG, MEX) | cuArealMSHBM CPU | cuArealMSHBM GPU |
 |---|---|---|---|
-| step 0 —— 梯度嵌入 | 233.6 s | 25.0 s | 2.3 s |
-| step 1 —— profile + 初始化 | 47.2 s | 13.2 s | 1.0 s |
-| step 3 —— 分区 EM | 763.1 s | 26.1 s | **0.6 s** |
-| **总计（端到端墙钟）** | **1073.0 s** | **65.9 s（16×）** | **6.4 s（168×）** |
+| step 0 —— 梯度嵌入 | 233.6 s | 26.4 s | 2.3 s |
+| step 1 —— profile + 初始化 | 47.2 s | 10.5 s | 1.0 s |
+| step 3 —— 分区 EM | 763.1 s | 22.5 s | **0.55 s** |
+| **总计（端到端墙钟）** | **1073.0 s** | **60.8 s（18×）** | **6.2 s（173×）** |
 | 对 MATLAB 标签的逐顶点一致率¹ | — | 98.33 % | 98.05 % |
-| 内存峰值（step 3，全进程） | ~11 GB RAM | — | **~4 GB（省 2.7×）** |
+| 主机内存峰值（整次运行，驱动器进程） | ~11 GB RAM（step 3） | 6.4 GiB | **2.7 GiB（省 4×）** |
 
-GPU 一列所用后端：`backend_step0` / `backend_step1` = `gpu`，`backend_step3` = `gpu_sparse`。MATLAB 路径还额外需要一次 1,527 s 的 GIFTI→NIfTI 一次性格式转换；cuArealMSHBM 原生读取 `.func.gii`。
+GPU 一列所用后端：`backend_step0` / `backend_step1` / `backend_step3` = `gpu`。MATLAB 路径还额外需要一次 1,527 s 的 GIFTI→NIfTI 一次性格式转换；cuArealMSHBM 原生读取 `.func.gii`。
 
-与 v1.0.0 相比（同一台机器、同一配置），GPU 上 step 0–3 的计算耗时从 **15.8 s 降至 3.9 s（4.1×）**，来自 step-0 的 Δ-stepping SSSP 重写、step-1 融合的整被试 GPU 叶子算子，以及 step-3 的 `gpu_sparse` 后端。6.4 s 的墙钟时间还额外包含约 1.0 s 的 BOLD 清单校验与约 0.7 s 的解释器启动 —— 这些是不随队列规模增长的固定开销。冷进程首次运行还要多付约 2 s 的 numba JIT 编译（墙钟 8.0 s），重复运行稳定在 6.3–6.4 s。
+与 v1.0.0 相比（同一台机器、同一配置），GPU 上 step 0–3 的计算耗时从 **15.8 s 降至 3.9 s（4.1×）**，来自 step-0 的 Δ-stepping SSSP 重写、step-1 融合的整被试 GPU 叶子算子，以及 step-3 的候选集后端（均为 v2.0.0 引入）；v2.1.0 在保持这一耗时的同时去掉了 step 1 与 step 2（显存常驻缓存模式）在主机内存中保留的位打包 profile 副本。6.2 s 的墙钟时间还额外包含约 0.9 s 的一次性包导入（Mode A 的最小输入检查为解析先验路径而载入 step-3 包）与约 0.6 s 的解释器启动 —— 这些是不随队列规模增长的固定开销。新进程中的重复运行稳定在 5.9–6.2 s；若 numba 缓存被删除，首次运行要多付约 7 s 的 JIT 编译；若 CuPy 内核缓存也被删除，则要先编译全部 GPU 内核（墙钟 31 s，每台机器一次）。
 
-¹ 皮层顶点，剔除内侧壁。两个 Python 后端彼此的一致率为 98.21%。MATLAB↔Python 的位级一致本就不可达：残余分歧是多个良性来源叠加的结果——不同数值库之间的 BLAS 归约顺序差异（每个后端各有自己的数值噪声带，GPU 还存在小幅的逐次运行波动）、贝塞尔类函数所采用的不同数值路径（我们的实现经 mpmath 审计，见 `arealmshbm/spatial_priors/_cdln.py`），以及移植中少数几处与参考实现有意为之的细小实现差异。我们用于判断此类差异是否具有功能意义的四层评估框架见 `docs/precision_impact_analysis.md`。
+¹ 皮层顶点，剔除内侧壁。两个 Python 后端彼此的一致率为 98.21%。MATLAB↔Python 的位级一致本就不可达：残余分歧是多个良性来源叠加的结果——不同数值库之间的 BLAS 归约顺序差异（每个后端各有自己的数值噪声带，GPU 还存在小幅的逐次运行波动）、贝塞尔类函数所采用的不同数值路径（我们通过 `log I_ν` 的闭式解与渐近展开求值，经 mpmath 审计：CPU 上是 `arealmshbm/em_stop_criterion/_cdln.py`，设备上是 d = 3 的闭式解，两者的 fp32 输出由 `arealmshbm/em_stop_criterion/tests/test_cdln_d3_oracle.py` 钉为逐位相同），以及移植中少数几处与参考实现有意为之的细小实现差异。我们用于判断此类差异是否具有功能意义的四层评估框架见 `docs/precision_impact_analysis.md`。
 
 ### Mode B —— 在本地队列上训练组先验
 
@@ -516,29 +597,30 @@ GPU 一列所用后端：`backend_step0` / `backend_step1` = `gpu`，`backend_st
 
 | | MATLAB (CBIG, MEX) | cuArealMSHBM CPU | cuArealMSHBM GPU |
 |---|---|---|---|
-| step 2 —— 组先验 EM（生产配置 `max_iter_inter=10`；两个后端均为 48 次 EM 迭代） | 工作站上不可实施² | 2,638.7 s | **16.5 s（160×）** |
-| 全流程 step 0–3，整个队列（生产运行） | 工作站上不可实施² | — | **77.0 s（≈1.3 分钟）** |
-| step 2 在 40 被试全队列下的设备内存 | **≈ 370–490 GB RAM**（预估²） | — | **峰值 6.7 GiB / 24 GB 显存** |
+| step 2 —— 组先验 EM（生产配置 `max_iter_inter=10`；两个后端均为 48 次 EM 迭代） | 工作站上不可实施² | 2,945.6 s | **15.8 s（186×）** |
+| 全流程 step 0–3，整个队列（生产运行） | 工作站上不可实施² | — | **70.5–75.9 s（≈1.2 分钟）** |
+| step 2 在 40 被试全队列下的设备内存 | **≈ 370–490 GB RAM**（预估²） | — | **峰值 5.6 GiB / 24 GB 显存** |
+| step 2 单独运行（独立的 `arealmshbm.step2_pipeline.profile` 进程）在 40 被试全队列下的主机内存 | （同上，≈ 370–490 GB²） | 11.1 GiB | **峰值 1.1 GiB** |
 
-step 2 的 GPU 一列取自 `gpu` 后端 —— 在 v2.0.0 中这个名字指的就是候选集 session，v1.0.0 中占用该名字的稠密 CuPy 移植已被移除。该数字为新进程中的单次冷启动运行（重复运行为 14.9 s；在完整 Mode B 驱动器运行中 step 2 为 15.1 s）。
+step 2 的 GPU 一列取自 `gpu` 后端，即候选集 session（自 v2.0.0 起；v1.0.0 中占用该名字的稠密 CuPy 移植已不存在）。该数字为新进程中的单次运行（进程内的预热重复运行为 14.1 s）。CPU 一列同样是新进程中的单次运行、48 次 EM 迭代（v2.0.0 代码在同一形状上测得 2,638.7 s；CPU 的 EM 内核代码未变，差异属于笔记本上一次 49 分钟全核运行的逐次波动）。全流程一行是两次生产运行；较快的一次中 step 2 为 14.2 s，另有 step 0 38.0 s、step 1 8.1 s、step 3 8.1 s；两次运行 5.4 s 的差值中 step 0 占 2.8 s、step 2 占 1.5 s、step 1 占 0.6 s。主机内存一行是 v2.1.0 新增的，在独立的 step-2 进程中测得：在显存常驻缓存模式下（`eager_bitpacked`；`bold_cache_mode` 为 `auto` 时，只要位打包队列、session 的常驻状态与一段安全余量放得进空闲显存就选用它），session 不再在主机内存中保留位打包队列的副本 —— 每名被试直接解码进一个两槽页锁定环形缓冲并上传 —— 主机工作集因此不再随队列规模增长；在端到端驱动器运行中，step 2 期间的进程峰值为 2.8 GiB，其中大部分是 step 0–1 遗留的内存。放不进显存的队列走 `stream` 模式：设备上只保留一名被试，并在主机内存允许时在主机内存中缓存整个位打包队列。在 `backend_step1: "gpu"` 下，step 1 同样不在主机内存中保留位打包队列的副本，且与队列规模无关：每个 session 一打包就累加进设备端的求和。`cpu` 后端求平均时会把每名被试的 `.b2nd` 读回主机内存。
 
 **与 v1.0.0 的同机对比。** v1.0.0 公布的 step 2 数字是 794.0 s（CPU）/ 156.7 s（稠密 GPU），但那是在 `max_iter_inter=2` —— 短跑基准的迭代上限 —— 下测得的，并非生产默认值 10，见 [`docs/step2_flow_and_subgraphs.md`](docs/step2_flow_and_subgraphs.md) 的 § Production-cohort walls。在 v2.0.0 代码上重跑同样的形状，`gpu` 后端为 **11.1 s**：比 v1.0.0 的 GPU 数字快 **14×**，比其 CPU 数字快 **72×**。其实测显存峰值在 `max_iter_inter=2` 与 `=10` 下**同为 6.7 GiB** —— 不随外层迭代数增长，因为候选集 session 只分配一次并全程复用。v1.0.0 的稠密 GPU 后端在同一形状下实测为 **21 GiB**，在 `inter=10` 时已溢出到主机内存；v2.0.0 将其移除，除了显存原因，也因为它的 fp32 清零（flush-to-zero）E-step 是两者中精度较低的一个。
 
 ² 由参考实现源码（`CBIG_ArealMSHBM_gMSHBM_estimate_group_priors_{parent,child}.m`）推算，而非实测 —— 因为它在工作站上*无法*实测。参考实现的 step 2被架构为 **1 个 parent + S 个 child 集群作业**（其源码头注释原文：*"user should submit 1 parent job and num_sub child jobs"*），在**每个 M-step 内层迭代**都通过文件系统交换 `.mat` 文件。child 会阻塞在迭代中途等待 parent 的回复，因此被试无法串行处理：40 个 child 必须**同时**常驻。在本基准形状下（N = 81,924 顶点、D = 1,175 profile 维、T = 6 session、L = 300 分区、全 fp64），每个 child 持有 profile 主存储`data_series`（N × D × T，4.6 GB），外加代码以*不同内存布局*物化的多份全尺寸拷贝 —— 每 session 的 N × D 切片副本、`mtimesx` 产出的N × L × T κ 更新乘积、转置的 L × N × T log-vMF 堆栈、(N, L, T) 空间先验堆栈 —— 工作集达**每被试约 9–12 GB**；parent 另持有 (N, L, S) 后验（S = 40 时 7.9 GB）及同尺寸临时量。合计：41 个进程约 370–490 GB 的同时常驻内存，外加每迭代经共享存储的 `.mat` 流量 —— 计算集群是硬性前提，而非可选优化。
 
-cuArealMSHBM 将这一切收拢到单个设备上：每份二值化 profile 在显存中**只存在一次**，以位打包的 `uint8 (N, T, ⌈D/8⌉)` 张量存放（每被试72 MB，整个队列 1.45 GB —— 对比未打包的约 11.6 GB，以及参考实现*尚未计入额外拷贝*的每被试约 4.6 GB fp64），并在所有内核间按引用共享。后验以 fp32 而非 fp64 存储（40 被试共 3.93 GB；仅在 softmax 需要处使用 fp64 暂存），算子融合则使参考实现在内存与磁盘间往返的 N × L × T中间量根本不被物化。`gpu` 后端上实测的设备峰值占用为 **6.7 GiB** —— **整个 40 被试队列所需的显存比参考实现单个被试所需的内存还少**，且 24 GB 显卡还剩下大半。队列还能扩到多大才会被 (S, N, ·) 项主导，尚未实测。
+cuArealMSHBM 将这一切收拢到单个设备上：每份二值化 profile 在显存中**只存在一次**，以位打包的 `uint8 (N, T, ⌈D/8⌉)` 张量存放（每被试 72 MB，整个队列 2.9 GB —— 对比未打包的约 23 GB，以及参考实现*尚未计入额外拷贝*的每被试约 4.6 GB fp64），并在所有内核间按引用共享。后验以 fp32 而非 fp64 存储，且只存放在空间掩膜的支撑集上，即一个 (S, P) 数组（P = 586,522 个（顶点, 分区）单元，占 N × L 的 2.4 %；40 被试共约 94 MB，而稠密的 (S, N, L) 布局需要 3.93 GB；仅在 softmax 需要处使用 fp64 暂存），算子融合则使参考实现在内存与磁盘间往返的 N × L × T中间量根本不被物化。`gpu` 后端上实测的设备峰值占用为 **5.6 GiB** —— **整个 40 被试队列所需的显存比参考实现单个被试所需的内存还少**，且 24 GB 显卡还剩下大半。队列还能扩到多大才会被 (S, N, ·) 项主导，尚未实测。
 
 ## 与参考实现的一致性
 
-以**未经修改的 CBIG 原版**为基准，在三个队列共 30 名被试上实测 —— K = 300、β = 5、w = 50、c = 10，目标网格 fsaverage6 / 种子网格 fsaverage3，两侧载入同一份组先验文件。后端：`backend_step0` / `backend_step1` = `gpu`；`backend_step3` 在有候选集路径的变体上取 `gpu_sparse`，cMSHBM 没有该路径，取 `gpu_full`。
+以**未经修改的 CBIG 原版**为基准，在三个队列共 30 名被试上实测 —— K = 300、β = 5、w = 50、c = 10，目标网格 fsaverage6 / 种子网格 fsaverage3，两侧载入同一份组先验文件。后端：`backend_step0` / `backend_step1` / `backend_step3` = `gpu` —— step 3 在全部三个变体上都运行候选集 session。cMSHBM 一列已在该后端上为 v2.1.0 重新测得；gMSHBM 与 dMSHBM 两列沿用 v2.0.0 的测量结果，其 step-3 后端就是这同一个 session（当时名字不同）。
 
 逐顶点标签一致率，仅计皮层顶点、剔除内侧壁 —— 内侧壁两侧同为标签 0，计入会白送一致率。括号内为全顶点口径。
 
 | 队列 | 被试 × session | gMSHBM | cMSHBM | dMSHBM |
 |---|---|---|---|---|
-| 自有队列 | 10 × 6 | 95.12 %（95.52 %） | 99.42 %（99.46 %） | **99.99 %**（99.98 %） |
-| OpenNeuro `ds004466` | 10 × 4 | 93.20 %（93.63 %） | 98.26 %（98.35 %）ᵃ | **99.84 %**（99.69 %） |
-| OpenNeuro `ds000221` | 10 × 4 | 93.07 %（93.12 %） | 98.08 %（98.20 %）ᵇ | **99.67 %**（99.12 %） |
+| 自有队列 | 10 × 6 | 95.12 %（95.52 %） | 99.35 %（99.40 %） | **99.99 %**（99.98 %） |
+| OpenNeuro `ds004466` | 10 × 4 | 93.20 %（93.63 %） | 98.42 %（98.49 %）ᵃ | **99.84 %**（99.69 %） |
+| OpenNeuro `ds000221` | 10 × 4 | 93.07 %（93.12 %） | 98.13 %（98.24 %）ᵇ | **99.67 %**（99.12 %） |
 
 ᵃ n = 9 · ᵇ n = 8 —— 参考实现自身在三名被试的 cMSHBM 上失败（`CBIG_ArealMSHBM_component_distance` 内 `sub2ind` 下标越界，重试可复现），这几格没有参考标签可比。cuArealMSHBM 这三名被试均正常完成。其余各格均为完整 10 名被试。
 
@@ -572,7 +654,9 @@ projects/<name>/
 
 ```bash
 curl -L -O https://github.com/BoletuPeng/cuArealMSHBM/releases/download/assets-v1/avg_mesh-fsaverage6.tar.gz
+curl -L -O https://github.com/BoletuPeng/cuArealMSHBM/releases/download/assets-v1/step0_inputs-fsaverage6_sigma2.55_khop3.tar.gz
 tar -xzf avg_mesh-fsaverage6.tar.gz -C arealmshbm/data/precomputed/
+tar -xzf step0_inputs-fsaverage6_sigma2.55_khop3.tar.gz -C arealmshbm/data/precomputed/
 ```
 
 两个都是**必需的**。`avg_mesh`（4.3 MB）是所有网格几何的唯一来源，运行时不会重建。`step0_inputs-fsaverage6_sigma2.55_khop3.tar.gz`（82.6 MB）是 step 0 的输入缓存：仓库里确实带了它的构建器（`arealmshbm.precompute.step0_inputs_builder`），但它需要从 CBIG checkout 读原始 FreeSurfer 球面，而其期待的目录布局与当前 CBIG 版本不一致，因此请以下载为准。两个都请解压到 `arealmshbm/data/precomputed/`。`$MSHBM_PRECOMPUTED_ROOT` 只能重定向 `avg_mesh/` bundle —— step 0 的缓存始终从包内读取 —— 所以不要用它把两者一起搬走：那样会在 step 0 里以一条看上去不相干的、抱怨 CBIG checkout 缺失的错误失败。
@@ -596,7 +680,7 @@ result = Pipeline("projects/<name>").run()
 ```
 
 分区结果写入
-`projects/<name>/ind_parcellation_<variant>/<N>_sess/beta<B>/`，文件名为`Ind_parcellation_MSHBM_sub<S>_w<W>_MRF<C>_beta<B>.mat`。
+`projects/<name>/ind_parcellation_<variant>/<N>_sess/beta<B>/`，文件名为 `Ind_parcellation_MSHBM_sub<S>_w<W>_MRF<C>_beta<B>.mat`（dMSHBM 没有 `beta<B>/` 目录，文件名也没有 `_beta<B>` 后缀）。
 
 ### 运行模式
 
@@ -606,7 +690,7 @@ result = Pipeline("projects/<name>").run()
 | `modeA_batch`（N 被试） | 0 → 1 → 3 | 预置于项目内 |
 | `modeB_train_prior`（队列） | 0 → 1 → 2 → 3 | 由 step 2 在你的队列上训练 |
 
-Mode A 读取 `<project>/priors/<variant>/beta<B>/Params_Final.mat`；将先验放到该位置是项目创建者的职责。变体：gMSHBM 与 dMSHBM 已提供；cMSHBM 的 step 2 未接入（其 step 3 已接入）。参见[`docs/pipeline_modes.md`](docs/pipeline_modes.md) 与[`docs/pipeline_variants.md`](docs/pipeline_variants.md)。
+Mode A 读取 `<project>/priors/<variant>/beta<B>/Params_Final.mat`（dMSHBM 为 `priors/dMSHBM/Params_Final.mat`，没有 `beta<B>/` 一级）；将先验放到该位置是项目创建者的职责。变体：gMSHBM 与 dMSHBM 已提供；cMSHBM 的 step 2 未接入（其 step 3 已接入）。参见[`docs/pipeline_modes.md`](docs/pipeline_modes.md) 与[`docs/pipeline_variants.md`](docs/pipeline_variants.md)。
 
 ### 如何选择后端
 
@@ -615,13 +699,15 @@ Mode A 读取 `<project>/priors/<variant>/beta<B>/Params_Final.mat`；将先验�
 | 配置项 | 可选值 | 说明 |
 |---|---|---|
 | `backend_step0` | `cpu`、`gpu` | GPU 版 step 0 不保证逐次运行的位级可复现，实测波动范围见 [`docs/step0_flow_and_subgraphs.md`](docs/step0_flow_and_subgraphs.md) |
-| `backend_step1` | `cpu`、`gpu` | 两者产物位级完全一致 |
-| `backend_step2` | `cpu`、`gpu` | `gpu` 即候选集 session：要求 `seed_mesh: "fsaverage3"`、K ≤ 512、梯度分量数 ≤ 11,772；超出范围的配置走 `cpu` |
-| `backend_step3` | `cpu`、`gpu_elambda`、`gpu_full`、`gpu_sparse` | `gpu_sparse` 要求 `seed_mesh: "fsaverage3"`，且仅覆盖 gMSHBM 与 dMSHBM |
+| `backend_step1` | `cpu`、`gpu` | 位打包 profile、平均 profile、空间掩膜与 `group.mat` 的标签在两个后端上逐位一致；`group.mat` 的 `mtc` / `epsil` 一致到几个 fp64 ULP 以内（fp64 归约顺序）；`gpu` 通过 nvCOMP 读入 BOLD（需要 `nvidia-nvcomp-cu12`），并要求 `step1.reduction_dtype: "float64"`（其他取值在校验阶段即被拒绝） |
+| `backend_step2` | `cpu`、`gpu` | `gpu` 即候选集 session：要求 `seed_mesh: "fsaverage3"`、K ≤ 512、gMSHBM 还要求梯度分量数 ≤ 11,772；其他形状在校验阶段即被拒绝，请为其选择 `cpu`；需要 `psutil` |
+| `backend_step3` | `cpu`、`gpu` | `gpu` 即候选集 session，覆盖 gMSHBM、cMSHBM 与 dMSHBM：要求 `seed_mesh: "fsaverage3"`（否则选 `cpu`）；gMSHBM / cMSHBM 还需要 `CUDA_PATH` 指向的 CUDA 工具包以及支持 cooperative launch 的设备 |
 
 设计说明与后端之间实测的一致性数据见 [`docs/step2_sparse_design.md`](docs/step2_sparse_design.md) 与 [`docs/step3_sparse_design.md`](docs/step3_sparse_design.md)。
 
-**从 v1.0.0 升级项目配置。** `step2` 块中有两个键现在会在解析阶段被拒绝：`backend_step2: "gpu_sparse"`（请改写为 `"gpu"` —— 没有保留别名）与 `enable_tf32`（直接删除；它从来只作用于稠密移植的 sgemm，`step0.enable_tf32` 不受影响）。原本就写 `backend_step2: "gpu"` 的配置仍可解析，但其组先验现在由候选集 session 训练 —— 后者与 `cpu` 参考实现一致，而稠密移植并不一致。
+**从 v2.0.0 升级项目配置。** `backend_step3` 只接受 `cpu` 与 `gpu`：原来写 `"gpu_sparse"` 的请改写为 `"gpu"`（同一个 session）；原来写 `"gpu_full"` 或 `"gpu_elambda"` 的请改为 `"gpu"` 或 `"cpu"`（稠密 GPU EM 已不存在；对照参考实现的标签，候选集 session 与它持平或更优）。`w` 在所有后端上都必须 ≥ 1：`w = 0` 时 E-step 的 `w · log θ` 项在先验支撑集之外没有定义，参考实现同样如此。v2.0.0 中"找得到才用"的四项依赖是硬性要求：`python-isal`（所有后端）、`nvidia-nvcomp-cu12`（`backend_step1: "gpu"`）、`psutil`（`backend_step2: "gpu"`），以及 `CUDA_PATH` 指向的 CUDA 工具包加上支持 cooperative launch 的设备（`backend_step3: "gpu"` 搭配 gMSHBM / cMSHBM）—— 机器不满足某一步的要求时，请为该步选择 `"cpu"`。
+
+**从 v1.0.0 升级项目配置。** 上面 v2.0.0 的说明同样适用。此外，`step2` 块中有一个键会在解析阶段被拒绝：`enable_tf32`（直接删除；它从来只作用于稠密移植的 sgemm，`step0.enable_tf32` 不受影响）。原本就写 `backend_step2: "gpu"` 的配置仍可解析，但其组先验由候选集 session 训练 —— 后者与 `cpu` 参考实现一致，而稠密移植并不一致。
 
 ## 仓库结构
 
@@ -643,8 +729,9 @@ original_paper.md           — 算法出处（Kong et al. 2021）
 
 ## 环境要求
 
-- Python 3.13；numba 0.63.1、numpy 2.2.6、scipy 1.16.0
-- CuPy 13.6.0（可选 —— 仅 GPU 后端需要）；可选 `nvidia-nvcomp-cu12` 用于 GPU GIFTI 解码
+- Python 3.13；numba 0.63.1、numpy 2.2.6、scipy 1.16.0。numba 必须运行在线程安全的线程层上（OpenMP 或 TBB；两者任一运行时存在时 numba 会自动选用）：流水线会从多个线程发起并行内核，numba 的后备线程层 `workqueue` 遇到这种情况会直接中止进程
+- `python-isal`（pip 包名为 `isal`；GIFTI 读取器与流式 MAT 读取器中的 isal_zlib 解压）与 `blosc2`（`.b2nd` profile 文件）；以 MAT v7.3 保存的输入（组先验、空间掩膜或梯度文件）需要 `h5py`
+- GPU 后端：CuPy 13.6.0（全部 GPU 后端）；`nvidia-nvcomp-cu12`（`backend_step1='gpu'` —— 其 BOLD 读入只走 nvCOMP，未安装或无法加载会在 step 0 之前以 `ImportError` 报错）；`psutil`（`backend_step2='gpu'`）；`CUDA_PATH` 指向的 CUDA 工具包以及支持 cooperative launch 的设备（`backend_step3='gpu'` 搭配 gMSHBM / cMSHBM —— 连通分量内核需要 `cudadevrt` 与 `cooperative_groups.h`；dMSHBM 不使用它）。驱动器会在 step 0 之前检查 CuPy（导入、CUDA 设备、NVRTC）、nvCOMP、psutil 以及 CUDA 工具包 / cooperative launch。step 2 与 step 3 的 `gpu` 后端要求 `seed_mesh` 为 `fsaverage3`。
 - 已部署的预计算资产（由安装程序部署；见[`arealmshbm/data/README.md`](arealmshbm/data/README.md)），以及指向 `<targ_mesh>/label/` 下含 Schaefer2018 + aparc `.annot` 文件目录的 `MSHBM_ATLAS_DIR`（图谱目录在运行时的唯一用途）
 
 BOLD 输入仅支持 GIFTI `.func.gii`。

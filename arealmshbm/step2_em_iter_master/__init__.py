@@ -20,15 +20,15 @@ Pulls every leaf in the step-2 outer-EM iter body
   prototype to the multi-subject (S, T, L, D) layout.
 * Phase C — Per-subject spatial_connect prior (gMSHBM only).
   Block-diagonal gemms + assemble in numba (``np.dot`` × 4 per session
-  + ``-||grad||² + 2·g·u - ||u||²`` numba loop). gradients keep the
-  legacy (S, T, N, D_grad) TND layout — the per-t (N, D_grad) C-contig
+  + ``-||grad||² + 2·g·u - ||u||²`` numba loop). gradients use the
+  (S, T, N, D_grad) TND layout — the per-t (N, D_grad) C-contig
   slice is the natural sgemm input.
 * Phase D — Per-subject fused E-step (NTD variant). Big sgemm
   ``(N, T·D) × (T·D, L) → (N, L)`` folds both the per-t loop AND the
   d-contraction in a single BLAS call; ``log_vmf[n, l] = κ · lv_sum[n,
   l] + count_alive[n] · cdln_val``, where ``count_alive[n]`` comes
-  from a per-(t, n) nonzero-BOLD scan (the medial-wall test that the
-  legacy per-t ``alive`` flag was implementing in disguise).
+  from a per-(t, n) nonzero-BOLD scan (the medial-wall test, see
+  ``_kernels._fused_estep_per_subject_NTD``).
 * Phase E — Phase E.1 per-subject normalize (``s_lambda *=
   boundary_mask`` → row-normalize → zero degenerate rows, fp64 scratch
   → fp32 storage on cast), fused inside the per-subject loop with
@@ -82,25 +82,15 @@ Public API:
   exposes ``run_iter(...)`` for one outer-EM iter.
 * :func:`em_iter_master_kernel_streaming` — the per-subject-streaming
   master (Python orchestrator + numba sub-kernels).
-* :func:`warmup_em_iter_master` — JIT-compile every kernel once at
-  process start.
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """
 
-from ._kernels import (
-    em_iter_master_kernel_streaming,
-    _mstep_inner_loop_master_step2,
-    _spatial_connect_per_subject_numba,
-    warmup as warmup_em_iter_master,
-)
+from ._kernels import em_iter_master_kernel_streaming
 from .session import Step2EmIterSession
 
 __all__ = [
     "em_iter_master_kernel_streaming",
-    "_mstep_inner_loop_master_step2",
-    "_spatial_connect_per_subject_numba",
-    "warmup_em_iter_master",
     "Step2EmIterSession",
 ]
 

@@ -14,7 +14,8 @@ Public API:
     XyzSession              — Session for spatial_xyz_prior.
     ConnectSession          — Session for spatial_connect_prior.
     compute_unit_sphere_xyz — load + row-normalize bilateral sphere coords;
-                              shared with the GPU full-device super-call.
+                              shared with the step-3 ``gpu`` session
+                              (vmf_clustering_gpu).
     warmup                  — pre-compile every numba kernel. Idempotent.
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
@@ -32,8 +33,7 @@ from .spatial_connect import (
 def warmup() -> None:
     """Pre-compile every numba kernel in this module with realistic
     dtypes / shapes. ~50 ms one-shot."""
-    from . import _cdln, _kernels
-    _cdln.warmup()
+    from . import _kernels
     _kernels.warmup()
 
 

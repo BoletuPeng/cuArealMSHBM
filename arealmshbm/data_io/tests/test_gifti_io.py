@@ -1,14 +1,8 @@
-"""test_gifti_io.py — equivalence + contract tests for the GIFTI reader.
+"""test_gifti_io.py — round-trip + contract tests for the GIFTI reader.
 
-The pipeline reads ``.func.gii`` surface BOLD directly. End-to-end
-bit-equality with the historical converted-NIFTI mirror was proven
-at strip time on real YS sub-001 data (10/10 numerical artifacts
-matched under ``backend_step0=cpu``); the e2e harness and the
-offline ``convert_ys_bold_parallel.py`` converter were both retired
-once the strip landed. See the PR #54 description for the result
-table.
+The pipeline reads ``.func.gii`` surface BOLD directly.
 
-What we still pin here: **strict-mode refusal** — a GIFTI that
+What this file pins: **strict-mode refusal** — a GIFTI that
 violates the documented contract (non-FLOAT32 / non-B64GZ / non-LE,
 or a later darray that disagrees with the first) must be refused with
 an explicit error rather than producing garbage.
@@ -123,8 +117,7 @@ def test_read_surface_gifti_rejects_off_contract(tmp_path: Path,
                                                  attr, bad_value, marker):
     """Strict-mode refusal: the reader bails on any non-FLOAT32 /
     non-GZip-B64 / non-LE header. The error message must name the
-    offending attribute so the operator can fix the writer. There is
-    no NIFTI fallback — ``.nii.gz`` is rejected at parse time."""
+    offending attribute so the operator can fix the writer."""
     kwargs = {attr: bad_value}
     p = tmp_path / "bad.func.gii"
     p.write_bytes(_make_minimal_gifti(**kwargs))  # type: ignore[arg-type]

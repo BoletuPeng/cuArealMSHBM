@@ -78,13 +78,13 @@ void hemi_gradient_kernel(
     __shared__ float sm_det;
 
     // NOTE: this early-return is safe ONLY because the launch site below
-    // (``_hemi_gradient_gpu``) uses ``grid = (n_verts, 1, 1)`` exactly —
+    // (``_hemi_gradient_gpu``) uses ``grid = (n_verts, 1, 1)`` exactly -
     // every block has ``blockIdx.x < n_verts``, so the condition is
     // either uniformly false (no thread returns) or, if a future change
     // launches with grid.x > n_verts, uniformly true for the over-
     // launched blocks (every thread returns; the per-block sync below
     // is never reached). Do NOT introduce a case where this condition
-    // diverges within a block — the ``__syncthreads()`` after the
+    // diverges within a block - the ``__syncthreads()`` after the
     // ``if (tid == 0)`` setup would then deadlock the early-return
     // threads. If you need a larger grid, gate work on ``i < n_verts``
     // without returning, or move the early-return after the sync.
@@ -198,7 +198,7 @@ void hemi_gradient_kernel(
     __syncthreads();
 
     int m = sm_m;
-    if (m < 2) return;   // out was zero-initialised by caller — leave as 0
+    if (m < 2) return;   // out was zero-initialised by caller - leave as 0
 
     float a00 = sm_A[0], a01 = sm_A[1], a02 = sm_A[2];
     float a11 = sm_A[3], a12 = sm_A[4], a22 = sm_A[5];
@@ -341,15 +341,13 @@ def cifti_gradient_gpu(data: Union[np.ndarray, cp.ndarray],
     ``cp.ndarray``. The production caller hands off an on-device
     ``FC_simi_block`` straight from ``compute_FC_simi_block_gpu``;
     ``cp.asarray`` below is then a no-op alias (no copy, no sync). A
-    host array still works — it triggers a one-shot H2D, matching the
-    legacy contract used by ``test_gpu_correctness``.
+    host array still works — it triggers a one-shot H2D (used by
+    ``test_gpu_correctness``).
 
-    Returns a device-resident ``cp.ndarray`` (post-PR #56-pattern
-    refactor). The production caller's per-iter_a accumulator now lives
-    on device too, so the legacy ``cp.asnumpy`` at exit was a 60 MB D2H
-    × 18 calls / subject ping-pong — eliminated in favour of one final
-    D2H at end of subgraph A (~300 KB of edge_count). Tests that need a
-    numpy view call ``cp.asnumpy`` at their boundary.
+    Returns a device-resident ``cp.ndarray``. The production caller's
+    per-iter_a accumulator lives on device too, so the only D2H is one
+    final copy at the end of subgraph A (~300 KB of edge_count). Tests
+    that need a numpy view call ``cp.asnumpy`` at their boundary.
 
     Parameters
     ----------

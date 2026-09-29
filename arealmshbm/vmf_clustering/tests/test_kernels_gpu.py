@@ -1,10 +1,10 @@
 # Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
-"""Kernel-level checks of ``_kernels_gpu_sparse`` against the CPU numba
+"""Kernel-level checks of ``_kernels_gpu`` against the CPU numba
 reference kernels on sub-001 (skipped without cupy / the data store).
 
 Each test feeds *identical* inputs (gathered at the candidate set) to
 both sides and compares the P-cell outputs; the dense CPU outputs are
-also checked to be zero outside P (the support invariant the sparse
+also checked to be zero outside P (the support invariant the gpu
 backend relies on).
 """
 
@@ -36,7 +36,7 @@ def ctx():
     skip_unless_cupy()
     fx = skip_unless_sub001()
     import cupy as cp
-    from arealmshbm.vmf_clustering import _kernels_gpu_sparse as K
+    from arealmshbm.vmf_clustering import _kernels_gpu as K
     from arealmshbm.vmf_clustering.sparse_layout import layout_to_device
     from arealmshbm.data_io.bitpacked_norm import unpack_normalize_packed_NTD_host
 

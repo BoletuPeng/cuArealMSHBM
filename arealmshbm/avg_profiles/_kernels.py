@@ -41,8 +41,8 @@ def _accum_packed_session_inplace_kernel(
     small non-negative integer (≤ subjects × sessions × number-of-
     accumulations-so-far). fp32 represents integers exactly up to 2^24,
     well beyond any realistic S × T, so no rounding occurs and the
-    final value is order-independent — bit-identical to the legacy
-    fp32-input path.
+    final value is order-independent — bit-identical to summing the
+    unpacked fp32 values.
     """
     V_h = packed_VhxDb.shape[0]
     D_bytes = packed_VhxDb.shape[1]

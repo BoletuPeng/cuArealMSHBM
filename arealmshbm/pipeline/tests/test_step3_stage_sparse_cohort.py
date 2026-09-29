@@ -1,12 +1,11 @@
 """test_step3_stage_sparse_cohort.py — stage LOAD loads the cohort once.
 
-On ``gpu_sparse`` the group prior / spatial masks / candidate layout are
-cohort constants; stage LOAD reads them once before the subject loop and
-hands the same :class:`Step3SparseCohort` to every ``Step3Pipeline``.
-Both tests replace ``Step3Pipeline`` with a recording stub and the
-cohort loader with a counting fake, so no data store is touched — but
-the coordinator still opens cupy streams on this backend, hence the
-cupy skip.
+The group prior / spatial masks / candidate layout are cohort constants;
+stage LOAD reads them once before the subject loop and hands the same
+:class:`Step3SparseCohort` to every ``Step3Pipeline``. Both tests
+replace ``Step3Pipeline`` with a recording stub and the cohort loader
+with a counting fake, so no data store is touched — but the coordinator
+still opens cupy streams, hence the cupy skip.
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """
@@ -17,7 +16,7 @@ import threading
 
 import pytest
 
-pytest.importorskip("cupy", reason="gpu_sparse coordinator creates cupy streams")
+pytest.importorskip("cupy", reason="the coordinator creates cupy streams")
 
 from arealmshbm.pipeline import _step3_stage_pipeline as sp
 from arealmshbm.step3_pipeline import Step3Config
@@ -50,7 +49,7 @@ class _StubPipe:
 def _configs(n):
     return [
         Step3Config(project_dir="/tmp/nonexistent", num_session=6,
-                    num_clusters=300, subid=i + 1, backend="gpu_sparse")
+                    num_clusters=300, subid=i + 1, backend="gpu")
         for i in range(n)
     ]
 
@@ -58,7 +57,7 @@ def _configs(n):
 def _coordinator(n):
     return sp.Step3StagePipeline(
         subject_ids=[str(i + 1) for i in range(n)],
-        configs=_configs(n), gradients={}, backend="gpu_sparse",
+        configs=_configs(n), gradients={},
     )
 
 
@@ -121,30 +120,3 @@ def test_cohort_load_failure_surfaces_from_run(monkeypatch):
     err = _run_with_timeout(_coordinator(2))
     assert isinstance(err, RuntimeError)
     assert "cohort load failed" in str(err)
-
-
-def test_dense_backend_gets_no_cohort(monkeypatch):
-    pipes = []
-
-    class _Recording(_StubPipe):
-        def __init__(self, cfg, **kw):
-            super().__init__(cfg, **kw)
-            pipes.append(self)
-
-    def _never(cfg, **kw):
-        raise AssertionError("dense backend must not load a sparse cohort")
-
-    monkeypatch.setattr(sp, "Step3Pipeline", _Recording)
-    monkeypatch.setattr(
-        "arealmshbm.step3_pipeline.sparse_inputs.load_step3_sparse_cohort",
-        _never)
-
-    coord = sp.Step3StagePipeline(
-        subject_ids=["1", "2"],
-        configs=[Step3Config(project_dir="/tmp/nonexistent", num_session=6,
-                             num_clusters=300, subid=i + 1,
-                             backend="gpu_full") for i in range(2)],
-        gradients={}, backend="gpu_full",
-    )
-    assert _run_with_timeout(coord) is None
-    assert [p.sparse_cohort for p in pipes] == [None, None]

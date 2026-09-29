@@ -6,7 +6,8 @@ variants share ~95 % of the EM body; this file catalogues the deltas
 and the structural impact on the Python implementation.
 
 Step 2 (group-prior estimation) supports `gMSHBM` and `dMSHBM` only;
-`cMSHBM` step-3 runs against a borrowed gMSHBM prior (see §4).
+`cMSHBM` step-3 runs against a borrowed gMSHBM prior where no cMSHBM
+prior exists (see §4).
 
 ## 1. The three variants — one-liner
 
@@ -26,7 +27,7 @@ Anything not listed here is identical across variants.
 | **Beta knob exists** | ❌ no `beta` arg | ✅ raw `beta` (no ×1000) | ✅ `beta * 1000` |
 | **Reads cohort.subjects[].gradient_*** | ❌ | ❌ | ✅ |
 | **`spatial_connect_prior`** (gradient term) | ❌ | ❌ | ✅ once per EM iter |
-| **`spatial_xyz_prior`** (sphere term) | ❌ | ✅ once per EM iter (always on) | ✅ inside comp_iter, only when `iter_em > 1` |
+| **`spatial_xyz_prior`** (sphere term) | ❌ | ✅ once per EM iter before comp_iter, and again after every `check_connectedness` inside it (from `iter_em = 1`) | ✅ inside comp_iter, only when `iter_em > 1` |
 | **`check_connectedness`** | ❌ | ✅ uses `RemoveIsolatedSurfaceComponents` then components > **1** \| dist > 0 | ✅ raw labels, components > **3** \| dist > 15 |
 | **`connect_th`** | n/a | 0 | 15 |
 | **`comp_iter` loop wrap** | ❌ (single λ-loop pass) | ✅ (full wrap) | ✅ (full wrap; first EM iter skips) |
@@ -55,7 +56,7 @@ highlighting:
 
 | Leaf | Owner module | Used by |
 |---|---|---|
-| `remove_isolated_surface_components` | [`arealmshbm/postprocessing/remove_isolated.py`](../arealmshbm/postprocessing/remove_isolated.py) | cMSHBM only — twice (per comp_iter and at the end) |
+| `remove_isolated_surface_components` | [`arealmshbm/postprocessing/remove_isolated.py`](../arealmshbm/postprocessing/remove_isolated.py) | cMSHBM only — twice (per comp_iter and at the end); `gpu` runs the per-comp_iter one on device (`ConnectednessGPU.remove_isolated`, bit-identical) |
 | `compute_components_general` threshold | [`arealmshbm/check_connectedness/`](../arealmshbm/check_connectedness/) | gMSHBM (`>3`), cMSHBM (`>1`); the leaf returns the raw count, the calling glue applies the predicate |
 
 `Cdln`, `vmf_probability`, the M-step κ/ν update, `intra_em_cost`,
@@ -78,30 +79,33 @@ from it:
    templates, sets `beta_internal` (gMSHBM ×1000, cMSHBM ×1, dMSHBM 0),
    skips cohort.json's gradient fields when not gMSHBM (`fetch_data`
    accepts a `with_gradient: bool` flag).
-2. **`VmfClusteringSession.run`** — reads the spec at construction and
-   gates which sub-Sessions get built and which calls fire per iter.
-   Both the CPU path and `gpu_full` mirror the same gating from the
-   same spec; no per-variant Session subclass.
-3. **`save_parcellation` / `derive_labels`** — applies the cMSHBM final
-   `RemoveIsolatedSurfaceComponents(5)` cleanup; picks
-   `..._beta<B>` vs `...` filename based on whether `beta` is set.
+2. **`VmfClusteringSession.run` (`cpu`) / `VmfClusteringSessionSparseCUDA`
+   (`gpu`, `vmf_clustering/vmf_clustering_gpu.py`)** — both read the
+   spec at construction and gate which sub-Sessions get built and which
+   calls fire per iter; no per-variant Session subclass.
+3. **`Step3Pipeline.save`** — applies the cMSHBM final
+   `RemoveIsolatedSurfaceComponents(5)` cleanup; passes `beta=None`
+   for dMSHBM, so `save_parcellation` writes `...` instead of
+   `..._beta<B>`.
 
 The "no spatial prior" cases (dMSHBM both, cMSHBM connect) are
 implemented by feeding the existing fused E-step kernel zero `(N, L)`
-buffers in the corresponding slots — no new "no-prior" kernel is
+buffers (zero P-length buffers on `gpu`) in the corresponding slots — no new "no-prior" kernel is
 needed since `+ β·scv + sxv` with `β = 0` or zero buffers is already
 algebraically correct.
 
 ## 4. Group-prior fallback (cMSHBM / dMSHBM)
 
-Only gMSHBM priors are shipped — the local
-`arealmshbm/data/group_priors/HCP_fsaverage6_40sub/<L>/gMSHBM/beta5/`
-layout has only `gMSHBM/beta<B>` subdirs; cMSHBM and dMSHBM
-directories don't exist. Step 2 trains gMSHBM / dMSHBM in-house
-(cMSHBM is not wired for step 2).
+CBIG's HCP priors (`lib/group_priors/HCP_fsaverage6_40sub/<L>/`,
+staged by the user — this repository does not ship them; see
+`arealmshbm/data/README.md`) carry `gMSHBM/beta<B>` subdirs at every
+`<L>`; cMSHBM and dMSHBM directories exist only at `<L>` = 300.
+Step 2 trains gMSHBM / dMSHBM in-house (cMSHBM is not wired for
+step 2).
 
-When running cMSHBM step-3 in isolation against the shipped HCP
-material, point at the gMSHBM `Params_Final.mat`. The four prior
+When running cMSHBM step-3 in isolation against CBIG's HCP
+priors at an `<L>` other than 300, point at the gMSHBM
+`Params_Final.mat`. The four prior
 fields (`mu`, `theta`, `epsil`, `sigma`) have identical meaning across
 all three variants — they're vMF group parameters and a spatial-prior
 probability map; the step-3 driver reads them positionally with no

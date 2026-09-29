@@ -22,9 +22,11 @@ On the GPU backend the four subgraphs are chained **in memory and on
 device**, and every disk write runs on a background thread that the
 caller joins at the end (:func:`join_step1_writers`):
 
-    generate_profiles  → packed (T, N, ⌈K/8⌉) uint8 per subject
-                         (``packed_sink``; .b2nd write in flight)
-    avg_profiles       ← ``packed_subjects``: device fp32 means
+    generate_profiles  → per-subject .b2nd (write in flight); every
+                         session's packed slab is folded into the
+                         cohort sums ON DEVICE as it is packed
+                         (``avg_accumulator``, :func:`make_avg_accumulator`)
+    avg_profiles       ← the accumulator: device fp32 means
                          (``lh_avg_dev`` / ``rh_avg_dev``; .npy write in flight)
     ini_params         ← device means (no host round trip; group.mat
                          write in flight)
@@ -49,6 +51,7 @@ from typing import (
 )
 
 import numpy as np
+from .config import _VALID_BACKENDS
 
 if TYPE_CHECKING:
     from ._progress import ProgressEmitter
@@ -104,23 +107,35 @@ _log = logging.getLogger(__name__)
 
 def prewarm_step1_gpu(bold_pairs: Optional[Sequence[Tuple[str, str]]] = None,
                       *, background: bool = True) -> Optional[threading.Thread]:
-    """Pay step 1's one-time GPU costs (RawKernel NVRTC compiles, the
-    cuBLAS handle, and — when the leaf's ingest will be nvCOMP — the
-    nvCOMP library + GIFTI kernels + pinned staging) off the timed
-    path.
+    """Pay part of step 1's one-time GPU costs (the profile leaf's
+    RawKernel NVRTC compiles, the cuBLAS handle, the nvCOMP library +
+    GIFTI kernel objects + pinned staging) off the timed path. The
+    GIFTI RawKernels, the CuPy elementwise kernels and the avg /
+    ini_params / radius_mask kernels compile at their first launch.
+
+    The nvCOMP binding is resolved first, synchronously, and a missing
+    or unloadable ``nvidia-nvcomp-cu12`` is raised from here as
+    ``ImportError``: ``backend='gpu'`` cannot run without it, and the
+    driver calls this before step 0, so the run fails at once rather
+    than after the whole cohort's gradients. The warm-up proper never
+    raises -- a failure there only means the run pays the first-call
+    cost itself, so it is logged at DEBUG rather than propagated.
 
     Idempotent: the leaf's prewarm is lock-guarded, so a second call —
     including the one ``run_generate_profiles`` makes itself — simply
     waits for the first to finish. Returns the daemon thread when
-    backgrounded (``None`` when run inline). Never raises: a prewarm
-    failure just means the run pays the cost itself, so the exception
-    is logged at DEBUG rather than propagated.
+    backgrounded (``None`` when run inline).
 
     Join the thread with :func:`join_step1_prewarm` before the process
     exits — otherwise a still-running NVRTC compile can outlive the
     interpreter's cupy teardown.
     """
     global _PREWARM_THREAD
+
+    # Hard dependency, checked before any thread starts. Cached, so the
+    # warm-up below reuses the binding this loads.
+    from arealmshbm.data_io._nvcomp_batched import get_deflate_batch
+    get_deflate_batch()
 
     # A fresh thread defaults to device 0, so the prewarm must be
     # pinned to the device the CALLER is on or it warms the wrong one.
@@ -185,6 +200,27 @@ class PendingSubjectWrite(NamedTuple):
     handle: Any
 
 
+def make_avg_accumulator(*, targ_mesh: str, seed_mesh: str, num_sess: int):
+    """The cohort's
+    :class:`~arealmshbm.avg_profiles.avg_profiles_gpu.PackedProfileAccumulator`
+    (GPU backend): ``(V_lh, D)`` / ``(V_rh, D)`` fp32 device sums sized
+    from the meshes -- ``D`` is the seed count the profile leaf packs
+    along, from the same ``subject_seed_and_mw`` call the leaf makes --
+    expecting ``num_sess`` sessions per subject. Hand it to
+    ``run_generate_profiles(avg_accumulator=...)``, then to
+    ``run_avg_profiles(accumulator=...)``.
+    """
+    from arealmshbm.avg_profiles.avg_profiles_gpu import (
+        PackedProfileAccumulator,
+    )
+    from arealmshbm.generate_profiles.profiles_subject_gpu import (
+        subject_seed_and_mw,
+    )
+    seed_idx, _mw, n_lh, n_rh = subject_seed_and_mw(seed_mesh, targ_mesh)
+    return PackedProfileAccumulator(n_lh, n_rh, int(seed_idx.size),
+                                    int(num_sess))
+
+
 def run_generate_profiles(
     *,
     project_dir: Path,
@@ -198,7 +234,7 @@ def run_generate_profiles(
     backend: str = "cpu",
     verbose: bool = True,
     progress: Optional["ProgressEmitter"] = None,
-    packed_sink: Optional[Dict[str, Tuple[np.ndarray, int]]] = None,
+    avg_accumulator=None,
     write_handles: Optional[List[PendingSubjectWrite]] = None,
 ) -> List[Tuple[str, Path]]:
     """Per-subject (T, N, D) profile writer.
@@ -208,27 +244,27 @@ def run_generate_profiles(
 
     ``backend='gpu'`` runs the fused whole-subject leaf
     (:func:`~arealmshbm.generate_profiles.profiles_subject_gpu.generate_subject_profiles_gpu`:
-    ingest → one zscore / sgemm / exact-select / pack per session →
-    one D2H → background .b2nd write). The leaf picks its own ingest
-    — batched nvCOMP when the library is installed, the CPU GIFTI
-    reader otherwise, byte-identical either way — so there is nothing
-    for this runner to route. Two optional sinks let the caller keep
-    the result in memory instead of re-reading the .b2nd:
+    batched nvCOMP ingest → one zscore / sgemm / exact-select / pack
+    per session → one D2H → background .b2nd write); there is nothing
+    for this runner to route. Two optional hooks chain the next
+    subgraphs in memory instead of re-reading the .b2nd:
 
-    * ``packed_sink`` — filled with ``sub_id → (packed (T, N, ⌈K/8⌉)
-      uint8 host array, K)``. For a multi-subject cohort each array is
-      a pageable copy (the leaf's pinned block is recycled subject to
-      subject); for a single subject it is the leaf's own buffer.
+    * ``avg_accumulator`` — a
+      :class:`~arealmshbm.avg_profiles.avg_profiles_gpu.PackedProfileAccumulator`
+      (:func:`make_avg_accumulator`). Every session's packed slab is
+      folded into it on device the moment it is packed, so
+      ``run_avg_profiles(accumulator=...)`` has nothing left to read
+      and no subject's bytes are held past its .b2nd write. GPU-only:
+      the CPU ``avg_profiles`` reads the .b2nd files back.
     * ``write_handles`` — when given, the single-subject case does
       NOT join its .b2nd write here: the pending write is appended and
-      the caller must :func:`join_step1_writers` it (after consuming
-      ``packed_sink``, which borrows the pinned block the writer is
-      still reading). Multi-subject cohorts always join per subject so
-      pinned memory stays bounded.
+      the caller must :func:`join_step1_writers` it, so the write
+      overlaps the subgraphs that follow. Multi-subject cohorts always
+      join per subject so pinned memory stays bounded (one recycled
+      block).
 
     ``backend='cpu'`` keeps the stage pipeline (GZIP pool → numba leaf
-    → POST → ASSEM → WRITE); the sinks are ignored (the CPU
-    ``avg_profiles`` reads the .b2nd back from disk).
+    → POST → ASSEM → WRITE); ``write_handles`` is ignored.
     """
     from arealmshbm.data_io.profile_io import profile_path
 
@@ -246,8 +282,13 @@ def run_generate_profiles(
         sess_per_sub[sub_id] = sum(
             1 for s in schedule if s[0] == sub_id)
 
-    if backend not in ("cpu", "gpu"):
+    if backend not in _VALID_BACKENDS:
         raise ValueError(f"run_generate_profiles: unknown backend {backend!r}")
+    if avg_accumulator is not None and backend != "gpu":
+        raise ValueError(
+            "run_generate_profiles: avg_accumulator is GPU-only (the CPU "
+            "avg_profiles reads the .b2nd files back)."
+        )
 
     if backend == "gpu":
         # The fused leaf reduces in fp32 throughout (its zscore, sgemm
@@ -266,7 +307,9 @@ def run_generate_profiles(
             seed_mesh=seed_mesh, targ_mesh=targ_mesh,
             threshold=threshold, split_flag=split_flag,
             verbose=verbose, progress=progress,
-            packed_sink=packed_sink, write_handles=write_handles,
+            on_packed=(avg_accumulator.add if avg_accumulator is not None
+                       else None),
+            write_handles=write_handles,
         )
 
     from ._step1_bold_prefetcher import Step1BoldPrefetcher
@@ -327,7 +370,7 @@ def _run_generate_profiles_gpu_fused(
     split_flag: str,
     verbose: bool,
     progress: Optional["ProgressEmitter"],
-    packed_sink: Optional[Dict[str, Tuple[np.ndarray, int]]],
+    on_packed,
     write_handles: Optional[List[PendingSubjectWrite]],
 ) -> List[Tuple[str, Path]]:
     """GPU path of :func:`run_generate_profiles`: one fused
@@ -360,10 +403,8 @@ def _run_generate_profiles_gpu_fused(
                 out_path=out_paths[sub_id],
                 seed_mesh=seed_mesh, targ_mesh=targ_mesh,
                 threshold=threshold, split_flag=split_flag,
+                on_packed=on_packed,
             )
-            if packed_sink is not None:
-                packed = res.packed if defer_join else np.array(res.packed, copy=True)
-                packed_sink[sub_id] = (packed, int(res.K))
             if defer_join:
                 write_handles.append(PendingSubjectWrite(sub_id, res))
             else:
@@ -379,9 +420,13 @@ def _run_generate_profiles_gpu_fused(
         if verbose:
             print(f"  [1] generate_subject_profiles_gpu sub={sub_id}  "
                   f"sessions={len(sess_ids)}  K={int(res.K)} "
-                  f"D={res.packed.shape[-1]}  ingest={res.ingest}  "
+                  f"D_bytes={(int(res.K) + 7) // 8}  "
                   f"{time.perf_counter() - t0:.2f} s", flush=True)
         out.append((sub_id, Path(res.out_path)))
+        # A joined result is the last reference to the leaf's pinned D2H
+        # block; dropping it here lets the next subject recycle that one
+        # block (the deferred single-subject case is held by its handle).
+        del res
     return out
 
 
@@ -438,49 +483,47 @@ def run_avg_profiles(
     targ_mesh: str,
     backend: str = "cpu",
     verbose: bool = True,
-    packed_subjects: Optional[Sequence[np.ndarray]] = None,
-    D: Optional[int] = None,
+    accumulator=None,
 ):
     """Average RSFC profiles across (subject × session).
 
     Returns the underlying :class:`AvgProfilesResult` —
     ``(lh_path, rh_path, lh_avg, rh_avg[, lh_avg_dev, rh_avg_dev, writer])``.
 
-    Disk flow (default): reads every subject's .b2nd back from
-    ``profiles_raw/`` and writes the .npy pair synchronously.
+    Disk flow (default): discovers subjects ``1..num_sub`` under
+    ``profiles_raw/`` (missing ids are skipped), reads their .b2nd back
+    and writes the .npy pair synchronously.
 
-    In-memory flow (``packed_subjects`` + ``D`` given; GPU only): the
-    ``(T, N, ⌈D/8⌉)`` uint8 arrays from ``run_generate_profiles``'s
-    ``packed_sink`` are accumulated on device; the result carries the
-    device fp32 means (``lh_avg_dev`` / ``rh_avg_dev``) for
-    ``run_ini_params`` and a ``writer`` handle for the background .npy
-    pair that the caller must join (:func:`join_step1_writers`).
+    In-memory flow (``accumulator`` given; GPU only): the
+    :class:`~arealmshbm.avg_profiles.avg_profiles_gpu.PackedProfileAccumulator`
+    that ``run_generate_profiles(avg_accumulator=...)`` filled on device
+    is turned into the mean of exactly the subjects the leaf fed
+    (``num_sub`` is not consulted); the result carries the device fp32
+    means (``lh_avg_dev`` / ``rh_avg_dev``) for ``run_ini_params`` and
+    a ``writer`` handle for the background .npy pair that the caller
+    must join (:func:`join_step1_writers`).
     """
-    if packed_subjects is not None:
+    if accumulator is not None:
         if backend != "gpu":
             raise ValueError(
-                "run_avg_profiles: the in-memory packed_subjects hand-off "
-                "is GPU-only; the CPU backend reads the .b2nd files back."
+                "run_avg_profiles: the in-memory accumulator hand-off is "
+                "GPU-only; the CPU backend reads the .b2nd files back."
             )
-        if D is None:
-            raise ValueError("run_avg_profiles: packed_subjects needs D")
-        # Same invariant the disk branch enforces on the decoded .b2nd:
-        # the accumulated slab must carry exactly ``num_sess`` sessions.
-        # (The leaf pins T equal across subjects, so subject 0 speaks
-        # for all of them; an empty sequence is the leaf's own error.)
-        if len(packed_subjects) > 0:
-            T0 = int(np.shape(packed_subjects[0])[0])
-            if T0 != num_sess:
-                raise ValueError(
-                    f"run_avg_profiles: packed_subjects has T={T0} but "
-                    f"num_sess={num_sess}."
-                )
+        # The accumulator checked the per-subject session order as it was
+        # fed and its finalize refuses an incomplete subject; what is
+        # left to pin here is that it counted sessions against THIS
+        # cohort's ``num_sess`` -- the disk branch's ``T == num_sess``
+        # check on every .b2nd.
+        if int(accumulator.num_sess) != int(num_sess):
+            raise ValueError(
+                f"run_avg_profiles: the accumulator was built for "
+                f"num_sess={accumulator.num_sess} but num_sess={num_sess}."
+            )
         from arealmshbm.avg_profiles.avg_profiles_gpu import (
-            avg_profiles_from_packed_gpu,
+            avg_profiles_from_accumulator,
         )
-        return avg_profiles_from_packed_gpu(
-            list(packed_subjects), int(D), targ_mesh, seed_mesh,
-            str(project_dir), save=True, verbose=verbose,
+        return avg_profiles_from_accumulator(
+            accumulator, targ_mesh, seed_mesh, str(project_dir), save=True,
         )
     from arealmshbm.avg_profiles import avg_profiles
     return avg_profiles(
@@ -500,7 +543,7 @@ def run_avg_profiles(
 class IniParamsRun(NamedTuple):
     """``run_ini_params`` result: the group.mat path, the scalar ε, and
     the background write handle (``None`` when the write was
-    synchronous). Unpacks as the historical ``(path, epsil)`` pair via
+    synchronous). Unpacks as the ``(path, epsil)`` pair via
     ``path, epsil = res[:2]``."""
     group_mat_path: Path
     epsil: float
@@ -579,8 +622,7 @@ def run_radius_mask(
     lh_labels: np.ndarray,
     rh_labels: np.ndarray,
     radius_mm: float = 30.0,
-    cbig_code_dir: Optional[Path] = None,
-    dtype=np.float32,
+    atlas_dir: Optional[Path] = None,
     backend: str = "cpu",
     verbose: bool = True,
 ) -> Path:
@@ -594,17 +636,16 @@ def run_radius_mask(
     test_knobs_field_match.test_step1_radius_mask_radius_mm_maps_to_run_radius_mask.
     """
     from arealmshbm.radius_mask import generate_radius_mask
-    cbig_str = str(cbig_code_dir) if cbig_code_dir is not None else None
+    atlas_str = str(atlas_dir) if atlas_dir is not None else None
     result = generate_radius_mask(
         lh_labels=lh_labels,
         rh_labels=rh_labels,
         mesh=targ_mesh,
         radius=radius_mm,
         out_dir=str(project_dir),
-        dtype=dtype,
         verbose=verbose,
         backend=backend,
-        cbig_code_dir=cbig_str,
+        atlas_dir=atlas_str,
     )
     return Path(result["mat_path"])
 
@@ -618,7 +659,7 @@ def resolve_group_labels(
     schaefer_resolution: Optional[str] = None,
     lh_labels_path: Optional[Path] = None,
     rh_labels_path: Optional[Path] = None,
-    cbig_code_dir: Optional[Path] = None,
+    atlas_dir: Optional[Path] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Return ``(lh_labels, rh_labels)`` with -1 → 0 normalisation.
 
@@ -632,7 +673,7 @@ def resolve_group_labels(
         from arealmshbm.data_io.annot_io import read_annot_labels
         from arealmshbm.data_io.load_avg_mesh import _atlas_dir
 
-        base = cbig_code_dir if cbig_code_dir is not None else _atlas_dir()
+        base = atlas_dir if atlas_dir is not None else _atlas_dir()
         stem = (
             f"Schaefer2018_{schaefer_resolution}Parcels_"
             f"Kong2022_17Networks_order.annot"

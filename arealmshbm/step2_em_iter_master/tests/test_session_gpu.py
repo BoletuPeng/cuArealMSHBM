@@ -15,6 +15,8 @@ Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
@@ -23,12 +25,16 @@ cp = pytest.importorskip("cupy")
 from arealmshbm.step2_em_iter_master import (  # noqa: E402
     Step2EmIterSession, Step2SparseSession,
 )
-from arealmshbm.step2_io import InMemoryGradientLoader, InMemoryProfileLoader  # noqa: E402
+from arealmshbm.step2_em_iter_master.tests._loaders import (  # noqa: E402
+    InMemoryGradientLoader, InMemoryProfileLoader,
+)
 from arealmshbm.step2_io.load_subject_profiles import (  # noqa: E402
     _widen_normalize_bitpacked_to_f32_NTD_kernel,
 )
 from arealmshbm.step2_io.sparse_inputs import Step2SparseInputs  # noqa: E402
-from arealmshbm.step2_io.sparse_layout import build_step2_layout_dense  # noqa: E402
+from arealmshbm.step2_io.tests._layout_oracle import (  # noqa: E402
+    build_step2_layout_dense,
+)
 from arealmshbm.step2_em_iter_master.tests import _bench_fixture as BF  # noqa: E402
 
 
@@ -163,14 +169,19 @@ extern "C" __global__ void _test_spin(long long cycles) {
 """
 
 
-def test_ctor_fences_the_current_stream_not_the_null_stream():
-    """The pinned staging slot is reused per subject inside the ctor.
+def test_ctor_fences_the_current_stream_not_the_null_stream(monkeypatch):
+    """The eager ingest refills a page-locked slot once its H2D is fenced.
 
     Built inside a non-blocking stream that already has work queued, the
     H2D copies sit behind that work; a fence on the legacy default stream
-    returns immediately and lets the host refill the slot under them.
+    returns immediately and lets the next subject's decode overwrite the
+    slot under them. The ring is pinned to ONE slot so subject 2's decode
+    refills subject 1's: with the default depth a cohort no larger than
+    the ring never refills anything and the fence is not exercised.
     """
+    import arealmshbm.step2_em_iter_master.session_gpu as sg
     from arealmshbm.initialize_concentration import initialize_concentration
+    monkeypatch.setattr(sg, "_INGEST_DEPTH", 1)
     # The per-subject payload must clear 64 KiB: CUDA inlines smaller H2D
     # copies into the pushbuffer, which hides the reuse hazard entirely.
     n_wide = 4096
@@ -214,7 +225,7 @@ def test_ctor_fences_the_current_stream_not_the_null_stream():
 
 
 def test_sync_to_host_rejects_an_unknown_field():
-    """Same contract as the dense GPU session: ValueError, not KeyError."""
+    """ValueError, not KeyError."""
     from arealmshbm.initialize_concentration import initialize_concentration
     inputs, _bm, _mtc, _bold, _g = _synthetic(4)
     dim = D - 1
@@ -268,25 +279,106 @@ def _u(dt):
     return {4: np.uint32, 8: np.uint64, 1: np.uint8}[np.dtype(dt).itemsize]
 
 
-def test_bold_cache_mode_stream_matches_eager():
+def test_bold_cache_mode_stream_matches_eager(monkeypatch):
+    """Eager, stream with the host cache, and stream decoding through
+    the reader on every visit (host cache over budget) agree bit for
+    bit; only the first keeps no host copy at all."""
+    pytest.importorskip("psutil")
     from arealmshbm.initialize_concentration import initialize_concentration
+    import arealmshbm.step2_em_iter_master.session_gpu as sg
     inputs, _bm, _mtc, _bold, _g = _synthetic(3)
     dim = D - 1
     ini_val = float(initialize_concentration(dim))
-    out = []
-    for cache in ("eager_bitpacked", "stream"):
-        g = Step2SparseSession(
+
+    def _build(cache):
+        return Step2SparseSession(
             inputs, mode="gMSHBM", num_clusters=L, dim=dim, ini_val=ini_val,
             beta_internal=5000.0, eps_m_step=1e-4, max_iter_m=50,
             eps_intra_var=1e-4, max_iter_intra_var=20, bold_cache_mode=cache)
+
+    out = []
+    for cache, fraction in (("eager_bitpacked", 0.5), ("stream", 0.5),
+                            ("stream", 1e-15)):
+        monkeypatch.setattr(sg, "_HOST_CACHE_FRACTION", fraction)
+        if fraction < 0.5:
+            with pytest.warns(RuntimeWarning, match="host BOLD cache"):
+                g = _build(cache)
+        else:
+            g = _build(cache)
         assert g.bold_cache_mode == cache
+        if cache == "eager_bitpacked":
+            assert g._host_cache is None and g._pinned_bold is None
+        else:
+            assert g._pinned_bold is not None
+            assert (g._host_cache is not None) == (fraction == 0.5)
         g.initialize_state()
         for _ in range(2):
             g.run_iter()
         out.append(g.sync_to_host(("s_lambda_P", "theta_P", "s_t_nu")))
     for k in out[0]:
-        assert np.array_equal(out[0][k].view(np.uint32),
-                              out[1][k].view(np.uint32)), k
+        for o in out[1:]:
+            assert np.array_equal(out[0][k].view(np.uint32),
+                                  o[k].view(np.uint32)), k
+
+
+def test_eager_ingest_reads_each_subject_once_and_keeps_no_host_copy():
+    """The eager ctor pulls every subject through the reader exactly
+    once into the device cache; no host cache or staging slot outlives
+    the constructor."""
+    from arealmshbm.initialize_concentration import initialize_concentration
+    base, _bm, _mtc, _bold, _g = _synthetic(6)
+    calls = []
+    real = base.bold_reader
+
+    def counting(s_1, out):
+        calls.append(s_1)
+        real(s_1, out)
+
+    inputs = replace(base, bold_reader=counting)
+    dim = D - 1
+    g = Step2SparseSession(
+        inputs, mode="dMSHBM", num_clusters=L, dim=dim,
+        ini_val=float(initialize_concentration(dim)), beta_internal=0.0,
+        eps_m_step=1e-4, max_iter_m=50, eps_intra_var=1e-4,
+        max_iter_intra_var=20, bold_cache_mode="eager_bitpacked")
+    assert sorted(calls) == list(range(1, S + 1))
+    assert g._host_cache is None and g._pinned_bold is None
+    expect = np.empty((S, T, N, DB), dtype=np.uint8)
+    for s in range(S):
+        real(s + 1, expect[s])
+    assert np.array_equal(cp.asnumpy(g._packed), expect)
+
+
+@pytest.mark.parametrize("cache, fraction", [("eager_bitpacked", 0.5),
+                                             ("stream", 0.5),
+                                             ("stream", 1e-15)])
+def test_ctor_propagates_a_reader_failure(monkeypatch, cache, fraction):
+    """A subject the reader rejects fails the constructor on every
+    residency path. The eager ring and the stream-mode host cache pull
+    the subjects through worker threads, whose exception must surface,
+    not be swallowed."""
+    if cache == "stream":
+        pytest.importorskip("psutil")
+    import arealmshbm.step2_em_iter_master.session_gpu as sg
+    from arealmshbm.initialize_concentration import initialize_concentration
+    base, _bm, _mtc, _bold, _g = _synthetic(7)
+    real = base.bold_reader
+
+    def bad(s_1, out):
+        if s_1 == 2:
+            raise ValueError("bold_reader: sub 2 packed shape (1, 128, 33) "
+                             "!= expected (T, N, Db)")
+        real(s_1, out)
+
+    inputs = replace(base, bold_reader=bad)
+    monkeypatch.setattr(sg, "_HOST_CACHE_FRACTION", fraction)
+    dim = D - 1
+    with pytest.raises(ValueError, match="sub 2 packed shape"):
+        Step2SparseSession(
+            inputs, mode="dMSHBM", num_clusters=L, dim=dim,
+            ini_val=float(initialize_concentration(dim)), beta_internal=0.0,
+            eps_m_step=1e-4, max_iter_m=50, eps_intra_var=1e-4,
+            max_iter_intra_var=20, bold_cache_mode=cache)
 
 
 def test_export_params_shapes():

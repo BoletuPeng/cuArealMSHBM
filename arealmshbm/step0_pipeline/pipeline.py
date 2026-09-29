@@ -96,9 +96,7 @@ _POS_GRAD_THRESHOLD = 1e-10
 #
 # The cache is unbounded and grows linearly in the number of distinct
 # (mesh, cbig_code_dir, smooth_sigma, K_hop) tuples seen by the
-# process. The current single-mesh batch usage keeps it at one entry;
-# test suites or pipelines that iterate meshes should call
-# :func:`clear_inputs_cache` between configs.
+# process. The current single-mesh batch usage keeps it at one entry.
 _INPUTS_CACHE: Dict[Tuple, "Step0Inputs"] = {}
 
 
@@ -106,17 +104,6 @@ def _inputs_cache_key(cfg) -> Tuple:
     """Cache key for the subject-invariant portion of load_inputs."""
     cbig = str(cfg.cbig_code_dir) if cfg.cbig_code_dir is not None else None
     return (str(cfg.mesh), cbig, float(cfg.smooth_sigma), int(cfg.K_hop))
-
-
-def clear_inputs_cache() -> None:
-    """Drop the process-wide load_inputs cache.
-
-    Useful in test suites and when switching meshes mid-process; not
-    needed in a normal batch run. The cache also auto-evicts the CPU
-    side memory only — GPU memory is governed by Step0Pipeline.close()
-    teardown.
-    """
-    _INPUTS_CACHE.clear()
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -265,8 +252,7 @@ class Step0Result:
 #
 #   * Internal — fallback for standalone ``Step0Pipeline`` usage
 #     (ad-hoc single-subject runs, leaf tests). Spins up a per-subject
-#     bounded sliding-window pool inside this contextmanager; behaviour
-#     matches the prior in-pipeline ``ThreadPoolExecutor``. The
+#     bounded sliding-window pool inside this contextmanager. The
 #     cold-start latency that the external path hides is unavoidable
 #     here because there's no driver to manage cross-subject overlap.
 #
@@ -461,8 +447,8 @@ class Step0Pipeline:
         else:
             # ── Tier 3: live rebuild (only on first cold start) ────────
             # All heavy precomputation lives in
-            # arealmshbm/precompute/step0_inputs_builder.py — moved out
-            # of the production path. We call it here once on first run
+            # arealmshbm/precompute/step0_inputs_builder.py, shared with
+            # the cache-builder CLI. We call it here once on first run
             # and write the result to disk so tier 2 wins next time.
             from arealmshbm.precompute.step0_inputs_builder import (
                 build_step0_inputs,
@@ -855,10 +841,9 @@ class Step0Pipeline:
         diffmap runs eigsh on cuSOLVER. The embeddings are always
         materialised to host (consumed by subgraph D); the distance
         matrices are D2H'd **only when ``cfg.save_geodesic_distance``
-        is True** — that flag is False by default since 2026-05 because
-        no production downstream step reads the on-disk dist artifact,
-        so the legacy unconditional D2H of (N_down, N_down) fp32 ×2
-        hemi (~1.34 GB / subject) was pure waste in the default mode.
+        is True**. No production downstream step reads the on-disk
+        dist artifact, so the default skips that (N_down, N_down) fp32
+        ×2 hemi (~1.34 GB / subject) D2H.
         """
         cfg = self.cfg
         tc = time.perf_counter()
@@ -993,7 +978,7 @@ class Step0Pipeline:
         # edge_density.npy is a step-0 intermediate with no production
         # downstream consumer (subgraph B reads it in-memory; the disk
         # artifact is consumed only by the internal CPU/GPU diff harness).
-        # Gated by ``save_edge_density`` (default False since 2026-06) —
+        # Gated by ``save_edge_density`` (default False) —
         # symmetric to ``save_geodesic_distance`` which gates the other
         # intermediate dump.
         if self.cfg.save_edge_density:

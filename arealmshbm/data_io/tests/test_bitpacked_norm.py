@@ -1,10 +1,8 @@
 """test_bitpacked_norm.py — direct tests for the host bit-unpack +
 demean + L2-norm kernel used by the CPU :class:`VmfClusteringSession`.
 
-The kernel is the host counterpart of the device-side
-``_normalize_bold_NTD_from_packed`` in vmf_clustering_gpu.py: both
-ingest the same on-disk packed bytes and produce numerically
-equivalent ``(N, T, D)`` fp32 BOLD.
+The kernel ingests the on-disk packed bytes and produces the
+``(N, T, D)`` fp32 BOLD the cpu session runs on.
 
 Three contract pins live here:
 

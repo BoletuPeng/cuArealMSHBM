@@ -4,38 +4,31 @@ device-stay subject reader.
 What is pinned here
 -------------------
 1. **Bit-equality of the fast CPU route** — ``read_surface_gifti``
-   (numba base64 + isal + staged transpose) against the reference
-   route it replaced (``_parse_gifti_chunks`` + ``_decode_one_chunk``
-   + strided column write), byte-for-byte on the ``uint32`` view, for
-   the serial and the chunk-parallel entry points and for a payload of
-   NaN / ±inf / -0.0 / subnormals.
+   (numba base64 + isal + staged transpose) against a reference route
+   (per-chunk decode + strided column write), byte-for-byte on the
+   ``uint32`` view, for the serial and the chunk-parallel entry points
+   and for a payload of NaN / ±inf / -0.0 / subnormals.
    The oracle is ``_head_parse`` / ``_reference_read``, frozen copies
-   of the shipped reader — NOT the live ``_scan_gifti_spans``, which
-   the rewrite replaced and would otherwise be compared with itself.
-2. **The base64 contract is not narrowed** — the default still accepts
+   in this file — NOT the live ``_scan_gifti_spans``, which would
+   otherwise be compared with itself.
+2. **The base64 contract is not narrowed** — the reader still accepts
    line-wrapped / pretty-printed payloads (via a per-chunk fallback)
-   and a length that is not a multiple of 4, ``allow_wrapped_b64=False``
-   opts into the strict GPU contract, and ``True`` forces the
-   permissive route.
-3. **``read_subject_bold_gpu`` semantics** — output equals
-   ``concat_hemis_drop_medial(read_surface_bold(lh),
-   read_surface_bold(rh), mask)`` bit-for-bit, including the NaN→0 and
-   ±inf clamping the fused epilogue does inline, for both the batched
-   and the pipelined (generator) entry points; a payload that does not
-   inflate to ``Dim0 * 4`` bytes raises instead of leaking recycled
-   device memory; no fixed timepoint ceiling; and the pipelined mode's
-   device memory does not grow with the session count.
-4. **``raw_sessions=True``** — the pre-epilogue ``(T, lh|rh)`` buffer
-   equals the CPU reader's transpose, and the mask stays mandatory on
-   the epilogue path.
-5. **No nested-pool deadlock** — ``pool=<the caller's own pool>`` from
+   and a length that is not a multiple of 4.
+3. **``iter_subject_bold_gpu`` semantics** — each ``(T, lh|rh)``
+   session buffer equals the CPU reader's transpose bit-for-bit, NaN
+   and ±inf included, for every ``group_sessions`` batching and in
+   input order; a payload that does not inflate to ``Dim0 * 4`` bytes
+   raises instead of leaking recycled device memory; no fixed
+   timepoint ceiling; and the pipelined mode's device memory does not
+   grow with the session count.
+4. **No nested-pool deadlock** — ``pool=<the caller's own pool>`` from
    inside one of its workers demotes to the serial path.
-6. **The GPU base64 contract** — a ``'='`` outside the payload's final
+5. **The GPU base64 contract** — a ``'='`` outside the payload's final
    quad is an error (the decode table maps it to 0, so only the kernel's
    placement guard catches it) while every legal tail pad still decodes.
-7. **The tag scan emits int64 offsets** — matching a host bytescan
+6. **The tag scan emits int64 offsets** — matching a host bytescan
    exactly, so there is no byte-span ceiling on a pipeline group.
-8. **The shared pinned staging block is not duplicated** — a regrown
+7. **The shared pinned staging block is not duplicated** — a regrown
    buffer replaces the old one instead of holding both, a request
    inside the pool's rounded capacity reuses it, and a failure to pin
    the whole subject is reported as a host-staging limit, not as a
@@ -57,7 +50,6 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from arealmshbm.bold_io import concat_hemis_drop_medial, read_surface_bold
 from arealmshbm.data_io.gifti_io import (
     _scan_gifti_spans,
     read_surface_gifti,
@@ -104,14 +96,10 @@ def _make_gifti(dim0: int, T: int, values=None, wrap: bool = False) -> bytes:
 
 
 def _head_parse(path):
-    """The pre-optimization ``_parse_gifti_chunks``, frozen verbatim.
-
-    The optimized parser rewrote ``_parse_gifti_chunks`` into a wrapper
-    over the new one-pass ``_scan_gifti_spans``, so comparing against
-    the live function would compare the new scanner with itself. This
-    is the three-sweep original (two unbounded ``bytes.find`` passes
-    plus a bounded ``</Data>`` search per darray) copied out of the
-    shipped reader, so the span logic actually has an oracle.
+    """Frozen three-sweep GIFTI head parser, the oracle for
+    ``_scan_gifti_spans``: two unbounded ``bytes.find`` passes plus a
+    bounded ``</Data>`` search per darray, transcribed here so the live
+    scanner is never compared with itself.
     """
     with open(path, "rb") as f:
         data = f.read()
@@ -147,16 +135,16 @@ def _head_parse(path):
 
 
 def _scan_chunks(path):
-    """``(N, T, chunks)`` off the live span scanner -- the ``bytes``-
-    materialising wrapper the reader itself never needed, kept with its
-    only user."""
+    """``(N, T, chunks)`` off the live span scanner, with each chunk
+    materialised as ``bytes`` for comparison with :func:`_head_parse`."""
     data = Path(path).read_bytes()
     N, T, _hs, _he, ds, de = _scan_gifti_spans(data, path)
     return N, T, [data[ds[i]:de[i]] for i in range(T)]
 
 
 def _reference_read(path) -> np.ndarray:
-    """The pre-optimization decode route, kept here as the oracle."""
+    """Per-chunk ``base64`` + ``zlib`` decode and strided column write:
+    the oracle for ``read_surface_gifti``."""
     N, T, chunks = _head_parse(path)
     out = np.empty((N, T), dtype=np.float32)
     for t, c in enumerate(chunks):
@@ -171,8 +159,8 @@ def _reference_read(path) -> np.ndarray:
 
 
 def test_span_scanner_matches_frozen_head_parser(tmp_path: Path):
-    """``_scan_gifti_spans`` replaced a three-sweep scan with a memchr
-    pass plus a fallback; this is the oracle that change never had."""
+    """``_scan_gifti_spans`` (one memchr pass plus a fallback) against
+    the frozen three-sweep head parser transcribed here as its oracle."""
     for dim0, T in [(8, 3), (255, 17), (1024, 5), (37, 41)]:
         p = tmp_path / f"scan{dim0}_{T}.func.gii"
         p.write_bytes(_make_gifti(dim0, T))
@@ -249,8 +237,7 @@ def test_cpu_reader_time_major_is_the_transpose(tmp_path: Path):
     """``time_major=True`` hands back the decode's own ``(T, N)`` layout:
     the default output transposed, bit for bit, on every route (serial,
     chunk-parallel, and the wrapped-b64 fallback). Step 1 reads this
-    way, so the host transpose the reader used to do and the one the
-    consumer undid are both gone."""
+    way."""
     rng = np.random.default_rng(9)
     vals = rng.standard_normal((5, 96)).astype(np.float32)
     p = tmp_path / "tm.func.gii"
@@ -267,12 +254,11 @@ def test_cpu_reader_time_major_is_the_transpose(tmp_path: Path):
 
 
 def test_cpu_reader_accepts_wrapped_b64_by_default(tmp_path: Path):
-    """No narrowing of the shipped reader's accepted-input set.
+    """The reader accepts whitespace-wrapped payloads.
 
     The strict numba kernel refuses a whitespace-wrapped payload; the
-    default ``allow_wrapped_b64=None`` must fall back to
-    ``base64.b64decode`` for that chunk and produce exactly what the
-    pre-optimization reader produced.
+    reader must fall back to ``base64.b64decode`` for that chunk and
+    produce exactly what ``_reference_read`` produces.
     """
     vals = [np.linspace(-1, 1, 64, dtype=np.float32) * (t + 1)
             for t in range(3)]
@@ -306,27 +292,6 @@ def test_cpu_reader_accepts_wrapped_b64_by_default(tmp_path: Path):
         p = tmp_path / f"{name}.func.gii"
         p.write_bytes(b"".join(out))
         assert _bit_equal(read_surface_gifti(p), _reference_read(p)), name
-
-
-def test_cpu_reader_strict_mode_rejects_wrapped_b64(tmp_path: Path):
-    """``allow_wrapped_b64=False`` opts into the GPU readers' contract."""
-    p = tmp_path / "wrapped2.func.gii"
-    p.write_bytes(_make_gifti(64, 3, wrap=True))
-    with pytest.raises(ValueError, match="outside the base64 alphabet"):
-        read_surface_gifti(p, allow_wrapped_b64=False)
-
-
-def test_cpu_reader_wrapped_b64_forced_permissive(tmp_path: Path):
-    """``allow_wrapped_b64=True`` routes every chunk through
-    ``base64.b64decode`` and still yields the reference values."""
-    vals = [np.linspace(-1, 1, 64, dtype=np.float32) * (t + 1)
-            for t in range(3)]
-    straight = tmp_path / "s.func.gii"
-    straight.write_bytes(_make_gifti(64, 3, values=vals))
-    wrapped = tmp_path / "w.func.gii"
-    wrapped.write_bytes(_make_gifti(64, 3, values=vals, wrap=True))
-    assert _bit_equal(read_surface_gifti(wrapped, allow_wrapped_b64=True),
-                      read_surface_gifti(straight))
 
 
 def test_cpu_reader_nested_pool_does_not_deadlock(tmp_path: Path):
@@ -368,13 +333,16 @@ def test_cpu_reader_missing_data_element(tmp_path: Path):
 
 
 # ── GPU subject reader ───────────────────────────────────────────────
-def _host_reference(lh_path, rh_path, mask):
-    return concat_hemis_drop_medial(read_surface_bold(lh_path),
-                                    read_surface_bold(rh_path), mask)
+def _read_subject(session_paths, **kw):
+    """Every session of ``iter_subject_bold_gpu``, in input order."""
+    from arealmshbm.data_io.gifti_bold_gpu import iter_subject_bold_gpu
+    kw.setdefault("group_sessions", 2)
+    return [a for _, a in sorted(iter_subject_bold_gpu(session_paths, **kw),
+                                 key=lambda item: item[0])]
 
 
 def _synth_subject(tmp_path, n_lh, n_rh, T, n_sess, seed=0):
-    """Write ``n_sess`` (lh, rh) pairs and return (pairs, mask)."""
+    """Write ``n_sess`` (lh, rh) pairs with NaN / ±inf injected."""
     rng = np.random.default_rng(seed)
     pairs = []
     for s in range(n_sess):
@@ -382,7 +350,7 @@ def _synth_subject(tmp_path, n_lh, n_rh, T, n_sess, seed=0):
                 for _ in range(T)]
         rh_v = [rng.standard_normal(n_rh).astype(np.float32)
                 for _ in range(T)]
-        # Exercise the epilogue's cleaning branches.
+        # Non-finite values must come through untouched.
         lh_v[0][3] = np.nan
         rh_v[1][5] = np.inf
         rh_v[2][7] = -np.inf
@@ -391,56 +359,17 @@ def _synth_subject(tmp_path, n_lh, n_rh, T, n_sess, seed=0):
         lh.write_bytes(_make_gifti(n_lh, T, values=lh_v))
         rh.write_bytes(_make_gifti(n_rh, T, values=rh_v))
         pairs.append((lh, rh))
-    mask = np.zeros(n_lh + n_rh, dtype=bool)
-    mask[rng.choice(n_lh + n_rh, size=(n_lh + n_rh) // 8,
-                    replace=False)] = True
-    return pairs, mask
-
-
-@pytest.mark.skipif(not _GPU, reason=_GPU_WHY)
-@pytest.mark.parametrize("group_sessions", [None, 1, 2])
-def test_subject_gpu_matches_host(tmp_path: Path, group_sessions):
-    import cupy as cp
-    from arealmshbm.data_io.gifti_bold_gpu import read_subject_bold_gpu
-
-    pairs, mask = _synth_subject(tmp_path, 97, 89, 6, 4)
-    got = read_subject_bold_gpu(pairs, medial_mask_d=cp.asarray(mask),
-                                n_lh=97, n_rh=89,
-                                group_sessions=group_sessions)
-    assert len(got) == len(pairs)
-    for (lh, rh), g in zip(pairs, got):
-        assert _bit_equal(cp.asnumpy(g), _host_reference(lh, rh, mask))
-
-
-@pytest.mark.skipif(not _GPU, reason=_GPU_WHY)
-def test_subject_gpu_pipelined_order_and_values(tmp_path: Path):
-    import cupy as cp
-    from arealmshbm.data_io.gifti_bold_gpu import iter_subject_bold_gpu
-
-    pairs, mask = _synth_subject(tmp_path, 64, 64, 5, 5, seed=1)
-    seen = []
-    for idx, arr in iter_subject_bold_gpu(
-            pairs, medial_mask_d=cp.asarray(mask), n_lh=64, n_rh=64,
-            group_sessions=1):
-        seen.append(idx)
-        lh, rh = pairs[idx]
-        assert _bit_equal(cp.asnumpy(arr), _host_reference(lh, rh, mask))
-    assert seen == list(range(len(pairs)))
+    return pairs
 
 
 @pytest.mark.skipif(not _GPU, reason=_GPU_WHY)
 def test_subject_gpu_rejects_wrapped_b64(tmp_path: Path):
-    import cupy as cp
-    from arealmshbm.data_io.gifti_bold_gpu import read_subject_bold_gpu
-
     lh = tmp_path / "w_L.func.gii"
     rh = tmp_path / "w_R.func.gii"
     lh.write_bytes(_make_gifti(32, 3, wrap=True))
     rh.write_bytes(_make_gifti(32, 3))
     with pytest.raises(ValueError, match="outside the base64 alphabet"):
-        read_subject_bold_gpu([(lh, rh)],
-                              medial_mask_d=cp.zeros(64, dtype=cp.bool_),
-                              n_lh=32, n_rh=32)
+        _read_subject([(lh, rh)], n_lh=32, n_rh=32)
 
 
 def _with_fdict(gifti: bytes) -> bytes:
@@ -464,17 +393,12 @@ def test_subject_gpu_rejects_fdict(tmp_path: Path):
     bytes to nvCOMP as DEFLATE data. Refused by name instead -- the CPU
     reader refuses such a stream as well (isal has no dictionary to
     offer), so neither backend reads it."""
-    import cupy as cp
-    from arealmshbm.data_io.gifti_bold_gpu import read_subject_bold_gpu
-
     lh = tmp_path / "fd_L.func.gii"
     rh = tmp_path / "fd_R.func.gii"
     lh.write_bytes(_with_fdict(_make_gifti(32, 3)))
     rh.write_bytes(_make_gifti(32, 3))
     with pytest.raises(ValueError, match="FDICT"):
-        read_subject_bold_gpu([(lh, rh)],
-                              medial_mask_d=cp.zeros(64, dtype=cp.bool_),
-                              n_lh=32, n_rh=32)
+        _read_subject([(lh, rh)], n_lh=32, n_rh=32)
     with pytest.raises(Exception):
         read_surface_gifti(lh)
 
@@ -505,17 +429,12 @@ def test_subject_gpu_rejects_misplaced_b64_pad(tmp_path: Path, pos):
     floats of the right length* — silently. The CPU reader refuses all
     four positions (binascii padding / truncated stream).
     """
-    import cupy as cp
-    from arealmshbm.data_io.gifti_bold_gpu import read_subject_bold_gpu
-
     lh = tmp_path / f"eq{pos}_L.func.gii"
     rh = tmp_path / f"eq{pos}_R.func.gii"
     lh.write_bytes(_splice_eq(_make_gifti(64, 3), quad=2, pos=pos))
     rh.write_bytes(_make_gifti(64, 3))
     with pytest.raises(ValueError, match="base64"):
-        read_subject_bold_gpu([(lh, rh)],
-                              medial_mask_d=cp.zeros(128, dtype=cp.bool_),
-                              n_lh=64, n_rh=64)
+        _read_subject([(lh, rh)], n_lh=64, n_rh=64)
 
 
 @pytest.mark.skipif(not _GPU, reason=_GPU_WHY)
@@ -527,7 +446,6 @@ def test_subject_gpu_accepts_every_legal_tail_pad(tmp_path: Path):
     route bit for bit.
     """
     import cupy as cp
-    from arealmshbm.data_io.gifti_bold_gpu import read_subject_bold_gpu
 
     by_pad = {}
     for dim0 in range(1, 64):
@@ -541,27 +459,20 @@ def test_subject_gpu_accepts_every_legal_tail_pad(tmp_path: Path):
         rh = tmp_path / f"pad{n_pad}_R.func.gii"
         lh.write_bytes(_make_gifti(dim0, 2))
         rh.write_bytes(_make_gifti(dim0, 2))
-        mask = np.zeros(2 * dim0, dtype=bool)
-        got = read_subject_bold_gpu([(lh, rh)],
-                                    medial_mask_d=cp.asarray(mask),
-                                    n_lh=dim0, n_rh=dim0)
-        assert _bit_equal(cp.asnumpy(got[0]),
-                          _host_reference(lh, rh, mask)), n_pad
+        got = _read_subject([(lh, rh)], n_lh=dim0, n_rh=dim0)
+        h = cp.asnumpy(got[0])
+        assert _bit_equal(h[:, :dim0], read_surface_gifti(lh).T), n_pad
+        assert _bit_equal(h[:, dim0:], read_surface_gifti(rh).T), n_pad
 
 
 @pytest.mark.skipif(not _GPU, reason=_GPU_WHY)
 def test_subject_gpu_rejects_wrong_dim0(tmp_path: Path):
-    import cupy as cp
-    from arealmshbm.data_io.gifti_bold_gpu import read_subject_bold_gpu
-
     lh = tmp_path / "d_L.func.gii"
     rh = tmp_path / "d_R.func.gii"
     lh.write_bytes(_make_gifti(32, 3))
     rh.write_bytes(_make_gifti(32, 3))
     with pytest.raises(ValueError, match="Dim0"):
-        read_subject_bold_gpu([(lh, rh)],
-                              medial_mask_d=cp.zeros(80, dtype=cp.bool_),
-                              n_lh=48, n_rh=32)
+        _read_subject([(lh, rh)], n_lh=48, n_rh=32)
 
 
 def _mismatched_dim0_gifti(dim0_claimed: int, dim0_actual: int,
@@ -586,9 +497,6 @@ def test_subject_gpu_rejects_short_or_long_payload(tmp_path: Path,
     ('Dim0 disagrees with decoded byte count'); the GPU reader checks
     the same thing against nvCOMP's reported output sizes.
     """
-    import cupy as cp
-    from arealmshbm.data_io.gifti_bold_gpu import read_subject_bold_gpu
-
     lh = tmp_path / f"sz{claimed}_L.func.gii"
     rh = tmp_path / f"sz{claimed}_R.func.gii"
     lh.write_bytes(_mismatched_dim0_gifti(claimed, actual, 3))
@@ -596,15 +504,9 @@ def test_subject_gpu_rejects_short_or_long_payload(tmp_path: Path,
     # Warm the pool so a second call would see recycled, dirty blocks —
     # the exact condition under which the missing check returned
     # garbage instead of raising.
-    read_subject_bold_gpu([(rh, rh)],
-                          medial_mask_d=cp.zeros(2 * claimed,
-                                                 dtype=cp.bool_),
-                          n_lh=claimed, n_rh=claimed)
+    _read_subject([(rh, rh)], n_lh=claimed, n_rh=claimed)
     with pytest.raises(ValueError, match="Dim0|decompress"):
-        read_subject_bold_gpu([(lh, rh)],
-                              medial_mask_d=cp.zeros(2 * claimed,
-                                                     dtype=cp.bool_),
-                              n_lh=claimed, n_rh=claimed)
+        _read_subject([(lh, rh)], n_lh=claimed, n_rh=claimed)
 
 
 @pytest.mark.skipif(not _GPU, reason=_GPU_WHY)
@@ -612,47 +514,43 @@ def test_subject_gpu_handles_more_than_4096_tags(tmp_path: Path):
     """No fixed timepoint ceiling.
 
     The tag scan budgets 4096 slots per file and a GIFTI emits three
-    tags per ``<DataArray>``, so T > 1365 overflowed the slot array and
-    raised. It now retries once at the exact count the kernel's
-    counter reports.
+    tags per ``<DataArray>``, so T > 1365 overflows the first estimate;
+    the reader retries once at the exact count the kernel's counter
+    reports.
     """
     import cupy as cp
-    from arealmshbm.data_io.gifti_bold_gpu import read_subject_bold_gpu
 
     T = 1400          # 4200 tags/file, above the 4096 first estimate
     lh = tmp_path / "big_L.func.gii"
     rh = tmp_path / "big_R.func.gii"
     lh.write_bytes(_make_gifti(4, T))
     rh.write_bytes(_make_gifti(4, T))
-    mask = np.zeros(8, dtype=bool)
-    got = read_subject_bold_gpu([(lh, rh)], medial_mask_d=cp.asarray(mask),
-                                n_lh=4, n_rh=4)
-    assert _bit_equal(cp.asnumpy(got[0]), _host_reference(lh, rh, mask))
+    got = _read_subject([(lh, rh)], n_lh=4, n_rh=4)
+    h = cp.asnumpy(got[0])
+    assert _bit_equal(h[:, :4], read_surface_gifti(lh).T)
+    assert _bit_equal(h[:, 4:], read_surface_gifti(rh).T)
 
 
 @pytest.mark.skipif(not _GPU, reason=_GPU_WHY)
 def test_subject_gpu_iter_device_memory_is_bounded(tmp_path: Path):
     """Per-group transients must not accumulate over the subject.
 
-    The first revision retained every group's base64 buffer for the
-    whole generator, so the pool high-water grew linearly with the
-    session count — the opposite of what the pipelined mode is for.
+    Retaining every group's base64 buffer for the whole generator would
+    make the pool high-water grow linearly with the session count — the
+    opposite of what the pipelined mode is for.
     """
     import cupy as cp
     from arealmshbm.data_io.gifti_bold_gpu import iter_subject_bold_gpu
 
-    pairs, mask = _synth_subject(tmp_path, 4096, 4096, 6, 8, seed=3)
-    mask_d = cp.asarray(mask)
+    pairs = _synth_subject(tmp_path, 4096, 4096, 6, 8, seed=3)
     pool = cp.get_default_memory_pool()
     # One warm pass so the pool is already sized for the working set.
-    for _i, a in iter_subject_bold_gpu(pairs, medial_mask_d=mask_d,
-                                       n_lh=4096, n_rh=4096,
+    for _i, a in iter_subject_bold_gpu(pairs, n_lh=4096, n_rh=4096,
                                        group_sessions=1):
         del a
     pool.free_all_blocks()
     highs = []
-    for _i, a in iter_subject_bold_gpu(pairs, medial_mask_d=mask_d,
-                                       n_lh=4096, n_rh=4096,
+    for _i, a in iter_subject_bold_gpu(pairs, n_lh=4096, n_rh=4096,
                                        group_sessions=1):
         del a
         highs.append(pool.used_bytes())
@@ -661,43 +559,21 @@ def test_subject_gpu_iter_device_memory_is_bounded(tmp_path: Path):
 
 
 @pytest.mark.skipif(not _GPU, reason=_GPU_WHY)
-def test_subject_gpu_rejects_host_mask(tmp_path: Path):
-    from arealmshbm.data_io.gifti_bold_gpu import read_subject_bold_gpu
-
-    lh = tmp_path / "m_L.func.gii"
-    rh = tmp_path / "m_R.func.gii"
-    lh.write_bytes(_make_gifti(16, 2))
-    rh.write_bytes(_make_gifti(16, 2))
-    with pytest.raises(TypeError, match="cupy.ndarray"):
-        read_subject_bold_gpu([(lh, rh)],
-                              medial_mask_d=np.zeros(32, dtype=bool),
-                              n_lh=16, n_rh=16)
-
-
-# ─────────────────────────────────────────────────────────────────────
-# ``raw_sessions=True`` — the pre-epilogue (T, lh|rh) session buffer
-# that step 1's fused subject leaf consumes.
-# ─────────────────────────────────────────────────────────────────────
-@pytest.mark.skipif(not _GPU, reason=_GPU_WHY)
 @pytest.mark.parametrize("group_sessions", [None, 1, 2, 3])
-def test_subject_gpu_raw_sessions_match_cpu_reader(tmp_path: Path,
-                                                   group_sessions):
+def test_subject_gpu_matches_cpu_reader(tmp_path: Path, group_sessions):
     """``buf[:, :n_lh] == read_surface_gifti(lh).T`` bit for bit.
 
-    No medial drop, no transpose, no NaN cleaning — the synthetic
-    subject injects NaN/±inf and every one of them must survive, so
-    the comparison is on the ``uint32`` view.
+    The synthetic subject injects NaN/±inf and every one of them must
+    survive, so the comparison is on the ``uint32`` view.
     """
     import cupy as cp
-    from arealmshbm.data_io.gifti_bold_gpu import read_subject_bold_gpu
 
     n_lh, n_rh, T = 97, 89, 6
-    pairs, _mask = _synth_subject(tmp_path, n_lh, n_rh, T, 6, seed=11)
-    got = read_subject_bold_gpu(pairs, n_lh=n_lh, n_rh=n_rh,
-                                group_sessions=group_sessions,
-                                raw_sessions=True)
+    pairs = _synth_subject(tmp_path, n_lh, n_rh, T, 6, seed=11)
+    got = _read_subject(pairs, n_lh=n_lh, n_rh=n_rh,
+                        group_sessions=group_sessions)
     assert len(got) == len(pairs)
-    for (lh, rh), g in zip(pairs, got):
+    for (lh, rh), g in zip(pairs, got, strict=True):
         assert g.shape == (T, n_lh + n_rh)
         assert g.dtype == cp.float32
         assert g.flags["C_CONTIGUOUS"]
@@ -707,16 +583,15 @@ def test_subject_gpu_raw_sessions_match_cpu_reader(tmp_path: Path,
 
 
 @pytest.mark.skipif(not _GPU, reason=_GPU_WHY)
-def test_subject_gpu_raw_sessions_pipelined(tmp_path: Path):
+def test_subject_gpu_pipelined_order_and_values(tmp_path: Path):
     import cupy as cp
     from arealmshbm.data_io.gifti_bold_gpu import iter_subject_bold_gpu
 
     n_lh, n_rh, T = 64, 48, 5
-    pairs, _mask = _synth_subject(tmp_path, n_lh, n_rh, T, 5, seed=12)
+    pairs = _synth_subject(tmp_path, n_lh, n_rh, T, 5, seed=12)
     seen = []
     for idx, arr in iter_subject_bold_gpu(pairs, n_lh=n_lh, n_rh=n_rh,
-                                          group_sessions=2,
-                                          raw_sessions=True):
+                                          group_sessions=2):
         seen.append(idx)
         lh, rh = pairs[idx]
         h = cp.asnumpy(arr)
@@ -724,19 +599,6 @@ def test_subject_gpu_raw_sessions_pipelined(tmp_path: Path):
         assert _bit_equal(h[:, :n_lh], read_surface_gifti(lh).T)
         assert _bit_equal(h[:, n_lh:], read_surface_gifti(rh).T)
     assert seen == list(range(len(pairs)))
-
-
-@pytest.mark.skipif(not _GPU, reason=_GPU_WHY)
-def test_subject_gpu_epilogue_path_still_needs_a_device_mask(tmp_path: Path):
-    """``medial_mask_d`` only became optional for ``raw_sessions``."""
-    from arealmshbm.data_io.gifti_bold_gpu import read_subject_bold_gpu
-
-    lh = tmp_path / "n_L.func.gii"
-    rh = tmp_path / "n_R.func.gii"
-    lh.write_bytes(_make_gifti(16, 2))
-    rh.write_bytes(_make_gifti(16, 2))
-    with pytest.raises(TypeError, match="cupy.ndarray"):
-        read_subject_bold_gpu([(lh, rh)], n_lh=16, n_rh=16)
 
 
 @pytest.mark.skipif(not _GPU, reason=_GPU_WHY)
@@ -749,22 +611,22 @@ def test_subject_gpu_abandoned_generator_is_safe(tmp_path: Path):
     """
     import cupy as cp
     from arealmshbm.data_io.gifti_bold_gpu import (
-        _PENDING_KEEPS, iter_subject_bold_gpu, read_subject_bold_gpu,
+        _PENDING_KEEPS, iter_subject_bold_gpu,
     )
 
-    pairs, mask = _synth_subject(tmp_path, 512, 512, 4, 6, seed=13)
-    mask_d = cp.asarray(mask)
-    gen = iter_subject_bold_gpu(pairs, medial_mask_d=mask_d,
-                                n_lh=512, n_rh=512, group_sessions=1)
+    pairs = _synth_subject(tmp_path, 512, 512, 4, 6, seed=13)
+    gen = iter_subject_bold_gpu(pairs, n_lh=512, n_rh=512,
+                                group_sessions=1)
     idx, arr = next(gen)
     assert idx == 0
     gen.close()
     assert _PENDING_KEEPS, "abandoned generator parked nothing"
-    got = read_subject_bold_gpu(pairs, medial_mask_d=mask_d,
-                                n_lh=512, n_rh=512)
+    got = _read_subject(pairs, n_lh=512, n_rh=512)
     assert not _PENDING_KEEPS, "the next ingest did not drain the keeps"
-    for (lh, rh), g in zip(pairs, got):
-        assert _bit_equal(cp.asnumpy(g), _host_reference(lh, rh, mask))
+    for (lh, rh), g in zip(pairs, got, strict=True):
+        h = cp.asnumpy(g)
+        assert _bit_equal(h[:, :512], read_surface_gifti(lh).T)
+        assert _bit_equal(h[:, 512:], read_surface_gifti(rh).T)
 
 
 @pytest.mark.skipif(not _GPU, reason=_GPU_WHY)
@@ -777,7 +639,7 @@ def test_tag_scan_emits_int64_positions():
     import cupy as cp
     from arealmshbm.data_io._gifti_kernels_gpu import get_gifti_gpu_kernels
 
-    find_tags, _b64, _epi, _table = get_gifti_gpu_kernels()
+    find_tags, _b64, _table = get_gifti_gpu_kernels()
 
     buf = bytearray(b"." * (1 << 20))
     want = []
@@ -869,12 +731,11 @@ def test_staging_oom_names_the_subject_not_the_gpu(tmp_path: Path,
     import cupy as cp
     from arealmshbm.data_io import gifti_bold_gpu as gbg
 
-    pairs, mask = _synth_subject(tmp_path, 64, 64, 4, 2, seed=5)
+    pairs = _synth_subject(tmp_path, 64, 64, 4, 2, seed=5)
 
     def _oom(nbytes):
         raise cp.cuda.runtime.CUDARuntimeError(2)   # cudaErrorMemoryAllocation
 
     monkeypatch.setattr(gbg, "_acquire_staging", _oom)
     with pytest.raises(RuntimeError, match="host staging"):
-        gbg.read_subject_bold_gpu(pairs, medial_mask_d=cp.asarray(mask),
-                                  n_lh=64, n_rh=64)
+        _read_subject(pairs, n_lh=64, n_rh=64)

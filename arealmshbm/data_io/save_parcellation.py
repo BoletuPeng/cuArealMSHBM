@@ -69,11 +69,8 @@ def _fmt_num(x: float | int | str) -> str:
     significant digits (``0.5`` -> ``"0.5"``); strings pass through
     unchanged (callers sometimes hand in pre-stringified beta).
 
-    The earlier ``f"{int(w)}"`` form silently truncated non-integer
-    values to 0 — ``int(0.5)`` is ``0``, so a ``w=0.5`` config would have
-    produced a file named ``..._w0_...`` colliding with ``w=0``. ``:g``
-    matches MATLAB's ``num2str`` for the integer + small-float regime
-    these knobs use.
+    ``:g`` matches MATLAB's ``num2str`` for the integer + small-float
+    regime these knobs use (``int(w)`` would truncate ``0.5`` to ``0``).
     """
     if isinstance(x, str):
         return x
@@ -123,10 +120,10 @@ def save_parcellation(s_lambda: np.ndarray,
                write these directly. cMSHBM must use it (its labels
                undergo :func:`remove_isolated_surface_components`
                post-processing AFTER argmax), and so must the step-3
-               ``gpu_sparse`` backend (its ``s_lambda`` aliases a
-               reusable pinned host buffer). Every other variant /
-               backend also passes it, to skip a redundant second
-               (N, L) argmax over the same ``s_lambda``.
+               ``gpu`` backend (its ``s_lambda`` aliases a reusable
+               pinned host buffer). Every other variant / backend also
+               passes it, to skip a redundant second (N, L) argmax over
+               the same ``s_lambda``.
 
     Returns
     -------

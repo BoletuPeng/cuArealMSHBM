@@ -5,7 +5,7 @@ external MATLAB one, and the one place a scipy-sparse ``theta`` (what
 the ``gpu`` backend exports) becomes the dense block MATLAB CBIG
 can read. The bars:
 
-* the file reproduces the pre-2026-09 ``_save_params`` byte semantics
+* the file reproduces the inline saver oracle's byte semantics
   (``mu`` transposed, float arrays widened to fp64, scalars / lists
   passed through, container compressed);
 * a sparse ``theta`` in gives the same bytes out as the equal dense one.
@@ -122,11 +122,12 @@ def test_parent_directory_is_created(tmp_path: Path) -> None:
     assert p.exists()
 
 
-def test_dense_branch_matches_the_legacy_saver(tmp_path: Path) -> None:
-    """Byte-for-byte against the pre-``_save.py`` inline implementation."""
+def test_dense_branch_matches_the_reference_saver(tmp_path: Path) -> None:
+    """Byte-for-byte against ``scipy.io.savemat`` of the transposed-mu
+    fp64 dict."""
     P = _params(seed=11)
 
-    def _legacy(Params, path):
+    def _reference(Params, path):
         path.parent.mkdir(parents=True, exist_ok=True)
         out = {}
         for k, v in Params.items():
@@ -144,9 +145,9 @@ def test_dense_branch_matches_the_legacy_saver(tmp_path: Path) -> None:
                 out[k] = v
         sio.savemat(path, {"Params": out}, do_compression=True, format="5")
 
-    a, b = tmp_path / "new.mat", tmp_path / "old.mat"
+    a, b = tmp_path / "saved.mat", tmp_path / "reference.mat"
     save_params_final(P, a)
-    _legacy(P, b)
+    _reference(P, b)
 
     # The docstring's claim, actually checked: identical on disk, not just
     # equal once loaded (a value comparison survives a do_compression flip,

@@ -67,9 +67,10 @@ def _find_library() -> str:
     """
     try:
         import nvidia.nvcomp as _nvcomp
-    except ImportError as e:            # pragma: no cover — nvcomp is in the env
+    except ImportError as e:
         raise ImportError(
-            "the GPU BOLD reader requires nvidia-nvcomp-cu12. "
+            "backend_step1='gpu' requires nvidia-nvcomp-cu12: the BOLD "
+            "ingest is nvCOMP-only, there is no CPU fallback. "
             "Install: pip install nvidia-nvcomp-cu12"
         ) from e
     root = os.path.dirname(os.path.dirname(os.path.abspath(_nvcomp.__file__)))
@@ -97,7 +98,21 @@ class DeflateBatch:
             # holds the library's own dependencies.
             self._dll_dir = os.add_dll_directory(dirname)
         self.path = path
-        lib = ctypes.CDLL(path)
+        try:
+            lib = ctypes.CDLL(path)
+            lib.nvcompBatchedDeflateDecompressGetRequiredAlignments
+            lib.nvcompBatchedDeflateDecompressGetTempSizeAsync
+            lib.nvcompBatchedDeflateDecompressAsync
+        except (OSError, AttributeError) as e:
+            # Installed but not loadable -- a wheel for another CUDA
+            # runtime, a partial install, a renamed export. The same
+            # hard error as a missing package, with the same hint.
+            raise ImportError(
+                f"nvCOMP shared library {path} could not be loaded ({e}); "
+                f"backend_step1='gpu' needs a working nvidia-nvcomp-cu12 "
+                f"for this CUDA runtime. Reinstall: pip install "
+                f"--force-reinstall nvidia-nvcomp-cu12"
+            ) from e
         c_sz, c_vp = ctypes.c_size_t, ctypes.c_void_p
 
         lib.nvcompBatchedDeflateDecompressGetRequiredAlignments.argtypes = [
@@ -212,26 +227,6 @@ class DeflateBatch:
     @staticmethod
     def status_name(code: int) -> str:
         return _STATUS_NAMES.get(int(code), f"nvcompStatus_t={int(code)}")
-
-
-def nvcomp_available() -> bool:
-    """Can the batched binding actually be built? Cached, never raises.
-
-    Locating the library is not enough: ``ctypes.CDLL`` can still fail
-    with ``OSError`` and symbol binding with ``AttributeError``, neither
-    of which is an ``ImportError`` the callers catch. So the probe is
-    the real constructor (whose result :func:`get_deflate_batch` caches,
-    making this free for the caller that then uses it).
-    """
-    hit = _CACHE.get("avail")
-    if hit is None:
-        try:
-            get_deflate_batch()
-            hit = True
-        except Exception:
-            hit = False
-        _CACHE["avail"] = hit
-    return hit
 
 
 def get_deflate_batch() -> DeflateBatch:

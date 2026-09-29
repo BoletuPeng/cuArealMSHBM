@@ -4,14 +4,18 @@
 Asserts the GPU cupyx fp32 SpMM matches the CPU numpy fp64 SpMV
 reference on the real fsa6 gather (built by the production
 ``prepare_smoothing_gather`` at sigma=2.55) to max-abs-diff < 1e-3.
-A silent regression in the gather-CSR build or the SpMM+scale pass
-fires on the next test run instead of waiting for an end-to-end
-pipeline run. The fp32 design choice is justified by this drift
+A silent regression in the fp32 device copy of the gather
+(``prepare_smoothing_gather_gpu``) or the SpMM+scale pass fires on the
+next test run instead of waiting for an end-to-end pipeline run. Both
+arms consume the same CPU-built gather, so the CPU gather build itself
+is not checked here. The fp32 design choice is justified by this drift
 bound — downstream find_minima + watershed compare values without
 accumulation, so the GPU/CPU drift is well inside the value-comparison
 noise floor.
 
-Skipped automatically if cupy / a CUDA device is not available.
+Skipped automatically if cupy is not installed or ``$CBIG_CODE_DIR``
+does not point at a CBIG checkout holding the fsaverage6 midthickness
+atlas.
 
 Run::
 
@@ -34,8 +38,8 @@ _HAS_CUPY = importlib.util.find_spec("cupy") is not None
 
 # Tests that read the CBIG midthickness atlas point at the env-configured
 # CBIG checkout; if ``CBIG_CODE_DIR`` is unset, the atlas-dependent tests
-# are skipped (the GPU vs. CPU equivalence tests don't depend on this
-# atlas, they consume the precomputed step0_inputs cache instead).
+# are skipped. Both tests in this file are atlas-dependent: the gather
+# they compare is built from the atlas midthickness.
 _CBIG_ENV = os.environ.get("CBIG_CODE_DIR")
 _CBIG = Path(_CBIG_ENV) if _CBIG_ENV else None
 _ATLAS = (_CBIG / "utilities" / "matlab" / "speedup_gradients" /

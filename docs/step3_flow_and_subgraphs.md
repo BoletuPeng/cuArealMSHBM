@@ -13,6 +13,7 @@ profile pattern, leaf module shape, backend dispatch), see
 Step3Pipeline.run(cfg)                                         [arealmshbm/step3_pipeline]
 │
 ├── load_inputs()
+│   │   (cpu below; gpu → load_step3_sparse_inputs in step3_pipeline/sparse_inputs — see § gpu)
 │   ├── load_group_prior(Params_Final.mat)                     data_io/load_group_prior
 │   ├── load_spatial_mask(spatial_mask_<mesh>.mat)             data_io/load_spatial_mask
 │   ├── load_avg_mesh(lh/rh, inflated)                         data_io/load_avg_mesh
@@ -24,9 +25,8 @@ Step3Pipeline.run(cfg)                                         [arealmshbm/step3
 │
 ├── build_session(inputs)
 │   └── VmfClusteringSession(...)                              vmf_clustering
-│       (cpu | gpu_elambda | gpu_full backend dispatch;
-│        gpu_sparse → VmfClusteringSessionSparseCUDA.run_intra_em,
-│        which owns the whole intra_em loop — see § gpu_sparse)
+│       (cpu; gpu → VmfClusteringSessionSparseCUDA.run_intra_em,
+│        which owns the whole intra_em loop — see § gpu)
 │
 ├── intra_em loop (~3 iters)
 │   ├── reset Params.kappa, Params.s_t_nu                      inline (small)
@@ -81,11 +81,13 @@ Iteration counts on sub-001 (6 sessions, fsaverage6, 300 ROIs):
 arealmshbm/
 ├── step3_pipeline/                         # top-level Python entry
 │   ├── config.py                           Step3Config dataclass
-│   ├── pipeline.py                         Step3Pipeline lifecycle
-│   └── profile.py                          per-stage wall-time report
+│   ├── pipeline.py                         Step3Pipeline lifecycle + backend dispatch
+│   ├── profile.py                          per-stage wall-time report
+│   └── sparse_inputs.py                    gpu loader: θ → CSR, candidate layout, packed BOLD
 │
 ├── data_io/                                # disk I/O leaves
-│   ├── fetch_data.py                       BOLD profile + diffusion gradient
+│   ├── fetch_data.py                       BOLD profile + diffusion gradient (cpu)
+│   ├── mat5_stream.py                      streaming MAT v7 reader (gpu loader)
 │   ├── load_group_prior.py                 Params_Final.mat
 │   ├── load_spatial_mask.py                spatial_mask_<mesh>.mat
 │   ├── load_avg_mesh.py                    fsaverage* mesh (inflated/sphere)
@@ -105,10 +107,10 @@ arealmshbm/
 │
 ├── check_connectedness/                    # connectedness BFS + distance
 │   ├── _kernels.py                         numba BFS + cdist
-│   └── component_distance.py               public functions
+│   ├── component_distance.py               public functions
+│   └── connectedness_gpu.py                ConnectednessGPU (gpu)
 │
 ├── spatial_priors/                         # xyz + connect priors
-│   ├── _cdln.py                            Cdln d=3 closed form
 │   ├── _kernels.py                         numba kernels
 │   ├── spatial_xyz.py                      XyzSession
 │   └── spatial_connect.py                  ConnectSession
@@ -116,7 +118,9 @@ arealmshbm/
 ├── m_step/                                 # M-step
 │   ├── _invad.py                           inverse-A_d Bessel root solver
 │   ├── _kernels.py                         numba kernels
-│   └── m_step.py                           MStepSession
+│   ├── _xdot_kernel.py                     x_dot_sl_bits CUDA source (shared with step 2)
+│   ├── m_step.py                           MStepSession
+│   └── m_step_gpu.py                       MStepGPU + row stats (gpu)
 │
 ├── em_stop_criterion/                      # EM stop block
 │   ├── _cdln.py                            Cdln general d via Debye
@@ -124,58 +128,67 @@ arealmshbm/
 │   └── em_stop_criterion.py                EMStopSession
 │
 └── vmf_clustering/                         # the EM body super-call
-    ├── _kernels.py                         numba kernels (CPU)
-    ├── _kernels_gpu.py                     CuPy kernels (GPU)
-    ├── e_step_lambda.py                    ELambdaSession (CPU)
-    ├── e_step_lambda_gpu.py                ELambdaSessionCUDA
-    ├── vmf_clustering.py                   VmfClusteringSession (CPU)
-    └── vmf_clustering_gpu.py               VmfClusteringSessionCUDA
+    ├── _kernels.py                         numba kernels (cpu)
+    ├── _kernels_gpu.py                     CuPy candidate-set kernels (gpu)
+    ├── _session_common.py                  variant-requirement validator (both)
+    ├── e_step_lambda.py                    ELambdaSession (cpu)
+    ├── sparse_layout.py                    CandidateLayout (gpu)
+    ├── vmf_clustering.py                   VmfClusteringSession (cpu)
+    └── vmf_clustering_gpu.py               VmfClusteringSessionSparseCUDA (gpu)
 ```
 
-Backend selection happens at `VmfClusteringSession(... backend=...)`.
-`backend='gpu_full'` redirects construction to `VmfClusteringSessionCUDA`
-via `__new__`, keeping the same external API.
+Backend selection happens in `Step3Pipeline`: `cpu` builds
+`VmfClusteringSession` from `fetch_data` inputs; `gpu` loads
+`Step3SparseInputs` and builds `VmfClusteringSessionSparseCUDA`.
 
-## `gpu_sparse` (2026-09-03)
+## `gpu` — candidate-set backend
 
-Candidate-set backend: every (N, L) buffer is replaced by its values on
+Every (N, L) buffer is stored as its values on
 `P = nnz(θ)` (251 k cells at fsaverage6 × L=300, ~1 % of N·L), the BOLD
 stays bit-packed on device (`X·v` becomes a popcount-style bit-sum,
 no 2.3 GB fp32 expansion, no cuBLAS), `check_connectedness` runs on the
 GPU, and the whole `intra_em` outer loop is device-resident. Design +
 per-kernel contracts: [`step3_sparse_design.md`](step3_sparse_design.md).
 Loader: `step3_pipeline/sparse_inputs.py` (MAT v7 parsed with
-`data_io/mat5_stream.py`, isal optional; θ straight to CSR, no dense
+`data_io/mat5_stream.py`, isal_zlib; θ straight to CSR, no dense
 mask). Session:
-`vmf_clustering/vmf_clustering_gpu_sparse.py`; kernels in
-`vmf_clustering/_kernels_gpu_sparse.py`, `m_step/m_step_gpu_sparse.py`,
+`vmf_clustering/vmf_clustering_gpu.py`; kernels in
+`vmf_clustering/_kernels_gpu.py`, `m_step/m_step_gpu.py`,
 `check_connectedness/connectedness_gpu.py`.
 
-sub-001 (fsaverage6, T=6, L=300), RTX 5090 Laptop, warm process:
+sub-001 (fsaverage6, T=6, L=300), RTX 5090 Laptop, warm process,
+2026-09-03. The middle column is the dense CuPy EM (`gpu_full`)
+measured alongside:
 
-| | `cpu` | `gpu_full` | `gpu_sparse` |
+| | `cpu` | dense GPU EM | `gpu` |
 |---|---:|---:|---:|
 | load_inputs + session_init | 2.09 s | 0.62 s | 0.19 s |
 | EM (3 intra rounds, 10 em_iters, 115 λ-iters) | 23.6 s | 3.07 s | **0.10 s** |
 | per-subject total | 25.7 s | 3.70 s | **0.30 s** |
 
-Per-stage EM wall (sub-001, `gpu_sparse`): m_step 0.028 s ·
+Per-stage EM wall (sub-001, `gpu`, 2026-09-03): m_step 0.028 s ·
 e_step_lambda_loop 0.030 s (115 λ-iters at 0.15 ms + 10 × 1 ms `acc`) ·
 check_connectedness 0.020 s (105 × 0.16 ms) · spatial_connect 0.006 s ·
 spatial_xyz 0.004 s · em_stop 0.001 s. Reference-cohort subjects 1–3 (Mode B
-prior): 0.45–0.61 s/sub vs 2.9–3.1 s on `gpu_full`; the 3-subject stage
-pipeline ran in 1.8 s vs 9.8 s.
+prior): 0.45–0.61 s/sub vs 2.9–3.1 s on the dense GPU EM; the
+3-subject stage pipeline ran in 1.8 s vs 9.8 s.
 
 Numerics: V_lambda is bit-identical to the CPU kernel, the E-step
 softmax agrees to ≤ 1e-15, EM-stop / intra costs agree to 16 digits on
-identical inputs; the bit-sum `acc` / `X·s_lambda` differ from the fp32
-sgemms by ~1e-4 relative on small entries (they are *closer* to an fp64
-truth than the sgemms). Labels: gpu_sparse↔cpu 3 / 35 / 1334 / 122
-vertices on sub-001 / YS 1 / 2 / 3, vs gpu_full↔cpu 6 / 51 / 84 / 140 —
+identical inputs; the bit-sum `acc` / `X·s_lambda` differ from the
+dense GPU EM's fp32 sgemms by ~1e-4 relative on small entries (they are
+*closer* to an fp64 truth than the sgemms). Labels: gpu↔cpu 3 / 35 /
+1334 / 122 vertices on sub-001 / YS 1 / 2 / 3, vs dense-GPU↔cpu 6 / 51 /
+84 / 140 —
 the YS-2 outlier is an `intra_em` convergence-ratio flip at the 1e-4
 threshold (2.5e-4 vs 5.2e-5 → one extra outer round). Run-to-run
-bit-reproducible (no float atomics). Not supported: cMSHBM
-(`remove_isolated` pre-predicate not ported), D > 2048.
+bit-reproducible (no float atomics). All three variants (cMSHBM's
+`remove_isolated` pre-predicate runs on device inside
+`ConnectednessGPU.step`). `gpu` needs D ≤ 2048 (`ceil(D/8) ≤ 256`); the
+driver accepts only seed_mesh fsaverage3 and rejects any other seed mesh
+by name — select `backend_step3='cpu'` for it — and the per-step API
+rejects D > 2048 when it reads the packed BOLD. Every backend requires
+w > 0 (`w·log θ` is NaN outside supp(θ) at w = 0).
 
 ## Wall
 
@@ -183,12 +196,15 @@ Mode-B end-to-end on the YS cohort (**40 subjects × 6 sessions ×
 fsaverage6 × L=300, gMSHBM**). RTX 5090 Laptop, 24 GB. 2026-05-20.
 Source: internal 40-subject × 6-session cohort run; raw timing log
 archived internally.
+Every GPU number in this section (through § Cohort scaling) is the
+dense CuPy EM (`gpu_full`) of 2026-05-20; current `gpu` walls are in
+§ `gpu`.
 
-End-to-end wall on the production GPU path: step 0 — 227.41 s ·
+End-to-end wall on the GPU path: step 0 — 227.41 s ·
 step 1 — 223.85 s · step 2 — 373.94 s · step 3 — **129.35 s** ·
 **total 954.84 s (15.91 min)**. Step 3 is 14 % of the end-to-end
 total — per-subject independent, 40 subjects run sequentially through
-the driver at ~3.23 s/sub on `gpu_full`.
+the driver at ~3.23 s/sub.
 
 ### Per-subject wall (3 representative subjects, gMSHBM)
 
@@ -241,28 +257,26 @@ per-subject wall: 40 × 23.47 ≈ **939 s (~15.6 min) if step 3 ran CPU**.
 
 The per-subject pipeline runs three phases sequentially — LOAD
 (disk + setup + H2D mirrors), EM (intra_em loop), SAVE (.mat write).
-On `gpu_full` the EM body (~2.4 s) gates the per-subject wall; LOAD
-(~0.9 s) and SAVE (~0.05 s) are off-GPU work that the wall would
-otherwise serialize behind EM. The driver pipelines by phase across
+On `gpu`, LOAD (load_inputs + session_init ≈ 0.19 s on sub-001) is the
+same order as EM (~0.10 s) or larger, and SAVE is off-GPU work, so a
+serial loop would pay their sum. The driver pipelines by phase across
 subjects: one stage thread per phase, with cupy streams on LOAD and
 EM (cross-stream event sync on the LOAD→EM device-buffer handoff),
 so subject K+1's LOAD overlaps subject K's EM and subject K-1's SAVE
-overlaps both. On `gpu_sparse` stage LOAD additionally reads the
-cohort constants (group prior, spatial masks, candidate layout) once
-before the subject loop and shares them read-only with every subject,
-cutting ~79 ms off each subject's LOAD (163 → 84 ms warm on sub-001).
+overlaps both. Stage LOAD reads the cohort constants (group prior,
+spatial masks, candidate layout) once before the subject loop and
+shares them read-only with every subject (`Step3SparseCohort`),
+cutting ~79 ms off each subject's `load_step3_sparse_inputs`
+(163 → 84 ms warm on sub-001).
 
 Steady-state per-subject wall becomes `max(t_LOAD, t_EM, t_SAVE)`
-instead of the sum. On a 3-subject Mode A smoke
-(sub-001…sub-003, gMSHBM, gpu_full) the stage-pipelined driver
-delivered **2.86 s/sub** (8.57 s for K=3) against the serial baseline
-of ~3.33 s/sub — a 14 % step-3 reduction. The relative win grows with
-K because the LOAD/SAVE → EM overlap stabilises after the first
-subject's pipeline-fill cost.
+instead of the sum. Reference-cohort subjects 1–3 on `gpu` (2026-09-03): the
+3-subject stage pipeline ran in 1.8 s against 0.45–0.61 s/sub serial
+(§ `gpu`). On the dense GPU EM (2026-05, 3-subject Mode A smoke,
+gMSHBM) it delivered 2.86 s/sub against a 3.33 s/sub serial baseline.
 
-Memory budget: with queues capped at 2 in-flight, ~3 subjects can be
-on GPU at once (peak ~9.5 GB on the YS profile reference) — well
-within the 24 GB device budget. CPU backend and `K=1` runs stay on
+Memory budget: queues are capped at 2 in-flight, so ~3 subjects can
+be on GPU at once. CPU backend and `K=1` runs stay on
 the serial loop (no overlap to amortise). See
 [`arealmshbm/pipeline/_step3_stage_pipeline.py`](../arealmshbm/pipeline/_step3_stage_pipeline.py).
 

@@ -11,7 +11,7 @@ every step block required by the mode is required, and unknown keys
 are rejected. There is no default-fallback path.
 
 Covered:
-  - v1 schema_version rejection with migration hint
+  - schema_version must be '2'
   - Mode-aware block presence (Mode A: step0/1/3 required, step2 forbidden;
     Mode B: all four required)
   - Missing required top-level fields → raises with field name
@@ -23,13 +23,16 @@ Covered:
   - Unknown-key rejection at top-level + each step{N} block
   - Strict bool/int/float type guards
   - cMSHBM × modeB_train_prior → NotImplementedError
+  - cMSHBM × backend_step3=gpu accepted
   - Per-step validator range / positivity checks
   - Non-default round-trip across all four step blocks
   - emb_output_format / bold_cache_mode enum rejection at parse time
+  - backend_step{0..3} enum rejection
 """
 from __future__ import annotations
 
 import json
+import math
 import subprocess
 import sys
 from pathlib import Path
@@ -168,20 +171,6 @@ def _write_config(tmp_path: Path, body: dict) -> Path:
 # ─────────────────────────────────────────────────────────────────────
 # Schema-version handling
 # ─────────────────────────────────────────────────────────────────────
-def test_v1_rejected_with_migration_hint(tmp_path: Path) -> None:
-    body = _full_v2_modeB()
-    body["schema_version"] = "1"
-    p = _write_config(tmp_path, body)
-    with pytest.raises(ValueError) as excinfo:
-        read_pipeline_config(p)
-    msg = str(excinfo.value)
-    assert "schema_version '1'" in msg
-    assert "step0" in msg and "step3" in msg
-    assert "sample_modeB" in msg
-    assert "sample_modeA_single" in msg
-    assert "no default fallback" in msg
-
-
 def test_unknown_schema_version_rejected(tmp_path: Path) -> None:
     body = _full_v2_modeB()
     body["schema_version"] = "99"
@@ -284,25 +273,12 @@ def test_missing_top_level_beta_scalar_rejected(tmp_path: Path) -> None:
 
 
 def test_missing_step0_enable_tf32_rejected(tmp_path: Path) -> None:
-    """enable_tf32 now lives inside step0 block, not at top level.
-    Omitting it raises the nested-key error."""
+    """``step0.enable_tf32`` is required; omitting it raises the
+    nested-key error."""
     body = _full_v2_modeB()
     del body["step0"]["enable_tf32"]
     p = _write_config(tmp_path, body)
     with pytest.raises(ValueError, match=r"missing required key 'step0\.enable_tf32'"):
-        read_pipeline_config(p)
-
-
-def test_step2_enable_tf32_is_an_unknown_key(tmp_path: Path) -> None:
-    """Step 2 lost its TF32 toggle with the dense CuPy port (its GPU
-    backend makes one cuBLAS call per run); a config still carrying the
-    key is refused with a message that says so, not a bare unknown-key
-    error (every pre-fold Mode-B config on disk carries it)."""
-    body = _full_v2_modeB()
-    body["step2"]["enable_tf32"] = False
-    p = _write_config(tmp_path, body)
-    with pytest.raises(ValueError,
-                       match=r"step2\.enable_tf32 was removed.*Delete the key"):
         read_pipeline_config(p)
 
 
@@ -465,8 +441,8 @@ def test_step2_epsilon_rejects_string(tmp_path: Path) -> None:
 # Top-level type guards
 # ─────────────────────────────────────────────────────────────────────
 def test_step0_enable_tf32_rejects_non_bool(tmp_path: Path) -> None:
-    """enable_tf32 moved into step block (2026-06); rejects non-bool
-    with the nested-key error prefix."""
+    """``step0.enable_tf32`` rejects non-bool with the nested-key error
+    prefix."""
     body = _full_v2_modeB()
     body["step0"]["enable_tf32"] = "true"
     p = _write_config(tmp_path, body)
@@ -483,11 +459,11 @@ def test_beta_scalar_rejects_bool(tmp_path: Path) -> None:
 
 
 def test_w_negative_rejected(tmp_path: Path) -> None:
-    """Top-level w >= 0 contract — w is a weight, negative is nonsense."""
+    """Top-level w > 0 contract — w is a weight, negative is nonsense."""
     body = _full_v2_modeB()
     body["w"] = -1
     p = _write_config(tmp_path, body)
-    with pytest.raises(ValueError, match=r"\bw must be >= 0"):
+    with pytest.raises(ValueError, match=r"\bw must be positive"):
         read_pipeline_config(p)
 
 
@@ -509,6 +485,17 @@ def test_cmshbm_modeb_rejected(tmp_path: Path) -> None:
     p = _write_config(tmp_path, body)
     with pytest.raises(NotImplementedError, match=r"cMSHBM"):
         read_pipeline_config(p)
+
+
+def test_cmshbm_gpu_accepted(tmp_path: Path) -> None:
+    """cMSHBM's remove_isolated pre-predicate runs on device inside the
+    gpu backend, so the pair parses (Mode A)."""
+    body = _full_v2_modeA_single()
+    body["variant"] = "cMSHBM"
+    body["backend_step3"] = "gpu"
+    p = _write_config(tmp_path, body)
+    cfg = read_pipeline_config(p)
+    assert cfg.variant == "cMSHBM" and cfg.backend_step3 == "gpu"
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -774,7 +761,7 @@ def test_full_v2_roundtrip_non_default(tmp_path: Path) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Knobs are now non-default — direct construction without args fails
+# Knobs have no defaults — direct construction without args fails
 # ─────────────────────────────────────────────────────────────────────
 def test_knobs_cannot_construct_without_args() -> None:
     """Step{N}Knobs() with no args must TypeError under strict mode —
@@ -794,8 +781,7 @@ def test_knobs_cannot_construct_without_args() -> None:
 #
 # The GPU init kernel keeps a fixed number of per-lane accumulators;
 # ``step2_em_iter_master._kernels_gpu.check_dims`` owns the ceiling. Refusing it here
-# means the run does not die in the Session ctor, i.e. after step 0/1
-# and the whole cohort's packed-BOLD decode.
+# means the run does not die after step 0/1.
 # ─────────────────────────────────────────────────────────────────────
 _SPARSE_MAX_CLUSTERS = 512
 _SPARSE_MAX_D_GRAD = 11772
@@ -880,42 +866,117 @@ def test_the_sparse_cluster_limit_is_scoped_to_backend_step2(
     assert read_pipeline_config(p).num_clusters == 1000
 
 
-def test_backend_step2_gpu_sparse_is_not_an_alias(tmp_path: Path) -> None:
-    """``'gpu_sparse'`` was the P-layout backend's name while the dense
-    CuPy port held ``'gpu'``; it is rejected like any unknown value."""
+def test_unknown_backend_value_rejected(tmp_path: Path) -> None:
     body = _full_v2_modeB()
-    body["backend_step2"] = "gpu_sparse"
+    body["backend_step2"] = "cuda"
     p = _write_config(tmp_path, body)
     with pytest.raises(ValueError, match=r"backend_step2 must be one of"):
         read_pipeline_config(p)
 
 
 # ─────────────────────────────────────────────────────────────────────
-# w=0 × backend_step3='gpu_sparse' constraint
+# w > 0 on every backend_step3
 #
-# w=0 is not a "prior off" switch: the dense E-step still evaluates
-# 0*log(theta)=NaN outside supp(theta), while the candidate-set backend
-# only visits supp(theta) and would silently answer differently.
+# At w=0 the E-step's w*log(theta) term is 0*log(0) = NaN outside
+# supp(theta) and the parcellation degenerates (stock CBIG does the same).
 # ─────────────────────────────────────────────────────────────────────
-def test_w_zero_rejected_with_gpu_sparse(tmp_path: Path) -> None:
+@pytest.mark.parametrize("backend", ["cpu", "gpu"])
+def test_w_zero_rejected(tmp_path: Path, backend: str) -> None:
     body = _full_v2_modeB()
     body["w"] = 0
-    body["backend_step3"] = "gpu_sparse"
+    body["backend_step3"] = backend
     p = _write_config(tmp_path, body)
-    with pytest.raises(ValueError, match=r"gpu_sparse.*requires\s+w > 0"):
+    with pytest.raises(ValueError, match=r"\bw must be positive \(got 0\)"):
         read_pipeline_config(p)
 
 
-def test_w_zero_accepted_on_cpu(tmp_path: Path) -> None:
+@pytest.mark.parametrize("backend", ["cpu", "gpu"])
+def test_w_positive_accepted(tmp_path: Path, backend: str) -> None:
     body = _full_v2_modeB()
-    body["w"] = 0
-    p = _write_config(tmp_path, body)
-    assert read_pipeline_config(p).w == 0
-
-
-def test_w_positive_accepted_with_gpu_sparse(tmp_path: Path) -> None:
-    body = _full_v2_modeB()
-    body["backend_step3"] = "gpu_sparse"
+    body["w"] = 1
+    body["backend_step3"] = backend
     p = _write_config(tmp_path, body)
     cfg = read_pipeline_config(p)
-    assert cfg.w == 50 and cfg.backend_step3 == "gpu_sparse"
+    assert cfg.w == 1 and cfg.backend_step3 == backend
+
+
+def test_catalog_backend_step3_values() -> None:
+    """The catalog offers exactly the values the parser accepts."""
+    from arealmshbm.pipeline.config import _VALID_BACKENDS
+    repo = Path(__file__).resolve().parents[3]
+    catalog = repo / "lib" / "hyperparameters" / "step3.json"
+    data = json.loads(catalog.read_text(encoding="utf-8"))
+    entry = next(e for e in data["entries"] if e["key"] == "backend_step3")
+    assert entry["values"] == list(_VALID_BACKENDS) == ["cpu", "gpu"]
+    assert entry["default"] == "cpu"
+
+
+
+def test_step1_gpu_rejects_fp32_reduction_at_parse(tmp_path: Path) -> None:
+    """The GPU ini_params kernels are fp64-only; a float32 reduction on
+    ``backend_step1='gpu'`` is refused when the config is read."""
+    body = _full_v2_modeB()
+    body["backend_step1"] = "gpu"
+    body["step1"]["reduction_dtype"] = "float32"
+    with pytest.raises(
+            ValueError,
+            match=r"backend_step1='gpu' requires "
+                  r"step1\.reduction_dtype='float64'"):
+        read_pipeline_config(_write_config(tmp_path, body))
+
+
+def test_step1_gpu_fp32_profile_dtype_accepted(tmp_path: Path) -> None:
+    body = _full_v2_modeB()
+    body["backend_step1"] = "gpu"
+    body["step1"]["profile_dtype"] = "float32"
+    cfg = read_pipeline_config(_write_config(tmp_path, body))
+    assert cfg.step1.profile_dtype == "float32"
+    assert cfg.step1.reduction_dtype == "float64"
+
+
+def test_step1_cpu_fp32_reduction_accepted(tmp_path: Path) -> None:
+    body = _full_v2_modeB()
+    body["step1"]["reduction_dtype"] = "float32"
+    cfg = read_pipeline_config(_write_config(tmp_path, body))
+    assert cfg.backend_step1 == "cpu"
+    assert cfg.step1.reduction_dtype == "float32"
+
+
+_FLOAT_KNOBS = [
+    ("step0", "smooth_sigma"), ("step0", "watershed_frac"),
+    ("step0", "downsample"),
+    ("step1", "threshold"), ("step1", "radius_mask_radius_mm"),
+    ("step2", "epsilon"), ("step2", "intra_em_convergence_eps"),
+    ("step2", "inter_convergence_eps"), ("step2", "em_convergence_eps"),
+    ("step2", "gpu_cache_safety_margin_gb"),
+    ("step3", "connect_th"), ("step3", "epsilon"),
+]
+
+
+@pytest.mark.parametrize("block,key", _FLOAT_KNOBS)
+@pytest.mark.parametrize("value", [math.nan, math.inf])
+def test_nonfinite_float_rejected(tmp_path: Path, block: str, key: str,
+                                  value: float) -> None:
+    """``json`` reads the ``NaN`` / ``Infinity`` tokens; no float knob
+    accepts them."""
+    body = _full_v2_modeB()
+    body[block][key] = value
+    p = _write_config(tmp_path, body)
+    token = "NaN" if math.isnan(value) else "Infinity"
+    assert token in p.read_text(encoding="utf-8")
+    with pytest.raises(ValueError, match=rf"{block}\.{key}"):
+        read_pipeline_config(p)
+
+
+def test_overflowing_float_literal_rejected(tmp_path: Path) -> None:
+    """``1e400`` is valid JSON and parses to infinity."""
+    body = _full_v2_modeB()
+    p = _write_config(tmp_path, body)
+    text = p.read_text(encoding="utf-8")
+    sigma = json.dumps(body["step0"]["smooth_sigma"])
+    needle = f'"smooth_sigma": {sigma}'
+    assert text.count(needle) == 1
+    p.write_text(text.replace(needle, '"smooth_sigma": 1e400'),
+                 encoding="utf-8")
+    with pytest.raises(ValueError, match=r"step0\.smooth_sigma"):
+        read_pipeline_config(p)

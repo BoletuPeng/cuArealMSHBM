@@ -1,7 +1,7 @@
-"""test_m_step_gpu_sparse.py
+"""test_m_step_gpu.py
 
-Validation of the ``gpu_sparse`` GPU M-step
-(:mod:`arealmshbm.m_step.m_step_gpu_sparse`) against the CPU reference
+Validation of the ``gpu`` M-step
+(:mod:`arealmshbm.m_step.m_step_gpu`) against the CPU reference
 :class:`arealmshbm.m_step.m_step.MStepSession`.
 
 Real-data checks run on sub-001 (fsaverage6, T=6, N=81924, D=1175,
@@ -31,7 +31,7 @@ from arealmshbm.vmf_clustering.tests._sub001_fixture import (
 def _csc_from_dense_support(mask_NL: np.ndarray):
     """Hand-built ``(col_ptr, csc_row, csc_pidx)`` for a dense support.
 
-    Mirrors :func:`arealmshbm.vmf_clustering.sparse_layout.build_candidate_layout_dense`:
+    Mirrors :func:`arealmshbm.vmf_clustering.tests._layout_oracle.build_candidate_layout_dense`:
     the ``(P,)`` CSR order is the row-major nonzero order of the support,
     and the CSC arrays are that order sorted by ``(col, n)``.
     """
@@ -70,7 +70,7 @@ def _sub001_ref():
         unpack_normalize_packed_NTD_host,
     )
     from arealmshbm.vmf_clustering.sparse_layout import layout_to_device
-    from arealmshbm.m_step import m_step_gpu_sparse as G
+    from arealmshbm.m_step import m_step_gpu as G
 
     fx = skip_unless_sub001()
     r = _Ref()
@@ -171,7 +171,7 @@ def test_row_stats_vs_host():
 def test_x_dot_sl_bits_vs_sgemm():
     skip_unless_cupy()
     import cupy as cp
-    from arealmshbm.m_step import m_step_gpu_sparse as G
+    from arealmshbm.m_step import m_step_gpu as G
     r = _sub001_ref()
 
     out = cp.empty((r.T, r.L, r.D), dtype=cp.float32)
@@ -216,6 +216,319 @@ def test_x_dot_sl_bits_vs_sgemm():
     assert max_scale_rel <= 1e-6
     assert e_gpu.max() <= e_sgemm.max()
     assert np.sqrt((e_gpu ** 2).mean()) <= np.sqrt((e_sgemm ** 2).mean())
+
+
+# ---------------------------------------------------------------------
+# 2b. x_dot_sl_bits vs the shared-memory-staged oracle
+# ---------------------------------------------------------------------
+# The oracle stages each member's packed row in shared memory and folds
+# one member per step. The shipped text (``m_step/_xdot_kernel.py``)
+# reads the member bytes straight from global memory with a 4-deep
+# ``__ldg`` prefetch instead, keeping every per-``d`` fp32 fold and every
+# fp32->fp64 fold in the same order, so the two must agree to the bit.
+# The staged text lives here as the oracle so that a later edit of the
+# shared kernel cannot drift silently.
+#
+# The text has two consumers and the oracle is instantiated at each one's
+# geometry -- step 3 at 128 threads x 2 bytes (``-std=c++14``), step 2 at
+# 256 x 1 (``-std=c++17 -fmad=false``) -- and compared against that
+# consumer's OWN compiled kernel, launched the way the consumer launches
+# it. The fp64 B-term tree spans ``blockDim.x`` lanes, so only the same
+# geometry is bit-comparable. The geometry and the 64-member fold chunk
+# are written out here, not read from the modules: the labels' bit-exact
+# contract against the merge-base rests on that op order, so a changed
+# module constant must fail here (``test_x_dot_geometry_is_pinned``), not
+# re-tune the oracle.
+_STAGED_ORACLE_SRC = r"""
+__device__ __forceinline__ double block_reduce_f64(double v, double* sh) {
+    const int tid = threadIdx.x;
+    sh[tid] = v;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (tid < s) sh[tid] += sh[tid + s];
+        __syncthreads();
+    }
+    const double r = sh[0];
+    __syncthreads();
+    return r;
+}
+
+#define XDOT_MAX_NB XDOT_MAX_NB_VALUE
+#define XDOT_BS     XDOT_BS_VALUE
+
+extern "C" __global__
+void x_dot_sl_bits(const unsigned char* __restrict__ packed,  // (T, N, Db)
+                   const float* __restrict__ row_mean,        // (T, N)
+                   const float* __restrict__ row_inv,         // (T, N)
+                   const int* __restrict__ col_ptr,           // (L+1,)
+                   const int* __restrict__ csc_row,           // (P,)
+                   const int* __restrict__ csc_pidx,          // (P,)
+                   const float* __restrict__ s_lambda_P,      // (P,)
+                   float* __restrict__ out,                   // (T, L, D)
+                   int N, int L, int D, int D_bytes, int chunk)
+{
+    extern __shared__ unsigned char smem_raw[];
+    float* sh_w = (float*)smem_raw;                          // chunk floats
+    unsigned char* sh_bytes = smem_raw + (size_t)chunk * 4;  // chunk*D_bytes
+    __shared__ double sh_red[XDOT_BS];
+    __shared__ double sh_B;
+
+    const int tid = threadIdx.x;
+    const int bs  = blockDim.x;
+    const int blk = blockIdx.x;
+    const int t   = blk / L;
+    const int l   = blk - t * L;
+
+    const int start = col_ptr[l];
+    const int end   = col_ptr[l + 1];
+
+    const unsigned char* base_t =
+        packed + (size_t)t * (size_t)N * (size_t)D_bytes;
+    const float* rm_t = row_mean + (size_t)t * (size_t)N;
+    const float* ri_t = row_inv  + (size_t)t * (size_t)N;
+    float* out_tl = out + ((size_t)t * (size_t)L + (size_t)l) * (size_t)D;
+
+    // --- B = sum_n w_nt * row_mean[t, n]  (per-(t,l), independent of d) ---
+    double bl = 0.0;
+    for (int i = start + tid; i < end; i += bs) {
+        const int n = csc_row[i];
+        const float w = s_lambda_P[csc_pidx[i]] * ri_t[n];
+        bl += (double)(w * rm_t[n]);
+    }
+    bl = block_reduce_f64(bl, sh_red);
+    if (tid == 0) sh_B = bl;
+    __syncthreads();
+    const double B = sh_B;
+
+    // --- A_d = sum_{n : bit(t,n,d)} w_nt ---
+    float  a32[XDOT_MAX_NB * 8];
+    double acc[XDOT_MAX_NB * 8];
+    #pragma unroll
+    for (int k = 0; k < XDOT_MAX_NB * 8; ++k) acc[k] = 0.0;
+
+    for (int cs = start; cs < end; cs += chunk) {
+        const int cnt = (end - cs) < chunk ? (end - cs) : chunk;
+        __syncthreads();
+        // Member-outer / byte-inner staging: consecutive threads read
+        // consecutive bytes of one member row (coalesced) and there is no
+        // integer division by the runtime ``D_bytes`` in the loop.
+        for (int i = 0; i < cnt; ++i) {
+            const int n = csc_row[cs + i];
+            const unsigned char* g = base_t + (size_t)n * (size_t)D_bytes;
+            unsigned char* s = sh_bytes + (size_t)i * (size_t)D_bytes;
+            for (int b = tid; b < D_bytes; b += bs) s[b] = g[b];
+        }
+        for (int i = tid; i < cnt; i += bs) {
+            const int n = csc_row[cs + i];
+            sh_w[i] = s_lambda_P[csc_pidx[cs + i]] * ri_t[n];
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (int k = 0; k < XDOT_MAX_NB * 8; ++k) a32[k] = 0.0f;
+
+        // <= chunk (64) members folded in fp32, then one fp64 fold.
+        for (int i = 0; i < cnt; ++i) {
+            const float w = sh_w[i];
+            const unsigned char* rp = sh_bytes + (size_t)i * (size_t)D_bytes;
+            #pragma unroll
+            for (int j = 0; j < XDOT_MAX_NB; ++j) {
+                const int b = tid + j * XDOT_BS;
+                if (b < D_bytes) {
+                    const unsigned int bv = (unsigned int)rp[b];
+                    // Branch-free form. ``bit`` is exactly 0.0f or 1.0f, so
+                    // fma(w, bit, a) == a + w (bit=1) / == a (bit=0) with a
+                    // single rounding either way -- bit-identical to the
+                    // predicated ``if (bit) a += w`` but divergence-free.
+                    #pragma unroll
+                    for (int k = 0; k < 8; ++k) {
+                        const float bit = (float)((bv >> k) & 1u);
+                        a32[j * 8 + k] = fmaf(w, bit, a32[j * 8 + k]);
+                    }
+                }
+            }
+        }
+        #pragma unroll
+        for (int k = 0; k < XDOT_MAX_NB * 8; ++k) acc[k] += (double)a32[k];
+    }
+
+    #pragma unroll
+    for (int j = 0; j < XDOT_MAX_NB; ++j) {
+        const int b = tid + j * XDOT_BS;
+        if (b < D_bytes) {
+            #pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                const int d = b * 8 + k;
+                if (d < D) out_tl[d] = (float)(acc[j * 8 + k] - B);
+            }
+        }
+    }
+}
+"""
+
+
+# (threads, bytes per thread, fold chunk, nvrtc options) the oracle is
+# instantiated at for each consumer.
+_ORACLE_GEOMETRY = {
+    "step3": (128, 2, 64, ("-std=c++14",)),
+    "step2": (256, 1, 64, ("-std=c++17", "-fmad=false")),
+}
+_CONSUMERS = tuple(_ORACLE_GEOMETRY)
+
+
+def _staged_oracle(consumer):
+    import cupy as cp
+    bs, nb, _, opts = _ORACLE_GEOMETRY[consumer]
+    src = (_STAGED_ORACLE_SRC
+           .replace("XDOT_MAX_NB_VALUE", str(nb))
+           .replace("XDOT_BS_VALUE", str(bs)))
+    return cp.RawModule(code=src, options=opts).get_function("x_dot_sl_bits")
+
+
+def _shipped(consumer):
+    """The consumer's own compiled ``x_dot_sl_bits``: step 3 through its
+    wrapper, step 2 with ``Step2SparseSession.run_iter``'s arguments and
+    geometry (a copy of that launch; the constants are pinned by
+    ``test_x_dot_geometry_is_pinned``)."""
+    if consumer == "step3":
+        from arealmshbm.m_step import m_step_gpu as G
+
+        def run(packed, rm, ri, lay, sl, D, out):
+            G.x_dot_sl_bits(packed, rm, ri, lay["col_ptr"], lay["csc_row"],
+                            lay["csc_pidx"], sl, D, out)
+        return run
+    from arealmshbm.step2_em_iter_master import _kernels_gpu as K
+    kern = K.module().get_function("x_dot_sl_bits")
+
+    def run(packed, rm, ri, lay, sl, D, out):
+        T, N, Db = packed.shape
+        L = int(lay["col_ptr"].size) - 1
+        kern((T * L,), (K.XDOT_BLOCK,),
+             (packed, rm, ri, lay["col_ptr"], lay["csc_row"], lay["csc_pidx"],
+              sl, out, np.int32(N), np.int32(L), np.int32(D), np.int32(Db),
+              np.int32(K.XDOT_CHUNK)),
+             shared_mem=K.XDOT_CHUNK * 8)
+    return run
+
+
+def _assert_bit_exact_vs_staged(consumer, packed_dev, D, lay, sl_dev):
+    """Consumer's shipped kernel (twice) == staged oracle at the
+    consumer's geometry, uint32-exact."""
+    import cupy as cp
+    from arealmshbm.m_step import m_step_gpu as G
+    T, N, Db = packed_dev.shape
+    L = int(lay["col_ptr"].size) - 1
+    bs, _, chunk, _ = _ORACLE_GEOMETRY[consumer]
+    rm, ri = G.compute_row_stats(packed_dev, D)
+    got = cp.empty((T, L, D), dtype=cp.float32)
+    got2 = cp.empty_like(got)
+    ref = cp.empty_like(got)
+    run = _shipped(consumer)
+    run(packed_dev, rm, ri, lay, sl_dev, D, got)
+    run(packed_dev, rm, ri, lay, sl_dev, D, got2)
+    _staged_oracle(consumer)(
+        (T * L,), (bs,),
+        (packed_dev, rm, ri, lay["col_ptr"], lay["csc_row"], lay["csc_pidx"],
+         sl_dev, ref, np.int32(N), np.int32(L), np.int32(D), np.int32(Db),
+         np.int32(chunk)),
+        shared_mem=chunk * 4 + chunk * Db,   # the staged layout
+    )
+    g, g2, r = (cp.asnumpy(x).view(np.uint32) for x in (got, got2, ref))
+    assert np.array_equal(g, g2), f"{consumer}: x_dot_sl_bits is not deterministic"
+    assert np.array_equal(g, r), (
+        f"{consumer}: x_dot_sl_bits differs from the staged oracle in "
+        f"{int((g != r).sum())} of {g.size} cells")
+
+
+def test_x_dot_geometry_is_pinned():
+    """Each consumer launches at the geometry its oracle is written at;
+    ``XDOT_CHUNK`` fixes the fp32->fp64 fold order the labels contract
+    rests on. Retuning one means retuning the oracle on purpose."""
+    skip_unless_cupy()
+    from arealmshbm.m_step import m_step_gpu as G
+    from arealmshbm.step2_em_iter_master import _kernels_gpu as K
+    assert (G.XDOT_BLOCK, G.XDOT_MAX_NB, G.XDOT_CHUNK) == _ORACLE_GEOMETRY["step3"][:3]
+    assert (K.XDOT_BLOCK, K.XDOT_MAX_NB, K.XDOT_CHUNK) == _ORACLE_GEOMETRY["step2"][:3]
+
+
+def test_x_dot_src_is_ascii():
+    """On a kernel-cache miss CuPy writes each ``RawModule`` source to a
+    ``.cu`` file in the locale codec, so the shared text must stay ASCII
+    for both consumers (step 3's M-step and step 2's ``module()``)."""
+    from arealmshbm.m_step._xdot_kernel import XDOT_SL_BITS_SRC
+    bad = [i for i, ch in enumerate(XDOT_SL_BITS_SRC) if ord(ch) > 127]
+    assert not bad, f"non-ASCII at offsets {bad[:5]}"
+
+
+@pytest.mark.parametrize("consumer", _CONSUMERS)
+def test_x_dot_sl_bits_bit_exact_vs_staged_synthetic(consumer):
+    """Db = 200 > 128, so step 3's second byte per thread runs; D is not
+    a multiple of 8, so the ``d < D`` store guard runs; columns hold ~390
+    members (several 64-member folds plus a tail that is not a multiple of
+    the 4-deep prefetch); s_lambda spans 1e-30..1."""
+    skip_unless_cupy()
+    import cupy as cp
+    N, T, D, L = 3000, 2, 1597, 7
+    rng = np.random.default_rng(5)
+    bits = rng.random((T, N, D)) < 0.1
+    bits[:, :3, :] = False                  # pop == 0 rows -> row_inv = 0
+    bits[:, 3:5, :] = True                  # pop == D rows -> row_inv = 0
+    packed = np.packbits(bits, axis=2, bitorder="little")
+    mask = rng.random((N, L)) < 0.13
+    col_ptr, csc_row, csc_pidx, rows, _ = _csc_from_dense_support(mask)
+    lay = {"col_ptr": cp.asarray(col_ptr), "csc_row": cp.asarray(csc_row),
+           "csc_pidx": cp.asarray(csc_pidx)}
+    sl = cp.asarray((10.0 ** rng.uniform(-30, 0, size=rows.size)).astype(np.float32))
+    _assert_bit_exact_vs_staged(consumer, cp.asarray(packed), D, lay, sl)
+
+
+@pytest.mark.parametrize("consumer", _CONSUMERS)
+def test_x_dot_sl_bits_bit_exact_vs_staged_sub001(consumer):
+    skip_unless_cupy()
+    import cupy as cp
+    r = _sub001_ref()
+    _assert_bit_exact_vs_staged(consumer, r.packed_dev, r.D, r.layout_dev,
+                                r.s_lambda_P_dev)
+    rng = np.random.default_rng(7)
+    wide = cp.asarray((10.0 ** rng.uniform(-30, 0, size=r.s_lambda_P.size)).astype(np.float32))
+    _assert_bit_exact_vs_staged(consumer, r.packed_dev, r.D, r.layout_dev, wide)
+
+
+@pytest.mark.parametrize("consumer", _CONSUMERS)
+def test_x_dot_sl_bits_bit_exact_vs_staged_cancellation(consumer):
+    """Every cell is ``A_d - B = 0`` in exact arithmetic, so what the
+    kernel stores is the summation residue -- the one input on which the
+    order of the fp64 B term is visible (on the synthetic and sub-001
+    fixtures a reversed B loop is invisible after the fp32 store). Rows
+    come in complementary pairs with exactly D/2 ones each, so
+    ``row_mean = 0.5`` and ``row_inv = 1/16`` are exact and every B term
+    is exact; both members of a pair share the weight; the head pair has
+    ``w = 1`` and the rest ``2^U(-44, -38)``, so every add into the partials
+    that carry the head pair rounds at ulp(0.5) (the tail-only lanes sum
+    exactly) and the rounding walk depends on which tail members share a
+    lane or tree level with the head pair."""
+    skip_unless_cupy()
+    import cupy as cp
+    npairs, T, D, L = 20000, 2, 1024, 16
+    rng = np.random.default_rng(12)
+    half = np.zeros((T, npairs, D), dtype=bool)
+    half[..., : D // 2] = True
+    half = rng.permuted(half, axis=2)           # exactly D/2 ones per row
+    bits = np.empty((T, 2 * npairs, D), dtype=bool)
+    bits[:, 0::2] = half
+    bits[:, 1::2] = ~half                       # the complement row
+    packed = np.packbits(bits, axis=2, bitorder="little")
+    mask = np.repeat(rng.random((npairs, L)) < 0.5, 2, axis=0)   # a pair is in or out
+    col_ptr, csc_row, csc_pidx, rows, _ = _csc_from_dense_support(mask)
+    sl = np.empty(rows.size, dtype=np.float32)
+    for l in range(L):
+        pos = csc_pidx[col_ptr[l]:col_ptr[l + 1]]       # (n ascending) = pairs adjacent
+        w = np.exp2(rng.uniform(-44, -38, size=pos.size // 2))
+        w[0] = 1.0
+        sl[pos] = np.repeat((w * 16.0).astype(np.float32), 2)   # w = sl * row_inv
+    lay = {"col_ptr": cp.asarray(col_ptr), "csc_row": cp.asarray(csc_row),
+           "csc_pidx": cp.asarray(csc_pidx)}
+    _assert_bit_exact_vs_staged(consumer, cp.asarray(packed), D, lay, cp.asarray(sl))
 
 
 # ---------------------------------------------------------------------
@@ -286,7 +599,7 @@ def _synthetic(with_empty_parcel: bool):
     from arealmshbm.data_io.bitpacked_norm import (
         unpack_normalize_packed_NTD_host,
     )
-    from arealmshbm.m_step import m_step_gpu_sparse as G
+    from arealmshbm.m_step import m_step_gpu as G
 
     rng = np.random.default_rng(7)
     N, T, D, L = 40, 2, 20, 4
@@ -377,7 +690,7 @@ def test_synthetic_no_empty_parcel():
 def test_timing_report():
     skip_unless_cupy()
     import cupy as cp
-    from arealmshbm.m_step import m_step_gpu_sparse as G
+    from arealmshbm.m_step import m_step_gpu as G
     r = _sub001_ref()
 
     out = cp.empty((r.T, r.L, r.D), dtype=cp.float32)

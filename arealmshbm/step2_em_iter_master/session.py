@@ -21,9 +21,12 @@ Internal layout:
     mu_LD             : (L, D)            fp32 C-contig
     sigma_L / epsil_L : (L,)              fp32
 
-The external (D-leading) layout — (D, L, T, S) / (N, L, S) / (D, L, S)
-/ (D, L) — only appears at the ``.mat`` save_params boundary, where
-:meth:`Step2Pipeline._save_params` transposes.
+The external (D-leading) layout is ``(D, L)`` for ``mtc`` / ``mu``:
+``group.mat``'s ``mtc`` is read as ``(D, L)`` and transposed to
+``(L, D)`` for Params, and :meth:`Step2Pipeline._save_params`
+transposes ``mu`` back to ``(D, L)`` for ``Params_Final.mat``. The
+per-subject fields (``s_t_nu`` / ``s_lambda`` / ``s_psi``) are not
+saved.
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """
@@ -45,7 +48,6 @@ from ._kernels import (
 
 def _validate_session_ctor_args(
     *,
-    cls_name: str,
     mode: str,
     bold_loader,
     grad_loader,
@@ -62,19 +64,11 @@ def _validate_session_ctor_args(
 ) -> None:
     """Up-front validation of the :class:`Step2EmIterSession` ctor
     contract. Raises on the first mismatch; never mutates inputs.
-
-    ``cls_name`` threads the calling class's name into the cMSHBM
-    NotImplementedError message — preserved from the per-class ctors so
-    the user still sees which Session refused the mode.
-
-    Layout / dtype coercion (``np.ascontiguousarray`` / ``astype``) stays
-    in the per-class ctor: the CPU path lands the bytes in a host
-    scratch, the GPU path H2D's into a device cache, and the validator
-    has no business deciding which.
+    Layout / dtype coercion stays in the ctor.
     """
     if mode == "cMSHBM":
         raise NotImplementedError(
-            f"{cls_name}: mode='cMSHBM' is not wired (no "
+            "Step2EmIterSession: mode='cMSHBM' is not wired (no "
             "xyz-vMF path in the master kernel)."
         )
     if mode not in ("gMSHBM", "dMSHBM"):
@@ -107,7 +101,7 @@ def _validate_session_ctor_args(
     if mode == "gMSHBM":
         if grad_loader is None:
             raise ValueError("mode='gMSHBM' requires grad_loader")
-        # Mirror the per-class ctor's coercion exactly: gate on the raw
+        # Mirror the ctor's coercion exactly: gate on the raw
         # ``D_grad > 0`` (not ``int(D_grad) > 0``) so fractional inputs
         # produce the same effective value here as in the ctor's
         # ``self.D_grad`` assignment. Production passes positive ints so
@@ -186,23 +180,24 @@ def _validate_initial_state_params(Params: Dict[str, np.ndarray],
 class Step2EmIterSession:
     """Holds scratch + caches for the EM-iter master kernel.
 
-    Construct ONCE per ``vmf_clustering_batch`` call (i.e., once per
-    intra-EM outer iter). Per ``run_iter`` invocation: ONE outer-EM
-    iter of the inner-iter while-loop, spatial prior, fused E-step,
-    normalize, and theta update.
+    Construct ONCE per :meth:`Step2Pipeline.run_em`; every
+    ``vmf_clustering_batch`` call (one per intra-EM iter) reuses it.
+    Per ``run_iter`` invocation: ONE outer-EM iter of the inner-iter
+    while-loop, spatial prior, fused E-step, normalize, and theta
+    update.
 
     The caller (vmf_clustering_batch) handles the EM-convergence test
     in Python between ``run_iter`` calls.
 
     Construction-time work (per Session, once):
-      * BOLD: takes caller's pre-stacked ``(S, N, T, D)`` fp32 C-contig
-        buffer **by reference** — zero copy, zero alloc. Caller
-        (Step2Pipeline.load_inputs) is responsible for landing data in
-        NTD per-sub layout straight from disk. Phase A.3 and Phase D
-        consume ``BOLD_SNTD[s]: (N, T, D)`` via zero-copy reshape to
-        ``(N, T·D)`` for the per-subject big sgemms.
-      * grad: same zero-copy reference for the ``(S, T, N, D_grad)``
-        buffer (gMSHBM only). Gradients keep TND layout — Phase C's
+      * BOLD: holds the caller's ``bold_loader`` and allocates one
+        ``(N, T, D)`` fp32 C-contig scratch slot that the loader fills
+        on each subject visit (Phase A.3 and Phase D). Those phases
+        consume it via zero-copy reshape to ``(N, T·D)`` for the
+        per-subject big sgemms.
+      * grad (gMSHBM only): holds ``grad_loader`` and one
+        ``(T, N, D_grad)`` fp32 scratch slot, filled on each subject
+        visit before Phase C. Gradients keep TND layout — Phase C's
         block-diagonal sgemms consume the per-t ``(N, D_grad)``
         C-contig slice directly.
       * Copy caller's ``s_psi`` (S, L, D) into Session-owned buffer.
@@ -218,16 +213,17 @@ class Step2EmIterSession:
         buffers directly.
 
     Memory budget (fsaverage6 / S=3 / L=400 / D=1174 / T=6 / D_grad=100):
-      * BOLD stack (caller-owned, by reference)
-                              : 6.93 GB
-      * grad stack (gMSHBM)   : 590 MB
-      * s_lambda (fp64)       : 786 MB
-      * s_t_nu (A + B)        : 67.6 MB × 2 = 135 MB
+      * BOLD scratch (one subject, independent of S)
+                              : 2.31 GB
+      * grad scratch (gMSHBM) : 197 MB
+      * s_lambda fp32 + (N, L) fp64 scratch
+                              : 393 + 262 = 655 MB
+      * s_t_nu (A + B)        : 33.8 MB × 2 = 67.6 MB
       * X_dot_sl + sigma_psi  : 33.8 + 5.6 = 39 MB
       * theta + bm + log_*    : ~525 MB
-      * tmp_idx + flag_ST     : ~131 MB
-      * Phase D scratch       : 3.76 MB (s_t_nu_TDL transpose for big sgemm B-operand)
-      * Spatial scratch       : ~few MB
+      * tmp_idx + flag_ST     : ~33 MB
+      * Phase D scratch       : 11.3 MB (s_t_nu_TDL transpose for big sgemm B-operand)
+      * Spatial scratch       : ~132 MB
     """
 
     __slots__ = (
@@ -260,8 +256,7 @@ class Step2EmIterSession:
         "_n_alive_count_N",        # (N,)   int32 — Phase D per-vertex alive count
         # Output scalar from last run_iter (per-subject cost).
         "_cost_S",
-        # Host mtc cache (for reset_s_t_nu_from_mtc — the GPU mirror
-        # caches on device; on CPU we hold a host reference).
+        # Host mtc cache for reset_s_t_nu_from_mtc.
         "_mtc_LD_cached",
     )
 
@@ -288,7 +283,6 @@ class Step2EmIterSession:
         max_iter_m: int = 50,
     ):
         _validate_session_ctor_args(
-            cls_name="Step2EmIterSession",
             mode=mode,
             bold_loader=bold_loader, grad_loader=grad_loader,
             num_sub=num_sub, N=N, T=T, D=D, D_grad=D_grad,
@@ -313,7 +307,7 @@ class Step2EmIterSession:
         # ── BOLD per-subject scratch: ONE (N, T, D) fp32 slot, re-used ──
         # The loader fills this on each subject visit (Phase A.3 and
         # again at Phase D); the bytes are evictable between visits.
-        # At fsa6/T=6/D=1175 this is ~770 MB regardless of S.
+        # At fsa6/T=6/D=1175 this is ~2.3 GB regardless of S.
         self._bold_loader = bold_loader
         self._bold_scratch_NTD = np.empty(
             (self.N, self.T, self.D), dtype=np.float32
@@ -393,7 +387,8 @@ class Step2EmIterSession:
 
         # Phase D scratch — (T, D, L) fp32 buffer that holds the
         # transpose of s_t_nu_TLD (T, L, D) → (T, D, L) for the big
-        # E-step sgemm's right operand. ~3.76 MB at production.
+        # E-step sgemm's right operand. ~11.3 MB at T=6 / D=1175 /
+        # L=400.
         self._s_t_nu_TDL_scratch = np.empty(
             (self.T, self.D, self.L), dtype=np.float32
         )
@@ -422,10 +417,9 @@ class Step2EmIterSession:
     def upload_initial_state(self, Params: Dict[str, np.ndarray]) -> None:
         """Stage initial Params into Session-owned scratch + rebind aliases.
 
-        On CPU this is the existing zero-copy aliasing: after this call
-        ``Params['s_t_nu']``, ``Params['s_lambda']``, and
-        ``Params['theta']`` ARE the Session-owned buffers (no per-iter
-        memcpy). The GPU mirror does an H2D instead.
+        Zero-copy aliasing: after this call ``Params['s_t_nu']``,
+        ``Params['s_lambda']``, and ``Params['theta']`` ARE the
+        Session-owned buffers (no per-iter memcpy).
         """
         _validate_initial_state_params(
             Params, self.S, self.T, self.N, self.L, self.D,
@@ -440,9 +434,8 @@ class Step2EmIterSession:
     def cache_mtc(self, mtc_LD: np.ndarray) -> None:
         """Cache the host ``mtc`` (L, D) used by :meth:`reset_s_t_nu_from_mtc`.
 
-        The CPU path holds a host reference (no copy); the GPU mirror
-        H2Ds the array to a device cache once. Same method name on both
-        classes; the pipeline calls it once after Session construction.
+        Holds a host reference (no copy); the pipeline calls it once
+        after Session construction.
         """
         mtc = np.ascontiguousarray(mtc_LD, dtype=np.float32)
         if mtc.shape != (self.L, self.D):
@@ -452,9 +445,8 @@ class Step2EmIterSession:
     def reset_s_t_nu_from_mtc(self) -> None:
         """In-place broadcast of cached mtc into ``s_t_nu``.
 
-        On CPU this writes the Session-owned ``_s_t_nu_A_STLD`` buffer
-        (= aliased ``Params['s_t_nu']``). The GPU mirror does the same
-        broadcast on device. Must call :meth:`cache_mtc` first.
+        Writes the Session-owned ``_s_t_nu_A_STLD`` buffer (= aliased
+        ``Params['s_t_nu']``). Must call :meth:`cache_mtc` first.
         """
         if self._mtc_LD_cached is None:
             raise RuntimeError(

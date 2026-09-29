@@ -4,10 +4,10 @@ The full EM body of step 3 — one outer call corresponds to one ``intra_em``
 iteration. Composes the leaf modules into a single Session.
 
 Public API:
-    VmfClusteringSession — caches all sub-Sessions and per-call scratch.
-                           ``backend='cpu' | 'gpu_elambda' | 'gpu_full'``.
-                           (``'gpu_sparse'`` is built by Step3Pipeline from
-                           sparse inputs — see vmf_clustering_gpu_sparse.)
+    VmfClusteringSession — the ``backend='cpu'`` session; caches all
+                           sub-Sessions and per-call scratch.
+                           (``backend='gpu'`` is built by Step3Pipeline
+                           from sparse inputs — see vmf_clustering_gpu.)
     warmup               — pre-compile every numba kernel reachable from
                            the super-call. Idempotent; useful before
                            benchmarking to avoid JIT cold-start cost.

@@ -60,7 +60,7 @@ Step0Pipeline.run(cfg)                                         [arealmshbm/step0
 └── save()
     ├── edge_density.npy
     ├── {lh,rh}_gradient_distance_matrix.npy
-    └── {lh,rh}_emb_<num_comp>_distance_matrix.npy   (preferred; .mat legacy via cfg.emb_output_format)
+    └── {lh,rh}_emb_<num_comp>_distance_matrix.npy   (default; .mat via cfg.emb_output_format)
 ```
 
 For `mesh = 'fsaverage6'`, `sub_FC=100`, `sub_verts=200`, `downsample=3.2`:
@@ -95,7 +95,7 @@ arealmshbm/
 ├── bold_io/                                FreeSurfer surface .func.gii BOLD (GIFTI only)
 ├── mesh_topology/                          vertex_nbors / vertex_faces
 ├── step0_neighbors/                        neighbors_exclude_medial + K-hop
-├── subsampling/                            FC speed-up randinds (legacy np.random)
+├── subsampling/                            FC speed-up randinds (np.random.seed global RNG)
 ├── fc_similarity/                          block-wise FC-similarity matrix
 │                                           (BLAS sgemm + fused numba kernels)
 ├── surface_gradient/                       per-vertex tangent-plane LS
@@ -112,7 +112,10 @@ arealmshbm/
 │                                           (replaces wb -surface-create-sphere)
 ├── interpolate_sphere/                     barycentric-on-sphere
 │                                           (replaces MARS_linearInterpolate)
-├── graph_distance/                         numba prange all-pairs Dijkstra
+├── graph_distance/                         numba prange all-pairs Dijkstra (cpu)
+│   ├── graph_distance_gpu.py               Δ-stepping SSSP (gpu)
+│   └── _heap.py                            indexed min-heap (also used by
+│                                           surface_smoothing's Dijkstra)
 └── diffusion_map/                          distance → affinity + mapalign Lanczos top-k
     ├── diffusion_map_repaired.py           CPU production wrapper: D → A then delegate
     ├── diffusion_map_gpu_repaired.py       GPU production wrapper: D → A then delegate
@@ -123,21 +126,22 @@ arealmshbm/
 ```
 
 Backend selection happens at `Step0Config.backend ∈ {'cpu', 'gpu'}`.
-`backend='gpu'` routes two leaves to CuPy + cuBLAS:
+`backend='gpu'` routes these leaves to CuPy (dispatch in
+`step0_pipeline/pipeline.py`):
 
   * **`fc_similarity`** (`fc_similarity_gpu.py`) — `curr_data`,
-    `t_series`, `mag_t`, `FC_A` stay device-resident across one
-    session's iter_a / iter_b loop; only the per-iter_a
-    `FC_simi_block` is D2H-copied because the downstream
-    `cifti_gradient` is still numba CPU.
+    `t_series`, `mag_t` stay device-resident across one session's
+    iter_a / iter_b loop.
+  * **`surface_gradient`** (`cifti_gradient_gpu`) — consumes the
+    device `FC_simi_block`; the per-block gradient sums and counts
+    accumulate on device.
+  * **`surface_smoothing`** (`cifti_smoothing_gpu`), **`local_minima`**
+    (`find_minima_gpu`) and **`watershed`** (`watershed_edge_count_gpu`)
+    — the per-block avg → smooth → minima → watershed chain.
+  * **`graph_distance`** (`gradient_geodesic_distance_gpu_device`,
+    Δ-stepping SSSP) — subgraph B.
   * **`diffusion_map`** (`diffusion_map_gpu_repaired.py`) — partial
     Lanczos eigsh on the (N_down × N_down) affinity via cuSPARSE.
-
-Every other leaf stays on the CPU numba path. The remaining
-GPU-port candidates (surface_gradient, surface_smoothing's per-call
-SpMV, subgraph B's all-pairs Dijkstra) are bandwidth- or
-memory-latency-bound — see the per-stage timing breakdown in
-`step0_pipeline/profile.py` output before deciding what to port next.
 
 ## Wall
 
@@ -181,27 +185,25 @@ cuSPARSE eigsh and recovers ~17× on that leaf. Subgraph A's GPU win
 (~2.7×) is from `fc_similarity` (curr_data + t_series device-resident
 across iter_a/iter_b, sgemm via cuBLAS, fused demean+norm RawKernel
 replacing the prior fp64-cast-and-reduce chain — see
-[`## fc_similarity fused demean+norm`](#fc-similarity-fused-demean-norm)
-below); the rest of A (watershed, local_minima, surface_smoothing's
-per-iter SpMV) stays on the numba CPU path. Subgraph B's GPU port is
+[`fc_similarity fused demean+norm`](#fc_similarity-fused-demeannorm)
+below); the rest of A (surface_gradient, surface_smoothing,
+local_minima, watershed) runs on CuPy too under `backend='gpu'`; see
+the dispatch list above. Subgraph B's GPU port is
 documented inline under [`## Subgraph B GPU port`](#subgraph-b-gpu-port).
 
 ### Subgraph B GPU port
 
-Sub-B used to be the largest GPU-wall single leaf (1.72 s, 30 % of the
-old GPU per-sub wall) because the CPU numba prange Dijkstra ran on
-both backends — no GPU port. The GPU solver is a per-source
-**Δ-stepping SSSP**
+The GPU solver is a per-source **Δ-stepping SSSP**
 ([`_kernels_gpu.py`](../arealmshbm/graph_distance/_kernels_gpu.py)):
 one CTA per source, the distance row kept L2-resident, the frontier a
 pair of shared-memory bitmasks drained through a compacted int32
 worklist, and the transpose + normalisation fused into one 32x32 tiled
-pass. It replaced a batched pull-based Bellman-Ford in 2026-09 — same
-fixed point, bit-identical output, the wall below; that solver is
-history (end of this section), not a knob.
+pass. Its output is bit-identical to a batched pull-based Bellman-Ford
+(same fixed point; the transcribed oracle below, walls at the end of
+this section).
 
 * **Hard preconditions**, each a `ValueError` out of
-  `graph_distance_gpu.py` — there is nothing to fall back to: valence
+  `graph_distance_gpu.py`: valence
   `M <= EDGE_SLOTS` (8, the packed edge table's slot count),
   `N <= MAX_N` (188352: the two frontier bitmasks must fit the 48 KiB
   static shared-memory budget — above fsaverage7, so no supported mesh
@@ -210,20 +212,17 @@ history (end of this section), not a knob.
   graph). Slots outside the 1-indexed range `[0, N]` and negative / NaN
   weights are refused up front too: the kernel orders distances by
   their uint32 bit pattern and terminates only on strict decreases.
-  The worklist was int16 (`N < 32768`) while the Bellman-Ford fallback
-  covered larger meshes; it was widened when that fallback went, so
-  `downsample < 1.26` (N ≥ 32768 on fsaverage6, down to the catalog's
-  1.0) solves on the GPU like on the CPU: 38 registers either way,
-  36.7 → 36.6 ms per hemisphere at N=12962, and bit-identical to the
-  transcribed Bellman-Ford oracle at N=33642 (the `downsample=1.25`
-  icosphere; 0.41 s vs the oracle's 3.57 s).
+  The worklist is int32, so `downsample < 1.26` (N ≥ 32768 on
+  fsaverage6, down to the catalog's 1.0) solves on the GPU like on the
+  CPU, bit-identical to the transcribed Bellman-Ford oracle at N=33642
+  (the `downsample=1.25` icosphere; 0.41 s vs the oracle's 3.57 s).
 * **Bit-stable and deterministic.** `min` / `atomicMin` are order-free,
   so the fixed point of `d[u] = min_v fl(d[v] + w(v, u))` does not
   depend on the relaxation schedule — run-to-run identical, and
-  identical to the retired Bellman-Ford. Pinned at the production shape
-  (N=12962, valence 6) by
+  identical to the pull-based Bellman-Ford. Pinned at the production
+  shape (N=12962, valence 6) by
   `graph_distance/tests/test_gpu_delta_correctness.py`, which keeps a
-  transcribed copy of that solver as its oracle. Δ only decides how
+  transcribed pull-based Bellman-Ford as its oracle. Δ only decides how
   relaxations are bucketed, never their fixed point, so the throughput
   knobs (`delta_mult`, `blocks_per_sm`, `threads`, `cap`) are all
   bit-neutral.
@@ -241,7 +240,7 @@ interpolations:
 
 | | subgraph B wall |
 |---|---:|
-| pull-BF (retired 2026-09) | 0.77 s |
+| pull-based Bellman-Ford (2026-09) | 0.77 s |
 | Δ-stepping | **0.14 s** |
 
 The residual is host-side `make_icosphere` + `linear_interpolate_sphere`,
@@ -287,8 +286,7 @@ Per-leaf measurement at fsa6 (N=12962, M=6), both hemis:
 
 That kernel was bandwidth-bound at ~2.6 ms/iter (theoretical floor
 ~2 ms/iter for the (N, N) × 7 fp32 read pattern), so the next win had
-to be algorithmic — Δ-stepping. Its CUDA is deleted from the tree; a
-transcribed copy survives as the oracle in
+to be algorithmic — Δ-stepping. A transcribed copy is the oracle in
 `graph_distance/tests/test_gpu_delta_correctness.py`.
 
 ### fc_similarity fused demean+norm
@@ -321,10 +319,12 @@ that does both passes through the fp32 buffer with fp64 accumulators
 Layout-specific kernels for the two callers — same algorithm, flipped
 coalescing pattern:
 
-* `axis0` ((T, K) row-major, reduce over T): block (32, 1); each
-  thread owns one column j. Warp loads `x[t, j..j+31]` = 32
+* `axis0` ((T, K) row-major, reduce over T): 256 threads per block;
+  each thread owns one column j. Warp loads `x[t, j..j+31]` = 32
   consecutive fp32 → one coalesced 128 B transaction. No shared
-  memory.
+  memory, except in the divide-fused variant used on FC_A / FC_B
+  (`fused_div_demean_norm_columns_cupy`), which stages its per-row
+  divisor in dynamic shared memory.
 * `axis1` ((K, T) row-major, reduce over T): block (256, 1), one
   block per row k. Threads cooperate via an 8-byte-per-cell shared
   fp64 array with stride-1 access — no bank conflicts in the tree
@@ -392,10 +392,11 @@ jitter — the blockers are structural:
 
 * **Assets are not caches.** The rewrite needs an inputs-cache v2 plus
   a `step0_down` bundle written at runtime under
-  `arealmshbm/data/precomputed/`. This tree's rule is that everything
-  under that path is a shipped asset the installer stages, never a
-  cache the pipeline fills in (see `arealmshbm/data/README.md`), so the
-  rewrite would have to ship both bundles as assets first.
+  `arealmshbm/data/precomputed/`. In this tree, `avg_mesh/` under that
+  path is asset-only (`load_avg_mesh` has no runtime rebuild) and
+  `step0_inputs/` is a downloadable release asset (its rebuild needs raw
+  CBIG sources; see `arealmshbm/data/README.md`), so the rewrite would
+  have to ship both new bundles as downloadable assets first.
 * **Subgraph A is not bit-exact.** Its fused stage-A path and the
   block-Krylov subgraph-C solver both move values at the ULP level
   (about 90 % of FC cells), so no per-kernel oracle against the
@@ -404,11 +405,18 @@ jitter — the blockers are structural:
 
 ## RNG / orientation tolerances
 
-Every hot-path kernel is `@njit` numba CPU (with one CuPy path in
-subgraph C); the tech-stack exceptions delegate to BLAS sgemm (numpy
-`@`) and Lanczos partial eigh (`scipy.sparse.linalg.eigsh` /
-`cupyx.scipy.sparse.linalg.eigsh`). Three RNG / orientation
-tolerances are inherent to the algorithm semantics:
+On `backend='cpu'` every hot-path kernel is `@njit` numba; the
+tech-stack exceptions delegate to BLAS sgemm (numpy `@`), a
+scipy.sparse SpMV (the cached smoothing gather) and Lanczos partial
+eigh (`scipy.sparse.linalg.eigsh`). `backend='gpu'` runs the leaves in
+the dispatch list above on CuPy (subgraph C through
+`cupyx.scipy.sparse.linalg.eigsh`); BOLD reads, subsampling, the
+icosphere and the sphere interpolations stay on the host. The GPU
+watershed numbers catchments in atomic-counter order and runs one
+Jacobi pass per threshold step instead of the permutations described
+under L10, so for a given input its boundary mask is deterministic.
+Three RNG / orientation tolerances are inherent to the algorithm
+semantics:
 
 * **L5 `subsampling`** seeds `np.random.seed(scan_idx)` and uses
   `np.random.permutation`. Any uniform permutation is acceptable;

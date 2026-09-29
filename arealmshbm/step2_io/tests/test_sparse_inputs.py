@@ -5,9 +5,8 @@ Two layers:
 * a **synthetic project** built the way ``test_subject_loaders.py`` does
   (real ``.b2nd`` + ``cohort.json`` + a hand-written ``group.mat`` /
   spatial mask / gradients), with ``load_avg_mesh`` monkeypatched to a
-  tiny fake mesh — it exercises both gradient formats, the host-cache
-  and stream branches, ``overlap`` on and off, and the medial-wall
-  contract;
+  tiny fake mesh — it exercises both gradient formats, the per-subject
+  reader, ``overlap`` on and off, and the medial-wall contract;
 * a **bench-backed** layer (``MSHBM_STEP2_BENCH_DIR``, default
   ``testdata/step2_bench``) asserting that every field equals what the
   dense ``Step2Pipeline.load_inputs`` path would have produced —
@@ -30,11 +29,12 @@ from arealmshbm.data_io.cohort import backfill_cohort_json
 from arealmshbm.data_io.profile_io import profile_path, write_subject_profile_tnd
 from arealmshbm.step2_io import (
     Step2SparseInputs,
-    build_step2_layout_dense,
-    layouts_equal,
     load_step2_sparse_inputs,
 )
-import arealmshbm.step2_io.sparse_inputs as si
+from arealmshbm.step2_io.tests._layout_oracle import (
+    build_step2_layout_dense,
+    layouts_equal,
+)
 from arealmshbm.vmf_clustering.tests._sub001_fixture import missing_avg_mesh
 
 
@@ -184,14 +184,12 @@ def test_synthetic_project_round_trip(tmp_path: Path, patched_mesh,
     assert layouts_equal(inp.layout, ref_lay)
 
     # packed BOLD: bit-identical to what the writer packed
-    assert inp.packed_host is not None
     out = np.empty((inp.T, inp.N, inp.D_bytes), dtype=np.uint8)
     for s in (1, 2):
         inp.bold_reader(s, out)
         exp = np.packbits(refs["raws"][s - 1].astype(np.uint8), axis=-1,
                           bitorder="little")
         assert np.array_equal(out, exp), s
-        assert np.array_equal(out, inp.packed_host[s - 1]), s
 
     # gradient: hemispheres stacked, sliced to D_grad, no T axis
     g = np.empty((inp.N, inp.D_grad), dtype=np.float32)
@@ -203,35 +201,16 @@ def test_synthetic_project_round_trip(tmp_path: Path, patched_mesh,
                                 "group_mtc", "boundary", "total"}
 
 
-def test_stream_mode_when_the_host_cache_does_not_fit(
-        tmp_path: Path, patched_mesh, monkeypatch) -> None:
-    cfg, refs = _make_project(tmp_path)
-    patched_mesh(refs["n_h"], refs["mw"])
-    monkeypatch.setattr(si, "_HOST_CACHE_FRACTION", 1e-15)
-
-    inp = load_step2_sparse_inputs(cfg)
-    assert inp.packed_host is None
-    out = np.empty((inp.T, inp.N, inp.D_bytes), dtype=np.uint8)
-    inp.bold_reader(2, out)
-    exp = np.packbits(refs["raws"][1].astype(np.uint8), axis=-1,
-                      bitorder="little")
-    assert np.array_equal(out, exp)
-
-
-@pytest.mark.parametrize("stream", [False, True])
 def test_a_second_subject_with_another_D_unpacked_raises(
-        tmp_path: Path, patched_mesh, monkeypatch, stream: bool) -> None:
+        tmp_path: Path, patched_mesh) -> None:
     """D=11 and D=12 share ceil(D/8)=2, so the shape check cannot see it.
 
     Only ``vlmeta.D_unpacked`` distinguishes them, and it is read off
-    subject 1; without a per-subject check subject 2 would be normalised
-    and unpacked with subject 1's D on both the eager and the streaming
-    path.
+    subject 1; without a per-call check subject 2 would be normalised
+    and unpacked with subject 1's D.
     """
     cfg, refs = _make_project(tmp_path, D=11, seed=17)
     patched_mesh(refs["n_h"], refs["mw"])
-    if stream:
-        monkeypatch.setattr(si, "_HOST_CACHE_FRACTION", 1e-15)
 
     rng = np.random.default_rng(5)
     N, T = refs["N"], 2
@@ -242,20 +221,15 @@ def test_a_second_subject_with_another_D_unpacked_raises(
                               np.ascontiguousarray(raw2))
     assert (11 + 7) // 8 == (12 + 7) // 8      # the shapes really do agree
 
-    if stream:
-        # Streaming defers the read to ``bold_reader``.
-        inp = load_step2_sparse_inputs(cfg)
-        out = np.empty((inp.T, inp.N, inp.D_bytes), dtype=np.uint8)
-        with pytest.raises(ValueError, match="D_unpacked"):
-            inp.bold_reader(2, out)
-    else:
-        with pytest.raises(ValueError, match="D_unpacked"):
-            load_step2_sparse_inputs(cfg)
+    # Only subject 1 is read at load time; the reader checks subject 2.
+    inp = load_step2_sparse_inputs(cfg)
+    out = np.empty((inp.T, inp.N, inp.D_bytes), dtype=np.uint8)
+    with pytest.raises(ValueError, match="D_unpacked"):
+        inp.bold_reader(2, out)
 
 
-@pytest.mark.parametrize("stream", [False, True])
 def test_a_second_subject_with_fewer_sessions_raises(
-        tmp_path: Path, patched_mesh, monkeypatch, stream: bool) -> None:
+        tmp_path: Path, patched_mesh) -> None:
     """A T=1 subject must raise, not be broadcast into all T slots.
 
     ``np.copyto`` broadcasts a leading axis of length 1, so without the
@@ -264,8 +238,6 @@ def test_a_second_subject_with_fewer_sessions_raises(
     """
     cfg, refs = _make_project(tmp_path, T=2, seed=23)
     patched_mesh(refs["n_h"], refs["mw"])
-    if stream:
-        monkeypatch.setattr(si, "_HOST_CACHE_FRACTION", 1e-15)
 
     rng = np.random.default_rng(9)
     raw2 = (rng.random((1, refs["N"], refs["D"])) < 0.4).astype(np.float32)
@@ -274,14 +246,10 @@ def test_a_second_subject_with_fewer_sessions_raises(
     write_subject_profile_tnd(profile_path(tmp_path, "2", TARG, SEED),
                               np.ascontiguousarray(raw2))
 
-    if stream:
-        inp = load_step2_sparse_inputs(cfg)
-        out = np.empty((inp.T, inp.N, inp.D_bytes), dtype=np.uint8)
-        with pytest.raises(ValueError, match="packed shape"):
-            inp.bold_reader(2, out)
-    else:
-        with pytest.raises(ValueError, match="packed shape"):
-            load_step2_sparse_inputs(cfg)
+    inp = load_step2_sparse_inputs(cfg)
+    out = np.empty((inp.T, inp.N, inp.D_bytes), dtype=np.uint8)
+    with pytest.raises(ValueError, match="packed shape"):
+        inp.bold_reader(2, out)
 
 
 def test_medial_wall_contract_violation_raises(tmp_path: Path,
@@ -298,6 +266,19 @@ def test_dmshbm_needs_no_gradient(tmp_path: Path, patched_mesh) -> None:
     cfg.mode = "dMSHBM"
     inp = load_step2_sparse_inputs(cfg)
     assert inp.grad_reader is None and inp.D_grad == 0
+
+
+def test_mixed_gradient_suffix_raises(tmp_path: Path, patched_mesh) -> None:
+    """Subject 1 with an lh ``.npy`` and an rh ``.mat`` is rejected."""
+    cfg, refs = _make_project(tmp_path)
+    patched_mesh(refs["n_h"], refs["mw"])
+    rh = tmp_path / "gradients" / "sub1" / "rh_emb_4_distance_matrix.npy"
+    sio.savemat(rh.with_suffix(".mat"), {"emb": np.load(rh)})
+    rh.unlink()
+    backfill_cohort_json(tmp_path, subjects=["1", "2"], sessions=["1", "2"],
+                         targ_mesh=TARG, seed_mesh=SEED, n_grad_components=4)
+    with pytest.raises(ValueError, match="mixed gradient suffix"):
+        load_step2_sparse_inputs(cfg)
 
 
 def test_cohort_disagreement_raises(tmp_path: Path, patched_mesh) -> None:
@@ -342,8 +323,11 @@ def test_from_arrays_matches_a_loaded_bundle(tmp_path: Path,
     patched_mesh(refs["n_h"], refs["mw"])
     inp = load_step2_sparse_inputs(cfg)
 
+    packed = np.empty((inp.S, inp.T, inp.N, inp.D_bytes), dtype=np.uint8)
+    for s in range(inp.S):
+        inp.bold_reader(s + 1, packed[s])
     grads = np.stack(refs["grads"])
-    mem = Step2SparseInputs.from_arrays(inp.layout, inp.packed_host, inp.mtc,
+    mem = Step2SparseInputs.from_arrays(inp.layout, packed, inp.mtc,
                                         grad_SNDg=grads)
     assert (mem.S, mem.T, mem.N, mem.D, mem.dim) == \
            (inp.S, inp.T, inp.N, inp.D, inp.dim)
@@ -416,11 +400,15 @@ def test_bench_inputs_match_the_dense_path() -> None:
 
 @pytest.mark.skipif(not _HAVE_BENCH2,
                     reason="step-2 S=2 bench project not present")
-def test_bench_two_subject_cache() -> None:
+def test_bench_two_subject_overlap_matches_serial() -> None:
     cfg = _bench_cfg(BENCH_DIR / "proj2", 2)
     a = load_step2_sparse_inputs(cfg, overlap=True)
     b = load_step2_sparse_inputs(cfg, overlap=False)
-    assert a.packed_host is not None and b.packed_host is not None
-    assert np.array_equal(a.packed_host, b.packed_host)
     assert layouts_equal(a.layout, b.layout)
     assert np.array_equal(a.mtc, b.mtc)
+    x = np.empty((a.T, a.N, a.D_bytes), dtype=np.uint8)
+    y = np.empty_like(x)
+    for s in (1, 2):
+        a.bold_reader(s, x)
+        b.bold_reader(s, y)
+        assert np.array_equal(x, y), s

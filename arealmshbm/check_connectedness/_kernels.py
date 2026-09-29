@@ -39,11 +39,6 @@ max_parcel_sz  = max boundary verts in any one multi-component parcel
    outputs:   ci          (N,)            int64    rewritten — 1-indexed comp id
               n_comp_out  (1,)            int64    rewritten — total comp count
 
-== `boundary` (two-vertex-thick boundary detection, sum-of-differences)
-   inputs:    vertex_nbors (max_neigh, N) int64    read-only — MATLAB 1-indexed
-              labels       (N,)           int64    read-only
-   outputs:   out          (N,)           int64    rewritten — boundary verts → 0
-
 == `count_per_parcel` (component-count per parcel, NaN for empty)
    inputs:    labels        (N,)             int64    read-only
               ci            (N,)             int64    read-only
@@ -81,16 +76,13 @@ Equivalence to MATLAB:
 * ``cc_from_edges``: union-find produces the same vertex partition as
   scipy's ``connected_components`` (component-ID numbering is encounter
   order rather than scipy order; only the partition matters downstream).
-* ``boundary``: literal port of
-  CBIG_ArealMSHBM_BuildTwoVertThickBoundary's sum-of-differences
-  criterion.
 * ``count_per_parcel``: each connected component contains vertices of
   exactly one label, so a single O(N) component→label map plus an
   O(n_comp) count gives the same result as
   ``np.unique(ci[labels == k]).size``.
 * ``fused_hemi_distance``: numerical equivalent of the MATLAB chain
       labels_tmp  = where(labels_zeroed==0, fake, labels_zeroed)
-      up_labels   = boundary(vertex_nbors, labels_tmp)
+      up_labels   = CBIG_ArealMSHBM_BuildTwoVertThickBoundary(vertex_nbors, labels_tmp)
       labels_bnd  = labels_zeroed * (up_labels == 0)
       ci_masked   = where(labels_zeroed==0, 0, ci_full)
       eucli[p]    = max_{c ∈ p} (min_{c'≠c, c' ∈ p} pair_min(c, c'))
@@ -120,11 +112,6 @@ from numba import njit
 #         cc_from_edges, count_per_parcel
 #   * Phase 2 (always-on):
 #         zero_singles_lh, zero_singles_and_reindex_rh, fused_hemi_distance
-# ``boundary`` also carries nogil=True for consistency, but as of this
-# commit it has no production caller — it is exercised only by ``warmup()``
-# (the standalone ``build_two_vert_thick_boundary`` helper that used to call
-# it was removed as dead code). Keeping it nogil means any future caller
-# that wants to thread boundary work needs no kernel-side change.
 @njit(cache=True, nogil=True, fastmath=False)
 def cc_from_edges(src, dst, labels, parent, rank, comp_map, ci, n_comp_out):
     N = labels.shape[0]
@@ -175,49 +162,7 @@ def cc_from_edges(src, dst, labels, parent, rank, comp_map, ci, n_comp_out):
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# 2. Two-vertex-thick boundary
-# ─────────────────────────────────────────────────────────────────────────
-@njit(cache=True, nogil=True, fastmath=False)
-def boundary(vertex_nbors, labels, out):
-    """Standalone boundary detector — RAW-LABEL contract.
-
-    Mirrors MATLAB CBIG_ArealMSHBM_BuildTwoVertThickBoundary on raw labels
-    (medial wall = 0). Out: same labels with boundary verts set to 0;
-    medial-wall verts STAY 0. A medial neighbor (nl == 0) contributes 0 to
-    the diff sum (we ``continue``); MATLAB achieves the same by masking
-    ``lh_temp(lh_full_labels==0) = 0`` after the bsxfun subtraction.
-
-    NOT interchangeable with the inlined boundary inside
-    ``fused_hemi_distance`` — that one uses a different contract
-    (pre-sentineled labels with medial = ``num_parcel + 1``) to mirror
-    MATLAB ``component_distance.m``'s line 60-65 which substitutes
-    medial → ``num_parcel + 1`` BEFORE calling BuildTwoVertThickBoundary.
-    The two outputs differ for vertices in distributed parcels adjacent to
-    medial / single-comp parcels. Do NOT try to deduplicate without first
-    re-validating the GT — the bit-equal pipeline result depends on each
-    kernel matching its own caller's contract.
-    """
-    max_neigh, N = vertex_nbors.shape
-    for v in range(N):
-        own = labels[v]
-        out[v] = own
-        if own == 0:
-            continue
-        diff_sum = 0
-        for k in range(max_neigh):
-            nb = vertex_nbors[k, v]
-            if nb == 0:
-                continue
-            nl = labels[nb - 1]
-            if nl == 0:
-                continue
-            diff_sum += (nl - own)
-        if diff_sum != 0:
-            out[v] = 0
-
-
-# ─────────────────────────────────────────────────────────────────────────
-# 3. Per-parcel unique-component-count via comp→label mapping
+# 2. Per-parcel unique-component-count via comp→label mapping
 # ─────────────────────────────────────────────────────────────────────────
 @njit(cache=True, nogil=True, fastmath=False)
 def count_per_parcel(labels, ci, n_comp, n_parcels, label_offset,
@@ -253,7 +198,7 @@ def count_per_parcel(labels, ci, n_comp, n_parcels, label_offset,
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# 4. Fused per-hemisphere distance computation (fp32 distance arithmetic)
+# 3. Fused per-hemisphere distance computation (fp32 distance arithmetic)
 # ─────────────────────────────────────────────────────────────────────────
 @njit(cache=True, nogil=True, fastmath=False)
 def fused_hemi_distance(
@@ -266,18 +211,14 @@ def fused_hemi_distance(
 ):
     """Fused per-hemi distance — SENTINELED-LABEL contract.
 
-    Step 1 (inlined boundary detector) uses a different contract from the
-    standalone ``boundary`` kernel above: it mirrors the *internal*
-    composition in MATLAB ``component_distance.m`` lines 60-65, which
-    substitutes medial-wall labels with the sentinel ``num_parcel + 1``
-    BEFORE calling BuildTwoVertThickBoundary. Here ``fake = num_parcel + 1``
-    is applied at neighbor-lookup time so a medial / single-comp neighbor
-    (label 0 in ``labels_zeroed``) DOES contribute to ``diff_sum`` — that
-    contribution is what marks distributed-parcel boundary verts adjacent
-    to single-comp parcels as boundary. The standalone ``boundary`` kernel
-    works on raw labels and ``continue``s on medial neighbors, so its
-    output differs at exactly those verts. Do NOT try to deduplicate the
-    two boundary impls — see the standalone's docstring for the rationale.
+    Step 1 (inlined boundary detector) mirrors the *internal* composition
+    in MATLAB ``component_distance.m`` lines 60-65, which substitutes
+    medial-wall labels with the sentinel ``num_parcel + 1`` BEFORE calling
+    BuildTwoVertThickBoundary. Here ``fake = num_parcel + 1`` is applied at
+    neighbor-lookup time so a medial / single-comp neighbor (label 0 in
+    ``labels_zeroed``) DOES contribute to ``diff_sum`` — that contribution
+    is what marks distributed-parcel boundary verts adjacent to
+    single-comp parcels as boundary.
     """
     max_neigh, N = vertex_nbors.shape
     fake = num_parcels_hemi * 2 + 1
@@ -389,7 +330,7 @@ def fused_hemi_distance(
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# 5. Zero single-component parcels in-place (LH path).
+# 4. Zero single-component parcels in-place (LH path).
 # ─────────────────────────────────────────────────────────────────────────
 @njit(cache=True, nogil=True, fastmath=False)
 def zero_singles_lh(labels_in, is_single, out):
@@ -408,7 +349,7 @@ def zero_singles_lh(labels_in, is_single, out):
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# 6. Zero single-component parcels AND re-index RH labels to [1, n_lh].
+# 5. Zero single-component parcels AND re-index RH labels to [1, n_lh].
 # ─────────────────────────────────────────────────────────────────────────
 @njit(cache=True, nogil=True, fastmath=False)
 def zero_singles_and_reindex_rh(labels_in, is_single, n_lh, out):
@@ -443,8 +384,6 @@ def warmup() -> None:
     cc_from_edges(src, dst, labels, parent, rank, comp_map, ci, n_comp_out)
 
     nbors = np.array([[2, 3, 0], [1, 3, 0], [1, 2, 0]], dtype=np.int64).T
-    out = np.empty(3, dtype=np.int64)
-    boundary(nbors, labels, out)
 
     comp_to_label = np.empty(int(n_comp_out[0]) + 1, dtype=np.int64)
     parcel_seen = np.empty(2, dtype=np.bool_)

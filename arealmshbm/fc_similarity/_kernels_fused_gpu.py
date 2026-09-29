@@ -38,18 +38,18 @@ void fused_demean_norm_axis0(
     const int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= K) return;
 
-    // ── Pass 1: fp64 mean accumulation over column j.
-    // Scalar reduction in register — no cross-thread coordination.
+    // -- Pass 1: fp64 mean accumulation over column j.
+    // Scalar reduction in register - no cross-thread coordination.
     double sum = 0.0;
     for (int t = 0; t < T; t++) {
         sum += (double)x[(size_t)t * (size_t)K + (size_t)j];
     }
-    // Cast mean to fp32 BEFORE the demean subtract — matches the host
+    // Cast mean to fp32 BEFORE the demean subtract - matches the host
     // path's ``x_d -= mean64.astype(cp.float32)`` so the stored fp32
     // demeaned value is bit-identical per cell.
     const float mean = (float)(sum / (double)T);
 
-    // ── Pass 2: in-place demean + fp64 SS accumulation.
+    // -- Pass 2: in-place demean + fp64 SS accumulation.
     // Pass-2 reads find pass-1's loads in L1 (each column's T floats =
     // ~960 B at T=240 fits in L1 / texture).
     double ss = 0.0;
@@ -86,7 +86,7 @@ void fused_demean_norm_axis1(
     const int B = blockDim.x;
     const size_t row_off = (size_t)k * (size_t)T;
 
-    // ── Pass 1: parallel sum over row k, tree-reduce in shared mem.
+    // -- Pass 1: parallel sum over row k, tree-reduce in shared mem.
     double local_sum = 0.0;
     for (int t = tid; t < T; t += B) {
         local_sum += (double)x[row_off + (size_t)t];
@@ -102,7 +102,7 @@ void fused_demean_norm_axis1(
     const float mean = (float)(smem[0] / (double)T);
     __syncthreads();  // ensure all threads see the same mean before reuse
 
-    // ── Pass 2: in-place demean + parallel SS reduction.
+    // -- Pass 2: in-place demean + parallel SS reduction.
     double local_ss = 0.0;
     for (int t = tid; t < T; t += B) {
         const size_t idx = row_off + (size_t)t;
@@ -154,7 +154,7 @@ void fused_div_demean_norm_axis0_1w(
     const int tid = threadIdx.x;
     const int j = blockIdx.x * blockDim.x + tid;
 
-    // Cooperative, coalesced staging of mr[] — every thread of the
+    // Cooperative, coalesced staging of mr[] - every thread of the
     // block walks the whole T axis twice, so the row divisor is read
     // 2*T times per thread out of shared memory instead of L1.
     for (int t = tid; t < T; t += blockDim.x) {

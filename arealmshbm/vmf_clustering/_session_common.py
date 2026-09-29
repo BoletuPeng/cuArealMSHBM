@@ -1,23 +1,15 @@
-"""_session_common.py — helpers shared by the CPU
-:class:`VmfClusteringSession` and the GPU :class:`VmfClusteringSessionCUDA`.
+"""_session_common.py — ctor validators and Params staging helpers for
+the step-3 sessions.
 
-Two scopes live here:
-
-  * **Ctor-time validators** (``validate_variant_requirements``,
-    ``validate_packed_bold_shape``) — the upstream contract both
-    Sessions accept (variant requirements + packed BOLD shape).
-    Centralised so the two Sessions can't drift on what input they
-    accept.
-  * **Run-time Params staging** (``_stage_1d``, ``_stage_2d``,
-    ``_stage_3d``) — shape-check + dtype-cast the EM Params dict
-    fields before consumption. Both backends call these from their
-    ``run()`` methods; centralising them here avoids the cross-module
-    private import the GPU file previously had into
-    ``vmf_clustering.py``.
-
-The only structural difference between the two ``__init__``s is
-*where* downstream work runs (host sub-Sessions vs device buffer
-alloc), which stays in the respective class bodies.
+  * ``validate_variant_requirements`` — the variant's required input
+    slots. Shared by the cpu :class:`VmfClusteringSession` and the gpu
+    :class:`VmfClusteringSessionSparseCUDA`, so both backends accept the
+    same variant inputs.
+  * ``validate_packed_bold_shape`` — the packed ``(N, T, ⌈D/8⌉)`` BOLD
+    contract of the cpu session.
+  * ``_stage_1d`` / ``_stage_2d`` / ``_stage_3d`` — shape-check +
+    dtype-cast the EM Params dict fields before the cpu session's
+    ``run()`` consumes them.
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """
@@ -67,10 +59,8 @@ def validate_packed_bold_shape(
 ) -> Tuple[int, int, int]:
     """Validate the packed BOLD input contract; return ``(N, T, D_bytes)``.
 
-    The caller may then either feed ``arr`` to
-    :func:`arealmshbm.data_io.bitpacked_norm.unpack_normalize_packed_NTD_host`
-    (CPU path) or H2D + run the fused device kernel (GPU path); both
-    paths share the same shape contract.
+    The caller then feeds ``arr`` to
+    :func:`arealmshbm.data_io.bitpacked_norm.unpack_normalize_packed_NTD_host`.
 
     Accepted contract:
       * dtype == uint8
@@ -78,9 +68,8 @@ def validate_packed_bold_shape(
       * shape == ``(N, T, ⌈D_unpacked/8⌉)``
       * T == num_session
 
-    Note: this is a pure shape/dtype validator; the actual unpack +
-    normalize is done downstream (host kernel for CPU, fused CUDA
-    kernel for GPU).
+    A pure shape/dtype validator; the unpack + normalize runs
+    downstream.
     """
     a = np.asarray(arr)
     if a.dtype != np.uint8:
@@ -108,11 +97,9 @@ def validate_packed_bold_shape(
 # ─────────────────────────────────────────────────────────────────────
 # Run-time Params staging helpers.
 #
-# Both Sessions' ``run()`` accept a Params dict at the per-call
-# boundary and stage each field through one of these three shape-
+# The cpu Session's ``run()`` accepts a Params dict at the per-call
+# boundary and stages each field through one of these three shape-
 # checked dtype-cast helpers before the EM math touches it.
-# Centralised here so the GPU module no longer reaches into the CPU
-# module for ``_stage_1d/2d/3d``.
 # ─────────────────────────────────────────────────────────────────────
 def _stage_2d(arr: Any, N: int, L: int, name: str) -> np.ndarray:
     """Stage a (N, L) Params field as fp32 C-contig. Strict shape check —
@@ -136,8 +123,8 @@ def _stage_3d(arr: Any, D: int, L: int, T: int, name: str) -> np.ndarray:
 
 def _stage_1d(arr: Any, L: int, name: str, dtype) -> np.ndarray:
     """Stage a (L,) Params field, accepting (L,) (preferred) or (1, L)
-    (legacy MATLAB GT shape readers produce this) and flattening either
-    way. Internal storage is always (L,) flat.
+    (MATLAB GT shape readers produce this) and flattening either way.
+    Internal storage is always (L,) flat.
 
     Pre-ravel shape check: anything with L total elements would pass
     a post-ravel ``shape == (L,)`` test (e.g. (2, L//2), (L, 1),

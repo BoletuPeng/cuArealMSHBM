@@ -18,6 +18,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
+import numba
 import numpy as np
 import scipy.io as sio
 
@@ -64,6 +65,7 @@ def _run_hemi(hemi: str, mesh_d: dict, labels: np.ndarray,
         L_h,
         relevant_parcels, relevant_verts,
         avg_dis,
+        numba.get_num_threads(),
     )
     timings[f"central_sulcus_{hemi}_s"] = time.perf_counter() - t
 
@@ -76,6 +78,7 @@ def _run_hemi(hemi: str, mesh_d: dict, labels: np.ndarray,
         L_h,
         np.float32(radius),
         out_mask,
+        numba.get_num_threads(),
     )
     timings[f"add_spatial_constraint_{hemi}_s"] = time.perf_counter() - t
 
@@ -91,10 +94,9 @@ def generate_radius_mask(lh_labels: np.ndarray,
                          mesh: str,
                          radius,
                          out_dir,
-                         dtype: np.dtype = np.float32,
                          verbose: bool = True,
                          backend: str = "cpu",
-                         cbig_code_dir: Optional[str] = None,
+                         atlas_dir: Optional[str] = None,
                          ) -> dict:
     """Per-parcel radius mask + central-sulcus truncation on a
     fsaverage* mesh.
@@ -119,11 +121,10 @@ def generate_radius_mask(lh_labels: np.ndarray,
     radius  : float or string mm (e.g. 30 or '30').
     out_dir : path; output written to
               ``<out_dir>/spatial_mask/spatial_mask_<mesh>.mat``.
-    dtype   : kept for signature parity; kernels run fp32 internally.
     verbose : print per-stage banners.
-    cbig_code_dir : atlas-dir override (legacy name) for the
-                    ``<mesh>/label/<hemi>.aparc.annot`` lookup; ``None`` ⇒
-                    ``MSHBM_ATLAS_DIR``. Mesh geometry comes from the
+    atlas_dir : atlas-dir override for the
+                ``<mesh>/label/<hemi>.aparc.annot`` lookup; ``None`` ⇒
+                ``MSHBM_ATLAS_DIR``. Mesh geometry comes from the
                     shipped avg_mesh bundles, not from here.
 
     Returns a dict with ``lh_boundary``, ``rh_boundary`` (csc_matrix),
@@ -133,8 +134,8 @@ def generate_radius_mask(lh_labels: np.ndarray,
         from .radius_mask_gpu import generate_radius_mask_gpu
         return generate_radius_mask_gpu(
             lh_labels=lh_labels, rh_labels=rh_labels, mesh=mesh,
-            radius=radius, out_dir=out_dir, dtype=dtype, verbose=verbose,
-            cbig_code_dir=cbig_code_dir,
+            radius=radius, out_dir=out_dir, verbose=verbose,
+            atlas_dir=atlas_dir,
         )
     if backend != "cpu":
         raise ValueError(f"generate_radius_mask: unknown backend {backend!r}")
@@ -143,8 +144,8 @@ def generate_radius_mask(lh_labels: np.ndarray,
 
     lh_mesh = load_avg_mesh("lh", mesh, "inflated")
     rh_mesh = load_avg_mesh("rh", mesh, "inflated")
-    lh_aparc = _read_aparc("lh", mesh, cbig_code_dir=cbig_code_dir)
-    rh_aparc = _read_aparc("rh", mesh, cbig_code_dir=cbig_code_dir)
+    lh_aparc = _read_aparc("lh", mesh, atlas_dir=atlas_dir)
+    rh_aparc = _read_aparc("rh", mesh, atlas_dir=atlas_dir)
 
     lh_labels = _coerce_labels(lh_labels)
     rh_labels = _coerce_labels(rh_labels)

@@ -16,9 +16,10 @@ Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Optional
+from arealmshbm.pipeline.config import _VALID_BACKENDS
 
 
 _SUPPORTED_MESHES = frozenset({
@@ -28,8 +29,6 @@ _SUPPORTED_MESHES = frozenset({
 _VALID_MODES = frozenset({"gMSHBM", "dMSHBM"})
 # cMSHBM is not wired — the master kernel has no xyz-vMF (s_muc / gamma /
 # log_xyz_term) path. Passing mode='cMSHBM' raises in __post_init__.
-
-_VALID_BACKENDS = frozenset({"cpu", "gpu"})
 
 
 @dataclass
@@ -191,10 +190,12 @@ class Step2Config:
                 f"Step2Config: backend must be one of {sorted(_VALID_BACKENDS)} "
                 f"(got {self.backend!r})"
             )
-        # The sparse kernels pack the seed dimension into ⌈D/8⌉ ≤ 256
-        # bytes of shared memory per row, which only fsaverage3's
-        # D = 1175 satisfies. Fail here rather than inside the first
-        # kernel launch.
+        # ``x_dot_sl_bits`` gives each of its 256 threads one byte of the
+        # packed row, so ⌈D/8⌉ ≤ 256; fsaverage4 and larger exceed it, and
+        # fsaverage3 (D = 1175) is also the only seed mesh the gpu sessions
+        # are validated on. Fail here rather than in the session ctor's
+        # ``check_dims``, which only runs after the step-2 input load and
+        # the kernel compile.
         if self.backend == "gpu":
             if self.seed_mesh != "fsaverage3":
                 raise ValueError(
@@ -207,7 +208,7 @@ class Step2Config:
             # warp, and ``connect_u`` stages one float per gradient
             # component in shared memory. Checked here as well as in
             # ``check_dims`` because the session ctor only runs after
-            # step 0/1 and the cohort's BOLD decode; the literals mirror
+            # the step-2 input load and the kernel compile; the literals mirror
             # ``_kernels_gpu``'s MAX_CLUSTERS / MAX_D_GRAD (no
             # kernel import — this dataclass must stay cupy-free) and
             # ``test_config_backend.py`` pins the equality.
@@ -226,10 +227,7 @@ class Step2Config:
                     f"n_grad_components <= {_SPARSE_MAX_D_GRAD}; got "
                     f"{self.n_grad_components}. Use backend='cpu'."
                 )
-        # Loop-cap / tolerance / GPU-headroom range checks. These used
-        # to live in a duplicate parser-side ``_validate_step2`` —
-        # consolidated here as the single owner so future range edits
-        # only touch one site (parser-side validator dropped 2026-06).
+        # Loop-cap / tolerance / GPU-headroom range checks.
         for name in ("max_iter_inter", "max_iter_intra_em", "max_iter_em",
                      "max_iter_m", "max_iter_intra_var"):
             v = int(getattr(self, name))

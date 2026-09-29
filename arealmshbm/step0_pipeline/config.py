@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Literal, Optional, Tuple
+from arealmshbm.pipeline.config import _VALID_BACKENDS
 
 
 _SUPPORTED_MESHES = frozenset({"fsaverage6"})
@@ -81,10 +82,9 @@ class Step0Config:
     # array (no MATLAB header parse, no struct overhead) and is
     # self-describing about shape/dtype.
     #   'npy'  — write {lh,rh}_emb_<nc>_distance_matrix.npy. Default.
-    #   'mat'  — write the legacy CBIG .mat (key 'emb'). Kept for
-    #            consumers that haven't migrated yet.
-    #   'both' — write both. Useful when a downstream tool still
-    #            expects the legacy .mat alongside the new .npy.
+    #   'mat'  — write the CBIG MATLAB .mat (key 'emb').
+    #   'both' — write both, for a downstream tool that reads the
+    #            CBIG .mat alongside the .npy.
     emb_output_format: Literal["npy", "mat", "both"] = "npy"
 
     # 'cpu' = pure-numba CPU path (default).
@@ -103,7 +103,7 @@ class Step0Config:
     # embedding, and the driver passes the embedding in memory anyway
     # (``precomputed_gradient_mat`` keyword).
     #
-    # Default OFF since 2026-05. No in-tree consumer; toggle on for
+    # Default OFF. No in-tree consumer; toggle on for
     # ad-hoc archaeological probes (cohort-level CPU/GPU drift comparison
     # via the internal step-0 CPU/GPU diff harness).
     save_geodesic_distance: bool = False
@@ -118,7 +118,7 @@ class Step0Config:
     # only consumer is the internal step-0 CPU/GPU bit-equality
     # diff harness.
     #
-    # Default OFF since 2026-06. Set True only when running that
+    # Default OFF. Set True only when running that
     # comparison script (or any future tool that wants the on-disk
     # ``edge_density.npy``). Independent of ``save_geodesic_distance``
     # — gates a different intermediate.
@@ -130,9 +130,10 @@ class Step0Config:
                 f"step-0 currently supports only mesh in {sorted(_SUPPORTED_MESHES)}; "
                 f"got {self.mesh!r}"
             )
-        if self.backend not in ("cpu", "gpu"):
+        if self.backend not in _VALID_BACKENDS:
             raise ValueError(
-                f"backend must be 'cpu' or 'gpu' (got {self.backend!r})"
+                f"backend must be one of {' / '.join(_VALID_BACKENDS)} "
+                f"(got {self.backend!r})"
             )
         if self.backend == "gpu":
             # Fail at config time on a missing GPU stack rather than ~30 s
@@ -181,11 +182,8 @@ class Step0Config:
           2. ``bold_root`` + ``sub_id`` + ``sess`` + ``mesh`` naming —
              synthesizes the canonical DeepPrep / fmriprep filename
              ``{sub}_{ses}_task-rest_hemi-{L,R}_space-{mesh}_bold.func.gii``.
-             The historical ``.nii.gz`` mirror was retired together with
-             the offline ``convert_ys_bold_parallel.py`` script; the
-             pipeline now reads GIFTI source directly via
-             :func:`arealmshbm.bold_io.read_surface_bold`, which hard-
-             rejects any non-``.gii`` suffix.
+             Read by :func:`arealmshbm.bold_io.read_surface_bold`, which
+             refuses any non-``.gii`` suffix.
         """
         if self.bold_paths_override is not None:
             return self.bold_paths_override[sess_idx - 1]

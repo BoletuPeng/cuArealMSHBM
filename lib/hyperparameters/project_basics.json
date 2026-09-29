@@ -3,7 +3,7 @@
   "schema_version": "1",
   "description": "Project-wide decisions: pipeline mode, variant, cohort-spanning algorithm weights (num_clusters, beta_scalar, w, c, n_grad_components), and dataset layout (BOLD inputs). Mode-specific constraints + per-entry overrides live in modes.json.",
   "source_note": "`source` fields name the file owning the field's authoritative default. Line numbers are intentionally omitted — they drift on every reformat and the file/symbol name is the stable contract.",
-  "range_policy": "advisory — `min`/`max` fields are UI hints documenting the values authors have validated; the parser/validator in arealmshbm/pipeline/config.py enforces only hard constraints (positivity on numeric fields, enum membership on `values`-typed fields). Out-of-range-but-positive values are accepted at parse time and surface as algorithm-side failures downstream.",
+  "range_policy": "advisory — `min`/`max` fields are UI hints documenting the values authors have validated; the parser/validator in arealmshbm/pipeline/config.py enforces only hard constraints (positivity on numeric fields except `c`, which must be >= 0; enum membership on `values`-typed fields; in Mode B, the rejection of cMSHBM and the backend_step2='gpu' limits num_clusters <= 512 and, for gMSHBM, n_grad_components <= 11772). Other out-of-range values are accepted at parse time and may surface as algorithm-side failures downstream.",
   "entries": [
     {
       "key": "mode",
@@ -69,12 +69,12 @@
     {
       "key": "w",
       "type": "integer",
-      "min": 0,
+      "min": 1,
       "max": 1000,
       "default": 50,
       "source": "arealmshbm/pipeline/config.py (PipelineConfig.w)",
       "description": "Group spatial prior log(theta) weight (step3 EM).",
-      "notes": "w=0 is not a prior-off switch: the dense backends still evaluate 0*log(theta)=NaN outside supp(theta), and backend_step3='gpu_sparse' rejects it."
+      "notes": "Must be > 0: the E-step's w*log(theta) term is undefined outside supp(theta) at w=0 (stock CBIG degenerates the same way)."
     },
     {
       "key": "c",
@@ -127,7 +127,7 @@
       "default": "fsaverage3",
       "source": "arealmshbm/pipeline/inputs.py (BoldInputs.seed_mesh)",
       "description": "Seed mesh for step1 RSFC profile.",
-      "notes": "Drives D = 1175 / 4661 / 18715 verts respectively."
+      "notes": "Drives D = 1175 / 4690 / 18741 verts respectively."
     },
     {
       "key": "bold_inputs.subjects",

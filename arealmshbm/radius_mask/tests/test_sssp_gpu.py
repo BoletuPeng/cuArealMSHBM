@@ -46,6 +46,7 @@ from arealmshbm.radius_mask._common import _build_mesh_csr  # noqa: E402
 from arealmshbm.radius_mask._kernels import (  # noqa: E402
     build_parcel_csr_kernel, central_sulcus_kernel)
 from arealmshbm.radius_mask import _kernels_gpu as K  # noqa: E402
+import numba
 
 BASELINE_MAT = Path(os.environ.get("MSHBM_STEP1_BENCH_DIR",
                                    "testdata/step1_bench"),
@@ -144,7 +145,8 @@ def test_avg_dis_matches_cpu_dijkstra_kernel(sphere):
     central_sulcus_kernel(sphere["indptr"], sphere["indices"],
                           sphere["weights"], pre, post,
                           parcel_offs, parcel_inds, L,
-                          relevant_parcels, relevant_verts, cpu)
+                          relevant_parcels, relevant_verts, cpu,
+                          numba.get_num_threads())
 
     rel = np.flatnonzero(relevant_verts).astype(np.int32)
     src = np.concatenate([pre, post]).astype(np.int32)

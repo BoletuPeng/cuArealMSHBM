@@ -1,22 +1,16 @@
 """gifti_bold_gpu.py — one subject's BOLD ingest, straight to device.
 
-:func:`read_subject_bold_gpu` turns one subject's ``(lh, rh)``
-``.func.gii`` pairs into one ``(N_cortex, T) fp32`` **device** array
-per session, bit-equal to ``concat_hemis_drop_medial(
-read_surface_bold(lh), read_surface_bold(rh), medial_mask)``. One
-``(T, n_lh + n_rh) fp32`` buffer per session is the batched
-decompressor's destination, so on return it already *is*
-``vstack([lh, rh]).T``; only the fused epilogue is left. Stream
-``prep`` carries H2D, tag scan and base64; ``dec`` carries the Deflate
-decode, the epilogue and the returned arrays. CuPy's pool keys free
-lists by the allocating stream, so a buffer written on ``prep`` and
-read on ``dec`` is held until that group's event fires.
+:func:`iter_subject_bold_gpu` turns one subject's ``(lh, rh)``
+``.func.gii`` pairs into one ``(T, n_lh + n_rh) fp32`` **device**
+buffer per session, lh in columns ``[0, n_lh)``, bit-equal to
+``hstack([read_surface_gifti(lh).T, read_surface_gifti(rh).T])``: that
+buffer is the batched decompressor's destination, so nothing runs after
+the decode. Stream ``prep`` carries H2D, tag scan and base64; ``dec``
+carries the Deflate decode and the returned arrays. CuPy's pool keys
+free lists by the allocating stream, so a buffer written on ``prep``
+and read on ``dec`` is held until that group's event fires.
 
-:func:`iter_subject_bold_gpu` is the pipelined variant: it yields each
-session as soon as its group's event has fired. ``raw_sessions=True``
-skips the epilogue and hands back the ``(T, n_lh + n_rh) fp32`` session
-buffer itself (lh in columns ``[0, n_lh)``), which is what step 1's
-fused subject leaf wants.
+It yields each session as soon as its group's event has fired.
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """
@@ -27,7 +21,7 @@ import os
 import re
 import threading
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 
 import numpy as np
 
@@ -185,7 +179,7 @@ def prewarm_subject_bold_gpu(session_paths=None, *, nbytes=None):
         _release_staging()
 
 
-def _default_stream():
+def _dec_stream():
     """Module-owned non-blocking decode stream, created once."""
     import cupy as cp
     st = _STREAM_CACHE.get("s")
@@ -271,22 +265,6 @@ def _validate_headers(host_buf, da_starts, data_starts, N, path):
     return n_dim0
 
 
-def _cortex_index(medial_mask_d, n_full):
-    """``(N_cortex,) int32`` device ``flatnonzero(~mask)``: kept rows."""
-    import cupy as cp
-    if not isinstance(medial_mask_d, cp.ndarray):
-        raise TypeError(
-            "read_subject_bold_gpu: medial_mask_d must be a cupy.ndarray "
-            "(upload once with ``cp.asarray(host_mask)``); got "
-            f"{type(medial_mask_d).__name__}")
-    mask = medial_mask_d.reshape(-1)
-    if int(mask.shape[0]) != int(n_full):
-        raise ValueError(
-            f"read_subject_bold_gpu: medial_mask length {int(mask.shape[0])}"
-            f" != n_lh + n_rh = {int(n_full)}")
-    return cp.flatnonzero(~mask.astype(cp.bool_)).astype(cp.int32)
-
-
 #: Shared pool for the ``readinto`` stage. Its tasks never block on the
 #: pool, so no nested-pool guard is needed.
 _READ_POOL: dict = {}
@@ -307,20 +285,13 @@ def _read_pool():
         return pool
 
 
-def _ingest_groups(pairs, *, medial_mask_d=None, n_lh, n_rh,
-                   prep_stream, dec_stream, group_sessions,
-                   raw_sessions=False):
+def _ingest_groups(pairs, *, n_lh, n_rh, prep_stream, dec_stream,
+                   group_sessions):
     """Decode one subject group by group.
 
     Yields ``(sess_indices, arrays, event, verify)``: the sessions of
     one group, the event recorded on ``dec_stream`` after it, and the
     decompressed-length check, which must run *after* that event.
-
-    ``raw_sessions=True`` hands back the **pre-epilogue** per-session
-    buffer instead: ``(T, n_lh + n_rh) fp32`` C-contig on device, lh in
-    columns ``[0, n_lh)`` and rh in ``[n_lh, n_full)``, with no medial
-    drop, no transpose and no NaN cleaning. ``medial_mask_d`` is then
-    unused (and may be ``None``).
 
     Whatever is still in flight when the generator finishes — or when
     an abandoned generator is closed — is parked in
@@ -338,7 +309,7 @@ def _ingest_groups(pairs, *, medial_mask_d=None, n_lh, n_rh,
     gs = n_sess if group_sessions is None else max(1, int(group_sessions))
     expected_n = [int(n_lh), int(n_rh)] * n_sess
 
-    find_tags, b64_kernel, epilogue, b64_table = get_gifti_gpu_kernels()
+    find_tags, b64_kernel, b64_table = get_gifti_gpu_kernels()
     nvbatch = get_deflate_batch()
     read_pool = _read_pool()
 
@@ -367,7 +338,7 @@ def _ingest_groups(pairs, *, medial_mask_d=None, n_lh, n_rh,
                 pinned, staging_cached = _acquire_staging(total)
             except cp.cuda.runtime.CUDARuntimeError as exc:
                 raise RuntimeError(
-                    f"read_subject_bold_gpu: could not pin {total} bytes of "
+                    f"iter_subject_bold_gpu: could not pin {total} bytes of "
                     f"host staging for this subject's {len(paths)} "
                     f"``.func.gii`` files ({exc}). The whole subject is "
                     f"staged at once; stage fewer runs per subject, or run "
@@ -383,17 +354,6 @@ def _ingest_groups(pairs, *, medial_mask_d=None, n_lh, n_rh,
             read_futs = [read_pool.submit(_readinto, p, host, o, s)
                          for p, o, s in zip(paths, offsets, sizes)]
 
-        if raw_sessions:
-            # No epilogue -> no gather map, and no mask required.
-            cidx = None
-            n_cortex = 0
-        else:
-            with dec_stream:
-                # Allocated *and* consumed on ``dec`` (the epilogue
-                # reads it), so it never crosses streams and needs no
-                # keepalive.
-                cidx = _cortex_index(medial_mask_d, n_full)
-            n_cortex = int(cidx.shape[0])
         t_subject = None
 
         for g0 in range(0, n_sess, gs):
@@ -442,7 +402,7 @@ def _ingest_groups(pairs, *, medial_mask_d=None, n_lh, n_rh,
                     max_found = n_found
                 else:
                     raise ValueError(
-                        f"read_subject_bold_gpu: tag scan found {n_found} "
+                        f"iter_subject_bold_gpu: tag scan found {n_found} "
                         f"tags > cap {max_found} even after resizing")
                 positions = cp.asnumpy(pos_d[:n_found])
                 kinds = cp.asnumpy(kind_d[:n_found])
@@ -495,7 +455,7 @@ def _ingest_groups(pairs, *, medial_mask_d=None, n_lh, n_rh,
                 T0 = per_file_T[0]
                 if any(t != T0 for t in per_file_T):
                     raise ValueError(
-                        f"read_subject_bold_gpu: all files of a subject "
+                        f"iter_subject_bold_gpu: all files of a subject "
                         f"must share T; got {per_file_T}")
 
                 starts_all = np.concatenate(chunk_starts)
@@ -564,7 +524,7 @@ def _ingest_groups(pairs, *, medial_mask_d=None, n_lh, n_rh,
                 t_subject = T0
             elif T0 != t_subject:
                 raise ValueError(
-                    f"read_subject_bold_gpu: all files of a subject must "
+                    f"iter_subject_bold_gpu: all files of a subject must "
                     f"share T; group {g0}..{g1 - 1} has T={T0}, earlier "
                     f"groups had T={t_subject}")
 
@@ -644,21 +604,7 @@ def _ingest_groups(pairs, *, medial_mask_d=None, n_lh, n_rh,
                         f"the decoded byte count "
                         f"({int(bad.shape[0])} chunk(s) affected)")
 
-                if raw_sessions:
-                    # Hand back the session buffers themselves: they
-                    # already ARE (T, lh|rh) fp32 C-contig on ``dec``.
-                    arrays = list(sess_bufs)
-                else:
-                    # ── fused NaN-clean + medial gather + transpose ──
-                    arrays = []
-                    gx = (n_cortex + 31) // 32
-                    gy = (T0 + 31) // 32
-                    for b in sess_bufs:
-                        dst_a = cp.empty((n_cortex, T0), dtype=cp.float32)
-                        epilogue((gx, gy), (32, 8),
-                                 (b, np.int32(T0), np.int32(n_full), cidx,
-                                  np.int32(n_cortex), dst_a))
-                        arrays.append(dst_a)
+                arrays = list(sess_bufs)
                 dec_evt = dec_stream.record()
                 inflight[-1] = (dec_evt, keeps)
 
@@ -686,88 +632,20 @@ def _ingest_groups(pairs, *, medial_mask_d=None, n_lh, n_rh,
             _release_staging()
 
 
-def read_subject_bold_gpu(session_paths,
-                          *,
-                          medial_mask_d=None,
-                          n_lh: int,
-                          n_rh: int,
-                          stream=None,
-                          group_sessions: Optional[int] = 2,
-                          raw_sessions: bool = False):
-    """Decode one subject's sessions straight to device ``(N_cortex, T)``.
-
-    Parameters
-    ----------
-    session_paths : sequence of (lh_path, rh_path)
-        One ``.func.gii`` pair per session, in session order. Payloads
-        must be unwrapped single-line ``GZipBase64Binary``; a wrapped
-        one raises (run step 1 with ``backend_step1='cpu'``, whose
-        reader accepts it).
-    medial_mask_d : cupy.ndarray, shape ``(n_lh + n_rh,)``
-        Truthy = medial wall (dropped); must already live on device.
-        Unused (and optional) when ``raw_sessions=True``.
-    n_lh, n_rh : int
-        Expected per-hemi vertex counts, enforced against each file's
-        ``Dim0`` and against the decompressed byte count.
-    stream : cupy.cuda.Stream, optional
-        Stream the **decode** half runs on and the returned arrays are
-        produced on; defaults to a module-owned non-blocking stream.
-    group_sessions : int or None, optional
-        Sessions per pipeline group; ``None`` = one group, no overlap.
-    raw_sessions : bool, optional
-        Return the **pre-epilogue** session buffer instead:
-        ``(T, n_lh + n_rh) fp32`` C-contig on device, lh in columns
-        ``[0, n_lh)`` and rh in ``[n_lh, n_full)``, no medial drop, no
-        transpose, no NaN cleaning.
-
-    Returns
-    -------
-    list of cupy.ndarray, ``(N_cortex, T) fp32``
-        One per session, in input order (``(T, n_lh + n_rh)`` with
-        ``raw_sessions=True``). Host-synchronous, so the arrays are
-        usable from any stream on return.
-    """
-    pairs = [(Path(a), Path(b)) for a, b in session_paths]
-    if not pairs:
-        return []
-
-    dec_stream = stream if stream is not None else _default_stream()
-    results: List = [None] * len(pairs)
-    verifies: list = []
-    last_evt = None
-    for idxs, arrays, evt, verify in _ingest_groups(
-            pairs, medial_mask_d=medial_mask_d, n_lh=n_lh, n_rh=n_rh,
-            prep_stream=_prep_stream(), dec_stream=dec_stream,
-            group_sessions=group_sessions, raw_sessions=raw_sessions):
-        for i, a in zip(idxs, arrays):
-            results[i] = a
-        verifies.append(verify)
-        last_evt = evt
-    last_evt.synchronize()
-    for v in verifies:
-        v()
-    # Decodes are complete, so the last groups' cross-stream buffers
-    # can go back to the pool now.
-    _drain_pending()
-    return results
-
-
 def iter_subject_bold_gpu(session_paths,
                           *,
-                          medial_mask_d=None,
                           n_lh: int,
                           n_rh: int,
-                          stream=None,
-                          group_sessions: int = 1,
-                          raw_sessions: bool = False):
-    """Pipelined variant — yield sessions as soon as each group lands.
+                          group_sessions: Optional[int] = 1):
+    """Decode one subject's sessions straight to device, yielding each
+    session as soon as its group lands.
 
-    Yields ``(sess_idx, dev_array)``, 0-based and in input order. The
-    generator waits only on the current group's completion event while
-    the remaining groups are already in flight on the two streams, so
-    the first session is available long before a whole-subject call
-    would return. Each array is yielded only after its group's event
-    has been synchronised, so the consumer may use it from any stream.
+    Yields ``(sess_idx, dev_array)``, 0-based and in input order. Every
+    file's host read is submitted up front; a group's device work (H2D,
+    tag scan, base64, decode) is issued only when the consumer asks for
+    that group's first session. Each array is yielded only after its
+    group's event has been synchronised, so the consumer may use it
+    from any stream.
 
     Transients are bounded at :data:`_MAX_INFLIGHT` groups, so the live
     device set is *outputs the consumer still holds* plus at most two
@@ -776,18 +654,32 @@ def iter_subject_bold_gpu(session_paths,
     decode stream, so hold it until the kernels that read it have
     completed.
 
-    Parameters are as :func:`read_subject_bold_gpu`, including
-    ``raw_sessions``.
+    Parameters
+    ----------
+    session_paths : sequence of (lh_path, rh_path)
+        One ``.func.gii`` pair per session, in session order. Payloads
+        must be unwrapped single-line ``GZipBase64Binary``; a wrapped
+        one raises (run step 1 with ``backend_step1='cpu'``, whose
+        reader accepts it).
+    n_lh, n_rh : int
+        Expected per-hemi vertex counts, enforced against each file's
+        ``Dim0`` and against the decompressed byte count.
+    group_sessions : int or None, optional
+        Sessions per pipeline group; ``None`` = one group, no overlap.
+
+    Yields
+    ------
+    (int, cupy.ndarray)
+        Session index and its ``(T, n_lh + n_rh) fp32`` C-contig array,
+        lh in columns ``[0, n_lh)``, rh in ``[n_lh, n_lh + n_rh)``.
     """
     pairs = [(Path(a), Path(b)) for a, b in session_paths]
     if not pairs:
         return
 
-    dec_stream = stream if stream is not None else _default_stream()
     for idxs, arrays, evt, verify in _ingest_groups(
-            pairs, medial_mask_d=medial_mask_d, n_lh=n_lh, n_rh=n_rh,
-            prep_stream=_prep_stream(), dec_stream=dec_stream,
-            group_sessions=group_sessions, raw_sessions=raw_sessions):
+            pairs, n_lh=n_lh, n_rh=n_rh, prep_stream=_prep_stream(),
+            dec_stream=_dec_stream(), group_sessions=group_sessions):
         evt.synchronize()
         verify()
         for i, a in zip(idxs, arrays):

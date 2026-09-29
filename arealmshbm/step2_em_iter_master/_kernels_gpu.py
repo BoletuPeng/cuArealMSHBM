@@ -33,21 +33,20 @@ from __future__ import annotations
 
 import math
 import threading
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Optional, Tuple
 
+import cupy as cp
 import numpy as np
 
-try:  # pragma: no cover - exercised only on CPU-only hosts
-    import cupy as cp
-except Exception:  # pragma: no cover
-    cp = None  # type: ignore
+from arealmshbm.m_step._xdot_kernel import XDOT_SL_BITS_SRC
 
 
 # ─────────────────────────────────────────────────────────────────────
 # Launch geometry / compile-time limits
 # ─────────────────────────────────────────────────────────────────────
 XDOT_BLOCK = 256        # threads own BYTES of the packed row
-XDOT_MAX_NB = 1         # bytes per thread -> Db <= 256 (D <= 2048)
+XDOT_MAX_NB = 1         # bytes per thread -> check_dims caps Db at
+                        # XDOT_BLOCK * XDOT_MAX_NB = 256 (D <= 2048)
 XDOT_CHUNK = 64         # members per fp32->fp64 fold (fixes the K3 op order)
 FUSED_BLOCK = 256       # M-step block reduce over D
 REDUCE_BLOCK = 256
@@ -359,15 +358,12 @@ _SRC_INIT = r"""
 // accumulator stays a private serial ascending-d fp32 sum, which is what
 // makes every (INIT_WARPS, INIT_RR, DT) choice bit-identical.
 //
-// PERF (F3), two changes over the original one-warp-per-row form, both
-// bit-exact (measured on the S=1 bench: 22.7 ms -> 7.9 ms):
+// Two properties set the speed (7.9 ms on the S=1 bench):
 //  1. the ``at`` stage is BYTE-based -- one packed byte yields 8 d values,
-//     so the packed / row_mean / row_inv loads drop 8x (they used to be
-//     re-issued once per d, i.e. N*D*T = 577 M byte loads for 72 MB of data);
+//     so each packed / row_mean / row_inv load serves 8 d values;
 //  2. a warp carries INIT_RR rows in registers, so each ``g_DL`` load feeds
-//     INIT_RR fmaf instead of one.  With one row per warp the loop is
-//     1 load : 1 FMA and runs at ~1.3 TFLOP/s; INIT_RR = 4 makes it 1 : 4.
-//     INIT_RR = 8 spills ``acc[RR][INIT_MAXJ]`` and costs 30 ms.
+//     INIT_RR fmaf (INIT_RR = 4: 1 load : 4 FMA).  INIT_RR = 8 spills
+//     ``acc[RR][INIT_MAXJ]`` and costs 30 ms.
 // ``g_DL`` is read straight from global: it is 1.4 MB, L2-resident, and every
 // block sweeps it in the same order, so a shared-memory stage measured no
 // better (19.6 vs 19.9 ms at INIT_RR = 1) while capping DT.
@@ -554,147 +550,11 @@ void sigma_psi_SLD(const float* __restrict__ sigma_L,
 }
 
 // =====================================================================
-// K3 -- X_dot_sl[s,t,l,d] = sum_{n in members(l)} s_lambda[s,n,l]*X[s,n,t,d]
-// Port of step-3's ``x_dot_sl_bits`` with the subject axis added and the
-// member lists restricted to the ACTIVE CSC (design 2.3).
-// One block per (t, l); threads own BYTES of the packed row.
-//
-// PERF (F3): the step-3 original stages each member's packed row in shared
-// memory.  Here it does not pay: every thread of the block walks the SAME
-// member row at the same time, so ``__ldg(rp + tid)`` is already a fully
-// coalesced 147-byte read and the staging loop only adds a serial
-// ``for i < cnt`` global->smem copy plus a __syncthreads per chunk.  Dropping
-// it (and moving from 128 threads x 2 bytes to 256 threads x 1 byte, which
-// halves the per-thread accumulator arrays) is BIT-EXACT -- the per-``d``
-// fp32 accumulator still folds the same members in the same order, and the
-// fp32->fp64 fold still happens every ``chunk`` members.  Measured on the
-// real S=1 active support (73 693 members): 696 us -> 490 us.
-// ``XDOT_BLOCK`` must stay a power of two: ``block_reduce_f64``'s fixed tree
-// (used for ``B``) is only correct for one.
+// K3 -- X_dot_sl[t,l,d] of ONE subject over the ACTIVE CSC (design 1.3);
+// session_gpu launches it once per s. Text: m_step/_xdot_kernel.py,
+// instantiated here at XDOT_BLOCK x XDOT_MAX_NB = 256 threads x 1 byte.
 // =====================================================================
-#define XDOT_MAX_NB XDOT_MAX_NB_VALUE
-#define XDOT_BS     XDOT_BS_VALUE
-
-extern "C" __global__
-void x_dot_sl_bits(const unsigned char* __restrict__ packed,  // (T, N, Db)
-                   const float* __restrict__ row_mean,        // (T, N)
-                   const float* __restrict__ row_inv,         // (T, N)
-                   const int* __restrict__ col_ptr,           // (L+1,)
-                   const int* __restrict__ csc_row,           // (P,)
-                   const int* __restrict__ csc_pidx,          // (P,)
-                   const float* __restrict__ s_lambda_P,      // (P,)
-                   float* __restrict__ out,                   // (T, L, D)
-                   int N, int L, int D, int D_bytes, int chunk)
-{
-    extern __shared__ float sh_w[];          // (chunk,) w, then (chunk,) row id
-    int* sh_n = (int*)(sh_w + chunk);
-    __shared__ double sh_red[XDOT_BS];
-    __shared__ double sh_B;
-
-    const int tid = threadIdx.x;
-    const int bs = blockDim.x;
-    const int blk = blockIdx.x;
-    const int t = blk / L;
-    const int l = blk - t * L;
-
-    const int start = col_ptr[l];
-    const int end = col_ptr[l + 1];
-
-    const unsigned char* base_t =
-        packed + (size_t)t * (size_t)N * (size_t)D_bytes;
-    const float* rm_t = row_mean + (size_t)t * (size_t)N;
-    const float* ri_t = row_inv + (size_t)t * (size_t)N;
-    float* out_tl = out + ((size_t)t * (size_t)L + (size_t)l) * (size_t)D;
-
-    double bl = 0.0;
-    for (int i = start + tid; i < end; i += bs) {
-        const int n = csc_row[i];
-        const float w = s_lambda_P[csc_pidx[i]] * ri_t[n];
-        bl += (double)(w * rm_t[n]);
-    }
-    bl = block_reduce_f64(bl, sh_red);
-    if (tid == 0) sh_B = bl;
-    __syncthreads();
-    const double B = sh_B;
-
-    float a32[XDOT_MAX_NB * 8];
-    double acc[XDOT_MAX_NB * 8];
-    #pragma unroll
-    for (int k = 0; k < XDOT_MAX_NB * 8; ++k) acc[k] = 0.0;
-
-    for (int cs = start; cs < end; cs += chunk) {
-        const int cnt = (end - cs) < chunk ? (end - cs) : chunk;
-        __syncthreads();
-        for (int i = tid; i < cnt; i += bs) {
-            const int n = csc_row[cs + i];
-            sh_w[i] = s_lambda_P[csc_pidx[cs + i]] * ri_t[n];
-            sh_n[i] = n;
-        }
-        __syncthreads();
-
-        #pragma unroll
-        for (int k = 0; k < XDOT_MAX_NB * 8; ++k) a32[k] = 0.0f;
-
-        // 4-deep member prefetch: the four ``__ldg`` are issued before any of
-        // the dependent ``fmaf``, which is what hides the 1-byte load latency
-        // (measured 403 -> 284 us per launch on the real S=1 active support).
-        // The per-``d`` accumulator still folds members in ascending order,
-        // so this is bit-exact.
-        #pragma unroll
-        for (int j = 0; j < XDOT_MAX_NB; ++j) {
-            const int b = tid + j * XDOT_BS;
-            if (b < D_bytes) {
-                int i = 0;
-                for (; i + 4 <= cnt; i += 4) {
-                    const unsigned int v0 = (unsigned int)__ldg(
-                        base_t + (size_t)sh_n[i] * (size_t)D_bytes + b);
-                    const unsigned int v1 = (unsigned int)__ldg(
-                        base_t + (size_t)sh_n[i + 1] * (size_t)D_bytes + b);
-                    const unsigned int v2 = (unsigned int)__ldg(
-                        base_t + (size_t)sh_n[i + 2] * (size_t)D_bytes + b);
-                    const unsigned int v3 = (unsigned int)__ldg(
-                        base_t + (size_t)sh_n[i + 3] * (size_t)D_bytes + b);
-                    const float w0 = sh_w[i], w1 = sh_w[i + 1];
-                    const float w2 = sh_w[i + 2], w3 = sh_w[i + 3];
-                    #pragma unroll
-                    for (int k = 0; k < 8; ++k) {
-                        float a = a32[j * 8 + k];
-                        a = fmaf(w0, (float)((v0 >> k) & 1u), a);
-                        a = fmaf(w1, (float)((v1 >> k) & 1u), a);
-                        a = fmaf(w2, (float)((v2 >> k) & 1u), a);
-                        a = fmaf(w3, (float)((v3 >> k) & 1u), a);
-                        a32[j * 8 + k] = a;
-                    }
-                }
-                for (; i < cnt; ++i) {
-                    const float w = sh_w[i];
-                    const unsigned int bv = (unsigned int)__ldg(
-                        base_t + (size_t)sh_n[i] * (size_t)D_bytes + b);
-                    #pragma unroll
-                    for (int k = 0; k < 8; ++k) {
-                        const float bit = (float)((bv >> k) & 1u);
-                        a32[j * 8 + k] = fmaf(w, bit, a32[j * 8 + k]);
-                    }
-                }
-            }
-        }
-        #pragma unroll
-        for (int k = 0; k < XDOT_MAX_NB * 8; ++k) acc[k] += (double)a32[k];
-    }
-
-    #pragma unroll
-    for (int j = 0; j < XDOT_MAX_NB; ++j) {
-        const int b = tid + j * XDOT_BS;
-        if (b < D_bytes) {
-            #pragma unroll
-            for (int k = 0; k < 8; ++k) {
-                const int d = b * 8 + k;
-                if (d < D) out_tl[d] = (float)(acc[j * 8 + k] - B);
-            }
-        }
-    }
-}
-
+""" + XDOT_SL_BITS_SRC + r"""
 // =====================================================================
 // K4a -- fixed-grid fp64 stage-1 reductions.
 // =====================================================================
@@ -1563,13 +1423,10 @@ void cdln_L(const float* __restrict__ k_L, double* __restrict__ out_L, double v)
 // L17 flag latch + sigma relative drift.  ONE block, FLAG_BLOCK threads
 // (a power of two; L <= 512 and S is small).
 //
-// PERF (F3): this used to be a single thread walking S*L + 3*L dependent
-// global loads -- ~1 200 scalar ops, but 125 us per launch because every load
-// was a fresh ~500-cycle round trip with nothing to overlap it.  The counts
-// are integer (order-free) so they take a block reduction; ``rel_acc`` keeps
-// the CPU's serial ascending-l fp64 order on thread 0 but now reads
-// ``sigma_cur`` / ``sigma_new`` out of shared memory, staged coalesced by the
-// whole block.  Bit-exact.
+// The counts are integer (order-free) so they take a block reduction.
+// ``rel_acc`` keeps the CPU's serial ascending-l fp64 order on thread 0,
+// reading ``sigma_cur`` / ``sigma_new`` out of shared memory staged
+// coalesced by the whole block.  Bit-exact with the CPU.
 #define INTRA_FLAG_MAXL 512
 extern "C" __global__
 void intra_flags_rel(const float* __restrict__ cos_LS,
@@ -1811,8 +1668,6 @@ def module():
     cell = _MODULE_CELL                      # single read of the published pair
     if cell is not None and cell[0] == key:
         return cell[1]
-    if cp is None:  # pragma: no cover
-        raise RuntimeError("cupy is required for the step-2 gpu backend")
     with _MODULE_LOCK:
         cell = _MODULE_CELL
         if cell is not None and cell[0] == key:
@@ -1824,8 +1679,6 @@ def module():
                   .replace("INIT_WARPS_VALUE", str(INIT_WARPS))
                   .replace("INIT_RR_VALUE", str(INIT_RR))
                   .replace("INIT_MAXJ_VALUE", str(INIT_MAXJ)))
-        if not src.isascii():
-            raise RuntimeError("CUDA source must be ASCII")
         mod = cp.RawModule(code=src, options=("-std=c++17", "-fmad=false"),
                            backend="nvrtc")
         _MODULE_CELL = (key, mod)
@@ -1879,12 +1732,13 @@ def init_dt() -> int:
 
 def check_dims(D: int, Db: int, L: int, dim: int, D_grad: int) -> None:
     """Static limits of the backend (design §3 / §9)."""
-    if Db > 256:
+    max_db = XDOT_BLOCK * XDOT_MAX_NB     # bytes of a row the K3 block owns
+    if Db > max_db:
         raise ValueError(
-            f"backend='gpu' supports ceil(D/8) <= 256 (D <= 2048); got "
-            f"D={D} (Db={Db}). The profile length is the seed-mesh vertex "
-            f"count + 1, so this needs a seed mesh of at most fsaverage3 "
-            f"(D=1175). Use backend='cpu' for larger seeds."
+            f"backend='gpu' supports ceil(D/8) <= {max_db} (D <= {8 * max_db}); got "
+            f"D={D} (Db={Db}). D is the number of cortical seed vertices "
+            f"over both hemispheres, so this needs a seed mesh of at most "
+            f"fsaverage3 (D=1175). Use backend='cpu' for larger seeds."
         )
     if L > MAX_CLUSTERS:
         raise ValueError(

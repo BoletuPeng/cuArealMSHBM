@@ -1,12 +1,10 @@
 """test_subject_profiles_gpu.py
 
-The fused whole-subject GPU leaf against the per-session path it
-replaced.
+The fused whole-subject GPU leaf against the per-session algorithm.
 
-The oracle is ``_reference_packed`` -- the whole of that retired
-algorithm, transcribed here and now living nowhere else: the
-``inv_norm = +inf`` zscore RawKernel below (moved verbatim out of
-``_kernels_gpu`` when the per-session leaf was deleted), a per-hemi
+The oracle is ``_reference_packed`` -- the whole per-session algorithm,
+transcribed here and living nowhere else: the ``inv_norm = +inf``
+zscore RawKernel below, a per-hemi
 seed gather, two sgemms, ``cp.nan_to_num``, accumulate, ``* 1/n_runs``,
 ``cp.concatenate`` for the threshold, ``cp.partition`` for the cut,
 then the same binarize+MW-zero+pack kernel the production path uses.
@@ -24,7 +22,7 @@ What is pinned
    ``<= 0``, and a column carrying a genuine ``NaN`` / ``+-inf`` in the
    BOLD itself.
 3. The seed gather may be taken from the normalised array (the fused
-   path) or from the raw one (the legacy path) -- same bits.
+   path) or from the raw one (the oracle) -- same bits.
 4. Generator input, so ingest can overlap compute.
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
@@ -45,7 +43,7 @@ from arealmshbm.generate_profiles.profiles_subject_gpu import (  # noqa: E402
 
 
 # ─────────────────────────────────────────────────────────────────────
-# The retired zscore kernel, verbatim
+# Oracle zscore kernel
 # ─────────────────────────────────────────────────────────────────────
 # The production kernel is ``zscore_unit_norm_columns_zerovar_cupy``,
 # which writes an exact ``0.0f`` where this one wrote ``+inf``. The
@@ -66,7 +64,7 @@ void zscore_unit_norm_columns(const float* __restrict__ x,
     //
     // We recover the centered L2 norm via the identity
     //   post_sumsq = sumsq - T * mean * mean
-    // -- same trick as step3's normalize_bold kernel. This is the
+    // -- same trick as step3's row_stats kernel (m_step_gpu.py). This is the
     // catastrophic-cancellation-prone form: when |mean| is comparable
     // to sqrt(sumsq / T), the subtraction loses ULPs. Precondition:
     // inputs must arrive demeaned upstream (CBIG preprocessing emits
@@ -145,10 +143,10 @@ def zscore_unit_norm_columns_cupy(x_TxN: cp.ndarray,
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Oracle: the retired per-session leaf's algorithm, verbatim
+# Oracle: per-session reference algorithm
 # ─────────────────────────────────────────────────────────────────────
 def _reference_packed(sessions, seed_idx, mw, n_lh, threshold):
-    """``(n_sess, n_full, ceil(K/8)) uint8``, the legacy way."""
+    """``(n_sess, n_full, ceil(K/8)) uint8``, the per-session way."""
     n_full = int(mw.shape[0])
     K = int(seed_idx.shape[0])
     D_bytes = (K + 7) // 8
@@ -239,10 +237,10 @@ def test_matches_the_per_session_path(as_generator):
 
 def test_whole_subject_sgemm_matches_the_per_hemi_pair():
     """The fused leaf issues ONE (K, T) x (T, n_lh + n_rh) sgemm where the
-    per-session fallback issues two per-hemi ones. cuBLAS picks its
-    tiling / split-K from the shape, so the two reduction orders are
-    only equal as a fact about the production shape class — pin it
-    there (fsaverage3 seed, fsaverage6 target)."""
+    per-session oracle (``_reference_packed``) issues two per-hemi ones.
+    cuBLAS picks its tiling / split-K from the shape, so the two reduction
+    orders are only equal as a fact about the production shape class —
+    pin it there (fsaverage3 seed, fsaverage6 target)."""
     import cupy as cp
     K, T, n_lh = 1175, 242, 40962
     rng = cp.random.RandomState(0)
@@ -334,7 +332,7 @@ def _fp32_overflow_columns(a, rng):
                                      _fp32_overflow_columns])
 def test_dropping_nan_to_num_changes_nothing(mutate):
     """The fused path sets ``inv_norm = 0`` (and stores a literal zero)
-    where the legacy path sets ``+inf`` and sweeps the resulting
+    where the oracle sets ``+inf`` and sweeps the resulting
     non-finite corr rows/columns with ``cp.nan_to_num``. Same bits."""
     sessions, seed_idx, mw = _make(64, 48, 20, 2, seed=13, mutate=mutate)
     ref = _reference_packed(sessions, seed_idx, mw, 64, 0.1)
@@ -344,7 +342,7 @@ def test_dropping_nan_to_num_changes_nothing(mutate):
 
 def test_degenerate_seed_column_too():
     """A degenerate column that is also a SEED zeroes a whole corr ROW
-    on both paths (the legacy one through NaN, this one through 0)."""
+    on both paths (the oracle through NaN, this one through 0)."""
     def mutate(a, rng):
         a[:, 2] = 7.0                    # seed column (< 12) constant
         a[:, 64 + 1] = 0.0               # rh seed column all zero

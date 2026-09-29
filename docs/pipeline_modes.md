@@ -15,12 +15,12 @@ call graph.
 
 | Aspect | Mode A — HCP prior | Mode B — self-trained prior |
 |---|---|---|
-| Group prior source | Pre-trained, shipped (40 HCP subjects) | Estimated on your own dataset |
+| Group prior source | Pre-trained on 40 HCP subjects (CBIG's `Kong2022_ArealMSHBM/lib/group_priors/`), staged by the project creator | Estimated on your own dataset |
 | Steps run | step 0 + step 1 + step 3 | step 0 + step 1 + step 2 + step 3 |
-| Step 2 (group EM) | skipped | required (heavy coupled EM, ~hours) |
+| Step 2 (group EM) | skipped | required (heavy coupled EM; 40 subjects: ~16 s `gpu` / ~49 min `cpu`) |
 | Subject coupling | none — each subject independent | all subjects coupled in step 2 |
 | Parallelization | trivial per-subject parallel | step 2 is one global EM; only step 3 is per-subject |
-| Wall time per subject | ~17 min (measured, see profiling) | ~hours (step 2 once) + ~17 min/subject |
+| Wall time per subject | ~6 s `gpu` / ~61 s `cpu` (measured, see [README § Benchmarks](../README.md#benchmarks)) | step 2 once + steps 0, 1, 3 per subject (40 subjects end to end: ~1.2 min `gpu`) |
 | Use case | routine personalization, deployment | new dataset where HCP normative doesn't generalize |
 | `pipeline_config.json:mode` | `modeA_single` (K=1) / `modeA_batch` (K≥1) | `modeB_train_prior` (K≥2) |
 
@@ -35,7 +35,7 @@ input: BOLD time series for one subject, N sessions
           → diffusion embedding (gradients/sub<S>/{lh,rh}_emb_100_distance_matrix.npy)
         ↓
 [step 1]  arealmshbm.pipeline.step1_runners.run_generate_profiles  (×N sessions)
-          → RSFC profile (correlation with fsaverage3 seeds, packed (N, T, ⌈D/8⌉) per subject)
+          → RSFC profile (correlation with fsaverage3 seeds, packed (sessions, vertices, ⌈D/8⌉) per subject)
         ↓
 [prior]   group prior must already sit at
           project_dir/priors/gMSHBM/beta<X>/Params_Final.mat
@@ -82,7 +82,7 @@ A `Params_Final.mat` contains a `Params` struct with fields:
 | `epsil` | 1 × L | Inter-subject vMF concentration |
 | `sigma` | 1 × L | Intra-subject vMF concentration |
 | `kappa` | 1 × L | Inter-region vMF concentration |
-| `s_psi`, `s_t_nu`, `s_lambda` | (training-only state) | Empty in the shipped HCP prior |
+| `s_psi`, `s_t_nu`, `s_lambda` | (training-only state) | Empty in CBIG's HCP priors |
 
 For fsaverage6 with 100 ROIs: `mu = 1175×100`, `theta = 81924×100`. D
 depends on the seed mesh (fsaverage3 cortex vertex count); N = 2 hemis
@@ -110,12 +110,13 @@ Sources a creator can copy from (toolkits, never read at run time):
 
 | Source | What | Coverage |
 |---|---|---|
-| `arealmshbm/data/group_priors/HCP_{fsaverage6,fs_LR_32k}_40sub/100/...` | Shipped in this fork | K=100 example only |
+| `arealmshbm/data/group_priors/HCP_{fsaverage6,fs_LR_32k}_40sub/<K>/...` | optional local staging of CBIG's priors — not shipped here (see `arealmshbm/data/README.md`) | whatever was staged |
 | `$CBIG_CODE_DIR/.../Kong2022_ArealMSHBM/lib/group_priors/` | CBIG checkout (creator-side; not read at runtime) | full K=100…1000 |
 | another project's `priors/<variant>/beta<X>/Params_Final.mat` | a prior `modeB_train_prior` run | whatever it trained |
 
 `cp` the chosen `Params_Final.mat` into the project slot above before
-running Mode A (and stage the matching spatial mask similarly).
+running Mode A. The spatial mask needs no staging: step 1 writes it to
+`<project>/spatial_mask/spatial_mask_<mesh>.mat`.
 
 ## Decision matrix
 

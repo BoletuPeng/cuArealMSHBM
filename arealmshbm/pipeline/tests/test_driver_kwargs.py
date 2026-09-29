@@ -40,7 +40,6 @@ from __future__ import annotations
 
 import ast
 import inspect
-from pathlib import Path
 from typing import Iterable
 
 from arealmshbm.pipeline import driver as driver_module
@@ -153,3 +152,7 @@ def test_driver_run_radius_mask_kwargs_valid() -> None:
 
 def test_driver_resolve_group_labels_kwargs_valid() -> None:
     _check_runner_kwargs("resolve_group_labels")
+
+
+def test_driver_make_avg_accumulator_kwargs_valid() -> None:
+    _check_runner_kwargs("make_avg_accumulator")

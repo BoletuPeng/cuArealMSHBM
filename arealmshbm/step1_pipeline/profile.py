@@ -45,6 +45,7 @@ if str(_REPO) not in sys.path:
 from arealmshbm.pipeline.step1_runners import (
     bold_pairs_for_prewarm,
     join_step1_writers,
+    make_avg_accumulator,
     prewarm_step1_gpu,
     resolve_group_labels,
     run_avg_profiles,
@@ -61,8 +62,7 @@ _STAGES = ("generate_profiles", "avg_profiles", "ini_params",
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Local helpers (inlined from the now-retired step1 validate.py when the
-# pipeline decoupled from MATLAB — profile.py was the only consumer).
+# Local helpers.
 # ─────────────────────────────────────────────────────────────────────
 def _release_cupy_pool(*, pinned: bool = False) -> None:
     """Free the cupy device memory pool (and, on request, the pinned
@@ -138,7 +138,12 @@ def _run_once(out: Path, args) -> Dict[str, float]:
 
     t_total = time.perf_counter()
 
-    packed_sink: Optional[Dict] = {} if (is_gpu and run_avg) else None
+    # The avg sums are built on device while the leaf packs, so the
+    # accumulator only exists when both subgraphs run this call.
+    avg_acc = (make_avg_accumulator(targ_mesh=args.targ_mesh,
+                                    seed_mesh=args.seed_mesh,
+                                    num_sess=len(args.sessions))
+               if (is_gpu and run_avg and run_gen) else None)
     write_handles: Optional[list] = [] if is_gpu else None
     if run_gen:
         t = time.perf_counter()
@@ -150,7 +155,7 @@ def _run_once(out: Path, args) -> Dict[str, float]:
             targ_mesh=args.targ_mesh,
             backend=args.backend,
             verbose=False,
-            packed_sink=packed_sink,
+            avg_accumulator=avg_acc,
             write_handles=write_handles,
         )
         timings["generate_profiles"] = time.perf_counter() - t
@@ -165,12 +170,10 @@ def _run_once(out: Path, args) -> Dict[str, float]:
     try:
         if run_avg:
             t = time.perf_counter()
+            # The disk flow discovers ids 1..num_sub (missing ones are
+            # skipped); the accumulator flow averages exactly the
+            # subjects just packed and does not read num_sub.
             num_sub = max(int(s) for s in args.subjects)
-            if packed_sink:
-                packed_subjects = [packed_sink[str(s)][0] for s in args.subjects]
-                D = packed_sink[str(args.subjects[0])][1]
-            else:
-                packed_subjects, D = None, None
             avg_res = run_avg_profiles(
                 project_dir=out,
                 num_sub=num_sub,
@@ -179,8 +182,7 @@ def _run_once(out: Path, args) -> Dict[str, float]:
                 targ_mesh=args.targ_mesh,
                 backend=args.backend,
                 verbose=False,
-                packed_subjects=packed_subjects,
-                D=D,
+                accumulator=avg_acc,
             )
             timings["avg_profiles"] = time.perf_counter() - t
 
@@ -227,7 +229,7 @@ def _run_once(out: Path, args) -> Dict[str, float]:
                 pass                   # the failure being propagated
 
     timings["__wall__"] = time.perf_counter() - t_total
-    del avg_res, ini_res, packed_sink, write_handles
+    del avg_res, ini_res, avg_acc, write_handles
     if is_gpu:
         _release_cupy_pool()
     return timings

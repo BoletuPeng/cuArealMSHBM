@@ -1,6 +1,7 @@
 # Step-2 EM-iter master kernel
 
-The step-2 EM-iter loop body is one numba nopython master kernel:
+The step-2 EM-iter loop body (`backend_step2='cpu'`) is one master
+function, a Python orchestrator over numba `@njit` sub-kernels:
 `arealmshbm.step2_em_iter_master.em_iter_master_kernel_streaming`.
 One call executes one outer EM iter — Phase A (precompute `X_dot_sl`)
 → Phase B (M-step inner while-loop) → Phase C (per-subject
@@ -25,11 +26,17 @@ This document covers:
 
 The kernel ASSUMES every tensor is C-contig fp32 (or fp64 where noted)
 in the unified `(S, T, L, D)` family. Callers MUST repack at the
-boundary if they hold a different layout — `Step2EmIterSession` handles
-this once at construction (BOLD, gradients, `s_psi`) and once per
-`run_iter` call (`s_t_nu`, `s_lambda`, `theta`, `kappa`).
+boundary if they hold a different layout — BOLD and gradients come
+from `Step2EmIterSession`'s per-subject loaders, which decode one
+subject into an internal-layout scratch slot at every subject visit
+of each `run_iter` call. `s_psi`, `s_t_nu`, `s_lambda` and `theta` must
+already be in internal layout: the Session stages `s_psi` / `sigma` at
+construction and re-stages them in `refresh_s_psi_sigma` (once per
+intra-EM iteration), and copies `s_t_nu` / `s_lambda` / `theta` once in
+`upload_initial_state`, which aliases them back into `Params`. `kappa`
+is read as a scalar and written back on each `run_iter` call.
 
-| Tensor          | External (legacy CBIG shape)     | Internal (this kernel)        | Notes                                    |
+| Tensor          | External (CBIG MATLAB shape)     | Internal (this kernel)        | Notes                                    |
 |-----------------|----------------------------------|-------------------------------|------------------------------------------|
 | BOLD            | `(N, D, T)` per subject (list)   | `(N, T, D)` fp32 C-contig per subject | NTD, streamed one subject at a time into a re-used scratch slot — there is no `(S, …)` BOLD array |
 | gradient        | `(N, D_grad, T)` per subject     | `(T, N, D_grad)` fp32 per subject | gMSHBM only; same per-subject streaming  |
@@ -103,31 +110,33 @@ correctness within the 1e-4 EM-convergence bar.
 
 Four sites must stay fp64 (kappa_sum, denom, softmax exp,
 row-normalise); the other five are fp32-safe. The CPU master is memory-bound, so fp32
-SIMD doesn't accelerate it — the policy is shaped to be GPU-port-ready
-(RTX 5090 has a 1:64 fp64:fp32 throughput ratio, so the policy directly
-sizes the cost of a future GPU port).
+SIMD doesn't accelerate it — the policy matters on a GPU (RTX 5090 has
+a 1:64 fp64:fp32 throughput ratio). `backend='gpu'` (below) keeps all
+four fp64 sites and also runs the M-step col-norm and cosine in fp64
+(`docs/step2_sparse_design.md` §1).
 
 ### What the GPU backend does with this contract
 
 **`backend='gpu'`** (the P-layout backend,
-`step2_em_iter_master/_kernels_gpu.py` + `session_gpu.py`) restores the
+`step2_em_iter_master/_kernels_gpu.py` + `session_gpu.py`) keeps the
 CPU semantics on device: fp64 `exp` with an fp64 `scr`, fp64
 row-normalise, and subnormal-aware fp32 stores that work around CuPy's
 forced `-ftz=true` (`f32_rn` / `f32_to_f64` helpers). Its numerics
 contract — which sites are bit-exact, which are merely reassociated, and
-the full deviation list — is `docs/step2_sparse_design.md` §1 and §9.
+the full deviation list — is `docs/step2_sparse_design.md` §1 and §8.
 CuPy's parallel-tree reductions differ from numba's serial accumulators
 at ULP level; bit equality across backends is NOT a goal (measured: 0
 `theta` argmax flips vs the CPU at S=1 and S=2, 2 at S=10).
 
-The dense CuPy port that held `backend='gpu'` until 2026-09 ran the
-Phase-D softmax `exp` and the Phase-E row-normalise in fp32 (CuPy's
+Why the softmax `exp` and row-normalise stay fp64 (measured 2026-09-03
+on a dense CuPy port that ran both in fp32; CuPy's
 `-ftz=true` puts the `exp` cliff at −87.3 where fp64 reaches −745): on
 the S=1 bench it killed 5 528 alive vertices vs 1 303 on the CPU, moved
-cost −5 % and `kappa` 954 vs 922, flipped 4 744 `theta` argmaxes, and its
-widen kernel carried a nondeterministic `atomicAdd`. It was removed in
-favour of the P-layout backend; configurations outside that backend's
-static limits (a seed mesh above fsaverage3, L > 512) run on `cpu`.
+cost −5 % and `kappa` 954 vs 922, and flipped 4 744 `theta` argmaxes.
+The `gpu` backend's static limits (seed mesh fsaverage3, L ≤ 512,
+n_grad_components ≤ 11772) are its contract: any other configuration
+is rejected at config / driver validation — select `backend_step2='cpu'`
+for it.
 
 ### Two constants worth stating exactly
 

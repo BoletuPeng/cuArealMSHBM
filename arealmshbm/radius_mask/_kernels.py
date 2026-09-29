@@ -1,11 +1,7 @@
 """_kernels.py
 
 Numba kernels for the radius_mask supercall. All compute lives here.
-Six kernels — each appears exactly once.
-
-    _hp_push / _hp_pop
-        Binary min-heap on parallel arrays (fp32 keys = distance,
-        int32 values = vertex idx). Inlined into the Dijkstra kernels.
+Five kernels — each appears exactly once.
 
     build_parcel_csr_kernel(labels, L) -> (offs, inds)
         Group vertex ids by parcel label. CSR layout consumed by the
@@ -36,7 +32,8 @@ Six kernels — each appears exactly once.
 Layout / precision:
     * Edge weights, Dijkstra distances, vertex coords post-MARS — fp32.
     * Per-parcel mean accumulator (avg_dis) — fp64.
-    * Heap sized to E = indptr[V] (upper bound on lazy-deletion pushes).
+    * Dijkstra frontier: the indexed min-heap of
+      ``graph_distance._heap`` (decrease-key), (T, V) per thread.
     * Per-thread scratch (heap, dist, touched, accum) preallocated
       inside each kernel.
 
@@ -48,49 +45,9 @@ import numpy as np
 import numba
 from numba import njit, prange
 
-
-# ─────────────────────────────────────────────────────────────────────
-# Binary min-heap (parallel arrays)
-# ─────────────────────────────────────────────────────────────────────
-
-@njit(cache=True, inline="always")
-def _hp_push(keys, vals, n, key, val):
-    keys[n] = key
-    vals[n] = val
-    i = n
-    while i > 0:
-        p = (i - 1) >> 1
-        if keys[p] > keys[i]:
-            tk = keys[p]; keys[p] = keys[i]; keys[i] = tk
-            tv = vals[p]; vals[p] = vals[i]; vals[i] = tv
-            i = p
-        else:
-            break
-    return n + 1
-
-
-@njit(cache=True, inline="always")
-def _hp_pop(keys, vals, n):
-    rk = keys[0]
-    rv = vals[0]
-    n -= 1
-    keys[0] = keys[n]
-    vals[0] = vals[n]
-    i = 0
-    while True:
-        l = 2 * i + 1
-        r = l + 1
-        s = i
-        if l < n and keys[l] < keys[s]:
-            s = l
-        if r < n and keys[r] < keys[s]:
-            s = r
-        if s == i:
-            break
-        tk = keys[i]; keys[i] = keys[s]; keys[s] = tk
-        tv = vals[i]; vals[i] = vals[s]; vals[s] = tv
-        i = s
-    return rk, rv, n
+from arealmshbm.graph_distance._heap import (
+    _heap_decrease, _heap_pop, _heap_push,
+)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -144,6 +101,7 @@ def add_spatial_constraint_kernel(
     L,
     radius,
     out_mask,
+    n_threads,
 ):
     """Per-parcel boundary mask via bounded multi-source Dijkstra.
 
@@ -158,23 +116,26 @@ def add_spatial_constraint_kernel(
         parcel_offs, parcel_inds   : parcel→verts CSR.
         L, radius                  : int / fp32 (mm).
         out_mask                   : (V, L) uint8 — pre-zeroed, written.
+        n_threads                  : ``numba.get_num_threads()`` at the
+                                     call site; sizes the per-thread scratch.
     """
     V = labels.shape[0]
-    E = indptr[V]
-    T = numba.get_num_threads()
+    T = n_threads
     radius_f = np.float32(radius)
 
     dist_T = np.full((T, V), np.float32(1e30), dtype=np.float32)
-    hk_T = np.empty((T, E), dtype=np.float32)
-    hv_T = np.empty((T, E), dtype=np.int32)
+    hn_T = np.empty((T, V), dtype=np.int32)
+    hk_T = np.empty((T, V), dtype=np.float32)
+    hp_T = np.full((T, V), -1, dtype=np.int32)
     touched_T = np.empty((T, V), dtype=np.int32)
 
     for l_idx in prange(L):
         tid = numba.get_thread_id()
         l = l_idx + 1
         dist = dist_T[tid]
+        hn = hn_T[tid]
         hk = hk_T[tid]
-        hv = hv_T[tid]
+        hp = hp_T[tid]
         touched = touched_T[tid]
         n_touched = 0
         n_heap = 0
@@ -198,15 +159,14 @@ def add_spatial_constraint_kernel(
                     touched[n_touched] = v
                     n_touched += 1
                 dist[v] = np.float32(0.0)
-                n_heap = _hp_push(hk, hv, n_heap,
-                                   np.float32(0.0), np.int32(v))
+                n_heap = _heap_push(hn, hk, hp, n_heap,
+                                    np.int32(v), np.float32(0.0))
 
         # Bounded Dijkstra
         while n_heap > 0:
-            d, v_i32, n_heap = _hp_pop(hk, hv, n_heap)
-            v = v_i32
-            if d > dist[v]:
-                continue
+            v = hn[0]
+            d = hk[0]
+            n_heap = _heap_pop(hn, hk, hp, n_heap)
             out_mask[v, l_idx] = 1
             for k_e in range(indptr[v], indptr[v + 1]):
                 u = indices[k_e]
@@ -217,7 +177,12 @@ def add_spatial_constraint_kernel(
                         touched[n_touched] = u
                         n_touched += 1
                     dist[u] = nd
-                    n_heap = _hp_push(hk, hv, n_heap, nd, np.int32(u))
+                    pos = hp[u]
+                    if pos >= 0:
+                        _heap_decrease(hn, hk, hp, pos, nd)
+                    else:
+                        n_heap = _heap_push(hn, hk, hp, n_heap,
+                                            np.int32(u), nd)
 
         # Reset only touched entries (cheaper than V-wide fill for small parcels).
         for k in range(n_touched):
@@ -340,6 +305,7 @@ def central_sulcus_kernel(
     relevant_parcels,
     relevant_verts,
     out_avg,
+    n_threads,
 ):
     """Per-parcel mean geodesic distance to {pre, post}-central verts.
 
@@ -361,10 +327,11 @@ def central_sulcus_kernel(
         L                          : int.
         relevant_parcels, relevant_verts : from classify_central_relevance_kernel.
         out_avg                    : (2, L) fp64 — row 0 = pre, row 1 = post.
+        n_threads                  : ``numba.get_num_threads()`` at the
+                                     call site; sizes the per-thread scratch.
     """
     V = indptr.shape[0] - 1
-    E = indptr[V]
-    T = numba.get_num_threads()
+    T = n_threads
     Npre = pre_verts.shape[0]
     Npost = post_verts.shape[0]
     Nsrc = Npre + Npost
@@ -375,8 +342,9 @@ def central_sulcus_kernel(
             n_relevant_total += 1
 
     dist_T = np.full((T, V), np.float32(1e30), dtype=np.float32)
-    hk_T = np.empty((T, E), dtype=np.float32)
-    hv_T = np.empty((T, E), dtype=np.int32)
+    hn_T = np.empty((T, V), dtype=np.int32)
+    hk_T = np.empty((T, V), dtype=np.float32)
+    hp_T = np.full((T, V), -1, dtype=np.int32)
     touched_T = np.empty((T, V), dtype=np.int32)
     accum_pre_T = np.zeros((T, V), dtype=np.float64)
     accum_post_T = np.zeros((T, V), dtype=np.float64)
@@ -391,22 +359,22 @@ def central_sulcus_kernel(
             is_pre = False
 
         dist = dist_T[tid]
+        hn = hn_T[tid]
         hk = hk_T[tid]
-        hv = hv_T[tid]
+        hp = hp_T[tid]
         touched = touched_T[tid]
         n_touched = 0
 
         dist[src] = np.float32(0.0)
         touched[n_touched] = src
         n_touched += 1
-        n_heap = _hp_push(hk, hv, 0, np.float32(0.0), np.int32(src))
+        n_heap = _heap_push(hn, hk, hp, 0, np.int32(src), np.float32(0.0))
         n_relevant_settled = 0
 
         while n_heap > 0:
-            d, v_i32, n_heap = _hp_pop(hk, hv, n_heap)
-            v = v_i32
-            if d > dist[v]:
-                continue
+            v = hn[0]
+            d = hk[0]
+            n_heap = _heap_pop(hn, hk, hp, n_heap)
             if relevant_verts[v] == 1:
                 n_relevant_settled += 1
                 if is_pre:
@@ -424,7 +392,17 @@ def central_sulcus_kernel(
                         touched[n_touched] = u
                         n_touched += 1
                     dist[u] = nd
-                    n_heap = _hp_push(hk, hv, n_heap, nd, np.int32(u))
+                    pos = hp[u]
+                    if pos >= 0:
+                        _heap_decrease(hn, hk, hp, pos, nd)
+                    else:
+                        n_heap = _heap_push(hn, hk, hp, n_heap,
+                                            np.int32(u), nd)
+
+        # The early break leaves entries in the heap: clear their
+        # back-references for the thread's next source.
+        for k in range(n_heap):
+            hp[hn[k]] = -1
 
         # Reset only the touched verts (O(touched), not O(V)).
         for k in range(n_touched):

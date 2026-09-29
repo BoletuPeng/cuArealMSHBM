@@ -53,7 +53,7 @@ def _fake_inputs() -> SimpleNamespace:
         layout=SimpleNamespace(P=N * 2, L=L, N=N, n_lh=N // 2),
         S=S, T=T, N=N, D=D, D_grad=3, n_lh=N // 2, n_rh=N // 2,
         mtc=np.zeros((D, L), dtype=np.float64), dim=D - 1,
-        bold_reader=None, packed_host=None, grad_reader=None,
+        bold_reader=None, grad_reader=None,
         timings={"cohort": 0.001, "profiles": 0.002},
     )
 
@@ -146,7 +146,8 @@ class Recorder:
 
 @pytest.fixture
 def sparse_env(monkeypatch, tmp_path):
-    """Patch the two lazy imports the sparse path makes + the writer."""
+    """Patch what the sparse path imports lazily (the loader, the
+    Session, the kernel warm-up) + the writer."""
     sess_holder: Dict[str, FakeSession] = {}
     inputs = _fake_inputs()
 
@@ -160,8 +161,11 @@ def sparse_env(monkeypatch, tmp_path):
 
     monkeypatch.setattr(_sio, "load_step2_sparse_inputs", _loader,
                         raising=False)
-    monkeypatch.setattr(_eim, "Step2SparseSession", _session_factory,
-                        raising=False)
+    # ``setitem`` on the module dict: ``setattr`` reads the old value
+    # first, through the package's lazy ``__getattr__``, which imports
+    # the GPU module and cupy with it.
+    monkeypatch.setitem(vars(_eim), "Step2SparseSession", _session_factory)
+    monkeypatch.setitem(vars(_eim), "warmup_step2_gpu", lambda: None)
     rec = Recorder()
     monkeypatch.setattr(Step2Pipeline, "_save_params", rec.hook(),
                         raising=True)
@@ -520,9 +524,8 @@ def test_sparse_timing_keys(sparse_env, tmp_path) -> None:
 def test_session_timings_are_forwarded_verbatim(sparse_env, tmp_path) -> None:
     """No unit conversion in the forwarding — the Session normalises.
 
-    ``kernel.<name>`` entries used to be scaled by 1e-3 here on the
-    assumption they were milliseconds; the Session now emits seconds for
-    every key, so any scale in the pipeline would corrupt them.
+    The Session emits seconds for every key; the pipeline forwards them
+    unscaled.
     """
     pipe = Step2Pipeline(_cfg(tmp_path))
     res = pipe.run()

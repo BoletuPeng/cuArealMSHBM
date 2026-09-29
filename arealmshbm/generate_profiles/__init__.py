@@ -29,11 +29,10 @@ Public API:
           Ingest of session g+1 overlaps the compute of session g, all
           sessions share one device packed buffer, and the subject
           leaves the GPU in a single pinned D2H; the .b2nd write runs
-          on a background thread. Ingest is nvCOMP-batched when
-          ``nvidia-nvcomp-cu12`` is installed and the CPU GIFTI reader
-          otherwise — same bytes either way, so the compute and the
-          artifacts are identical. Import it directly: the package
-          ``__init__`` must stay cupy-free for the CPU path.
+          on a background thread. Ingest is batched nvCOMP
+          (``nvidia-nvcomp-cu12`` is required; no CPU-reader fallback).
+          Import it directly: the package ``__init__`` must stay
+          cupy-free for the CPU path.
 
 Reads:
     <out_dir>/data_list/fMRI_list/{lh,rh}_sub<sub>_sess<sess>.txt

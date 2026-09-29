@@ -15,8 +15,7 @@ parcellations.
 
 This doc captures the framework + reference case study from the
 2026-05-21 session, where we evaluated enabling TF32 + fp32 softmax on
-step2's then-GPU master kernel (the dense CuPy port, since retired — see
-the status note on the case study).
+step2's GPU master kernel of that date (a dense CuPy port).
 
 ## Why the four layers exist
 
@@ -62,14 +61,10 @@ canonical readout.
 
 ## Case study — TF32 + fp32 softmax on step2 only
 
-> **Status (2026-09-09):** the code this case study measured — step 2's
-> dense CuPy port (fp32 softmax) and the step-2 TF32 scope with its
-> `step2.enable_tf32` knob — was removed; `backend_step2='gpu'` is now the
-> P-layout session (fp64 softmax, no TF32 path;
-> [`step2_sparse_design.md`](step2_sparse_design.md)). The case study stays
-> as the worked example of the four-layer method. The re-run recipe at the
-> end no longer applies to step 2: `NVIDIA_TF32_OVERRIDE=1` would only
-> touch step 0's sgemms.
+> Measured 2026-05-21 on step 2's dense CuPy port of that date (fp32
+> softmax + TF32); kept as the worked example of the four-layer method.
+> The current step-2 `gpu` backend is fp64-softmax with no TF32 scope
+> ([`step2_sparse_design.md`](step2_sparse_design.md)).
 
 ### Setup
 
@@ -77,7 +72,7 @@ canonical readout.
   L=300 clusters, gMSHBM, β=5)
 * Pipeline step2 (Mode B group prior training) GPU backend
 * Compare two configurations:
-  * **OLD (NoTF32)**: current code (fp32 softmax committed) with no
+  * **OLD (NoTF32)**: the code of that date (fp32 softmax committed) with no
     `NVIDIA_TF32_OVERRIDE`
   * **NEW (TF32)**: same code, plus `NVIDIA_TF32_OVERRIDE=1` ⇒ cuBLAS
     sgemms use TF32 tensor cores
@@ -173,15 +168,17 @@ TF32 is **functionally safe** and **mathematically equivalent** under
 the L4 quality metric. The vertex-level disagreement is "edge of
 parcel" precision noise — the underlying atlas quality is preserved.
 
-The fp32 softmax change (now the shipped default) shows the same
+The fp32 softmax change (the default of that 2026-05 dense port) shows the same
 pattern: cost rel-diff 2e-4, no parcel relocated, atlas quality
 unchanged.
 
 ## Reproducibility
 
-Re-running the case study was two commands on the retired code (step2
-took ~3.5 min; step3 × 40 subs ~2 min) — kept for the record, see the
-status note:
+Re-running the case study was two commands on the 2026-05-21 code
+(step2 took ~3.5 min; step3 × 40 subs ~2 min), kept for the record. On
+the current tree the step-2 `gpu` backend has neither the fp32 softmax
+nor a TF32 scope (see the note at the top of the case study), so these
+commands record how the numbers were made rather than reproduce them:
 
 ```bash
 # OLD baseline — step2 + step3 (Mode-B project run, no TF32)

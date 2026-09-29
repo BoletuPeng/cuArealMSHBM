@@ -1,12 +1,12 @@
 """sparse_inputs.py
 
-Fast, sparse-aware input path for the step-3 ``gpu_sparse`` backend.
+Fast, sparse-aware input path for the step-3 ``gpu`` backend.
 
 The dense loader (:meth:`arealmshbm.step3_pipeline.pipeline.Step3Pipeline.load_inputs`)
 materialises three (N, L) fp32/fp64 arrays — θ (98 MB), the boundary
 mask (197 MB fp64) and ``spatial_xyz_vmf`` — of which ~1 % is nonzero,
 plus a (T, N, D_b) → (N, T, D_b) host transpose of the packed BOLD.
-``gpu_sparse`` wants none of that: it consumes a
+The ``gpu`` backend wants none of that: it consumes a
 :class:`~arealmshbm.vmf_clustering.sparse_layout.CandidateLayout` over
 the ``P = nnz(θ)`` candidate cells and the on-disk ``(T, N, D_b)``
 packed BOLD.
@@ -23,9 +23,9 @@ numbers, without ever forming an (N, L) array:
                                 dense→CSR for anything it does not handle
                                 (v7.3, uncompressed, unexpected classes).
     load_spatial_mask_csr       spatial_mask_<mesh>.mat → two csr_matrix.
-    build_candidate_layout_fast CSR θ + CSR masks → CandidateLayout,
-                                equal (``layouts_equal``) to
-                                ``build_candidate_layout_dense``.
+    build_candidate_layout_fast CSR θ + CSR masks → CandidateLayout
+                                (equality with the dense reference builder
+                                is pinned by the tests).
     fetch_packed_bold_TND       cohort discovery → (T, N, D_b) uint8 as
                                 stored (RAW: MW rows not zeroed), plus
                                 the MW row index lists.
@@ -406,73 +406,28 @@ def load_group_prior_csr(prior_path: str | Path) -> Dict[str, Any]:
     }
 
 
-def theta_csr_to_dense(theta_csr, N: int, L: int) -> np.ndarray:
-    """Densify a ``theta_csr`` triple — tests / debugging only."""
-    row_ptr, col, val = theta_csr
-    out = np.zeros((N, L), dtype=np.float32)
-    rows = np.repeat(np.arange(N, dtype=np.int64), np.diff(row_ptr))
-    out[rows, col] = val
-    return out
-
-
 # ─────────────────────────────────────────────────────────────────────
 # 2. spatial mask → CSR
 # ─────────────────────────────────────────────────────────────────────
 def load_spatial_mask_csr(mask_path: str | Path):
     """Read ``spatial_mask_<mesh>.mat`` as two fp64 ``csr_matrix``.
 
-    Same values as :func:`data_io.load_spatial_mask`, never densified.
-    Explicit stored zeros are dropped so ``nonzero`` support matches the
-    dense loader's ``mask != 0``.
+    Same reader as step 2 (:func:`arealmshbm.data_io.mat5_stream.read_sparse`,
+    MATLAB sparse straight from ``ir``/``jc``/``pr``), never densified.
+    Same values as :func:`data_io.load_spatial_mask`. Explicit stored
+    zeros are dropped so ``nonzero`` support matches the dense loader's
+    ``mask != 0``.
     """
-    import scipy.sparse as sp
+    from arealmshbm.data_io import mat5_stream
 
-    p = Path(mask_path)
-    if not p.exists():
-        raise FileNotFoundError(f"spatial mask not found: {p}")
-
-    def _to_csr(x):
-        if sp.issparse(x):
-            m = x.tocsr()
-        else:
-            m = sp.csr_matrix(np.asarray(x, dtype=np.float64))
-        m = m.astype(np.float64)
+    def _to_csr(m):
+        m = m.tocsr().astype(np.float64)
         m.eliminate_zeros()
         m.sort_indices()
         return m
 
-    try:
-        from scipy.io import loadmat
-        m = loadmat(p, squeeze_me=False)
-    except (NotImplementedError, ValueError):
-        import h5py
-        with h5py.File(p, "r") as f:
-            return (_to_csr(_read_v73_boundary_sparse(f, "lh_boundary")),
-                    _to_csr(_read_v73_boundary_sparse(f, "rh_boundary")))
-
-    return _to_csr(m["lh_boundary"]), _to_csr(m["rh_boundary"])
-
-
-def _read_v73_boundary_sparse(f, key: str):
-    """v7.3 branch of :func:`data_io.load_spatial_mask._read_v73_boundary`,
-    stopping at the sparse matrix instead of densifying."""
-    import h5py
-    import scipy.sparse as sp
-
-    obj = f[key]
-    if isinstance(obj, h5py.Group):
-        data = np.asarray(obj["data"]).ravel()
-        indices = np.asarray(obj["ir"]).ravel()
-        indptr = np.asarray(obj["jc"]).ravel()
-        n_rows_attr = obj.attrs.get("MATLAB_sparse")
-        if n_rows_attr is None:
-            raise ValueError(
-                f"v7.3 sparse {key!r}: missing MATLAB_sparse attribute")
-        n_rows = int(np.asarray(n_rows_attr).ravel()[0])
-        n_cols = int(indptr.shape[0]) - 1
-        return sp.csc_matrix((data, indices, indptr), shape=(n_rows, n_cols))
-    return sp.csr_matrix(np.ascontiguousarray(np.asarray(obj).T,
-                                              dtype=np.float64))
+    return (_to_csr(mat5_stream.read_sparse(mask_path, "lh_boundary")),
+            _to_csr(mat5_stream.read_sparse(mask_path, "rh_boundary")))
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -515,8 +470,8 @@ def build_candidate_layout_fast(theta_csr,
                                 ) -> CandidateLayout:
     """Build a :class:`CandidateLayout` from CSR θ + per-hemi CSR masks.
 
-    Equal (``layouts_equal``) to
-    ``build_candidate_layout_dense(theta_dense, boundary_mask_dense, ...)``.
+    Equal to the dense reference builder in
+    ``vmf_clustering/tests/_layout_oracle.py`` (pinned by the tests).
     """
     row_ptr_full, col_full, val_full = theta_csr
     row_ptr_full = np.asarray(row_ptr_full, dtype=np.int64)
@@ -695,22 +650,24 @@ def fetch_packed_bold_TND(project_dir: str | Path,
             f"D_unpacked={D}")
     if D_bytes > MAX_D_BYTES:
         raise ValueError(
-            f"fetch_packed_bold_TND: profile dimension D={D} "
-            f"(ceil(D/8)={D_bytes} > {MAX_D_BYTES} bytes) exceeds the "
-            f"gpu_sparse kernels' limit of {MAX_D_BYTES * 8}; use "
-            f"backend='gpu_full' or 'cpu'.")
-    # The device ``acc_bits`` kernel folds all 8 bits of every byte with
-    # no ``d < D`` clamp, so a set padding bit in the last byte would be
-    # counted (and, on the final row, read past the allocation). Both
-    # in-tree writers zero the padding; verify it once per subject —
-    # a (T, N)-byte pass.
+            f"fetch_packed_bold_TND: backend='gpu' requires "
+            f"ceil(D/8) <= {MAX_D_BYTES} (D <= {MAX_D_BYTES * 8}, i.e. "
+            f"seed_mesh fsaverage3); got D={D} (ceil(D/8)={D_bytes}); "
+            f"use backend='cpu'.")
+    # The profile format requires the padding bits past D to be zero
+    # (docs/profile_disk_format.md): the bit-count normalisers fold all
+    # 8 bits of every byte with no ``d < D`` clamp, so a set padding bit
+    # would be counted, and ``acc_bits`` gathers ``s_t_nu[t, l, d]`` for
+    # every set bit, so it would read past the end of the D-long
+    # ``(t, l)`` row. Both in-tree writers zero the padding; verify it
+    # once per subject — a (T, N)-byte pass.
     pad = (-int(D)) % 8
     if pad and bool((packed[..., -1] >> np.uint8(8 - pad)).any()):
         raise ValueError(
             f"fetch_packed_bold_TND: {b2nd_path} (subject id="
             f"{sub_entry.id!r}) has nonzero padding bits in the last "
-            f"packed byte (D={D}, {pad} pad bits); the gpu_sparse "
-            f"kernels require them zeroed.")
+            f"packed byte (D={D}, {pad} pad bits); the profile format "
+            f"requires them zeroed.")
     return (np.ascontiguousarray(packed), int(D), mw_lh_idx, mw_rh_idx)
 
 
@@ -724,7 +681,7 @@ def fetch_gradient(project_dir: str | Path,
                    ) -> np.ndarray:
     """``fetch_data``'s ``gradient_mat``, with the same passthrough rule."""
     from arealmshbm.data_io.cohort import resolve_path
-    from arealmshbm.data_io.fetch_data import _read_gradient_emb
+    from arealmshbm.data_io.fetch_data import read_gradient_emb
 
     if precomputed_gradient_mat is not None:
         g = precomputed_gradient_mat
@@ -747,8 +704,8 @@ def fetch_gradient(project_dir: str | Path,
     lh_p = resolve_path(project_dir, sub_entry.gradient_lh)
     rh_p = resolve_path(project_dir, sub_entry.gradient_rh)
     with ThreadPoolExecutor(max_workers=2) as ex:
-        f_lh = ex.submit(_read_gradient_emb, lh_p, n_grad_components)
-        f_rh = ex.submit(_read_gradient_emb, rh_p, n_grad_components)
+        f_lh = ex.submit(read_gradient_emb, lh_p, n_grad_components)
+        f_rh = ex.submit(read_gradient_emb, rh_p, n_grad_components)
         return np.concatenate([f_lh.result(), f_rh.result()], axis=0)
 
 
@@ -757,7 +714,7 @@ def fetch_gradient(project_dir: str | Path,
 # ─────────────────────────────────────────────────────────────────────
 @dataclass
 class Step3SparseInputs:
-    """Everything the ``gpu_sparse`` backend needs, with no dense (N, L)."""
+    """Everything the ``gpu`` backend needs, with no dense (N, L)."""
     layout: CandidateLayout
     packed_TND: np.ndarray                 # (T, N, ⌈D/8⌉) uint8, RAW on
     #                                        disk: MW rows are NOT zeroed
@@ -999,7 +956,7 @@ def load_step3_sparse_inputs(cfg,
 
 
 __all__ = [
-    "load_group_prior_csr", "theta_csr_to_dense", "load_spatial_mask_csr",
+    "load_group_prior_csr", "load_spatial_mask_csr",
     "build_candidate_layout_fast", "fetch_packed_bold_TND", "fetch_gradient",
     "Step3SparseCohort", "load_step3_sparse_cohort",
     "Step3SparseInputs", "load_step3_sparse_inputs",

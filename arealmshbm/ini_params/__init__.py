@@ -25,7 +25,7 @@ Public API:
                          …, backend='cpu' | 'gpu')
         Optional hand-offs: ``precomputed_{lh,rh}_avg`` (host arrays),
         ``precomputed_{lh,rh}_avg_dev`` (cupy arrays from
-        ``avg_profiles_from_packed_gpu``; GPU backend only),
+        ``avg_profiles_from_accumulator``; GPU backend only),
         ``save_async`` (background ``group.mat`` write — join via
         ``result.writer.wait()``).
 

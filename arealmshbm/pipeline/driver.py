@@ -1,7 +1,7 @@
 """driver.py — the unified project-driven pipeline orchestrator.
 
-A single ``Pipeline(project_dir).run()`` call replaces the historical
-mix of per-step entry points + MATLAB driver chains.
+A single ``Pipeline(project_dir).run()`` call runs every step of a
+project.
 
 Flow per mode::
 
@@ -52,6 +52,19 @@ from .inputs import BoldInputs, check_bold_files_exist, read_bold_inputs
 from .layout import ProjectLayout
 
 _log = logging.getLogger(__name__)
+
+
+def _require_cuda_device() -> None:
+    """Import CuPy, query the current CUDA device and load NVRTC.
+
+    Every ``gpu`` backend compiles its kernels through NVRTC on a CUDA
+    device, so none of them runs without all three: a missing CuPy is
+    an ``ImportError``, no usable device a ``CUDARuntimeError``, a CuPy
+    that cannot load NVRTC raises from the library load.
+    """
+    import cupy as cp
+    cp.cuda.runtime.getDevice()
+    cp.cuda.nvrtc.getVersion()
 
 
 @dataclass
@@ -125,30 +138,29 @@ class Pipeline:
         # inert and must not be rejected.
         if (not self.config.is_mode_a
                 and self.config.backend_step2 == "gpu"):
-            self._require_fsaverage3_seed("step2", "gpu", "'cpu'")
+            self._require_fsaverage3_seed("step2")
         # Step 3 runs in both modes.
-        if self.config.backend_step3 == "gpu_sparse":
-            self._require_fsaverage3_seed("step3", "gpu_sparse",
-                                          "'gpu_full' or 'cpu'")
+        if self.config.backend_step3 == "gpu":
+            self._require_fsaverage3_seed("step3")
 
-    def _require_fsaverage3_seed(self, step: str, backend: str,
-                                 alternatives: str) -> None:
-        """Reject a P-layout GPU backend (step 2 ``'gpu'``, step 3
-        ``'gpu_sparse'``) on a seed mesh it cannot serve.
+    def _require_fsaverage3_seed(self, step: str) -> None:
+        """Reject the P-layout ``'gpu'`` backend of step 2 / step 3 on a
+        seed mesh it cannot serve.
 
-        Both bake a ``ceil(D/8) <= 256`` limit that only
-        ``seed_mesh='fsaverage3'`` satisfies. ``seed_mesh`` lives in
+        Both bake a ``ceil(D/8) <= 256`` limit; fsaverage4 and larger
+        exceed it, and ``seed_mesh='fsaverage3'`` is also the only seed
+        mesh the gpu sessions are validated on. ``seed_mesh`` lives in
         bold_inputs.json, so ``read_pipeline_config`` cannot see it and
         the leaf-side rules (``Step2Config.__post_init__``, the step-3
-        gpu_sparse session ctor) fire only after steps 0-1 (step 3: 0-2)
+        packed-BOLD loader) fire only after steps 0-1 (step 3: 0-2)
         have already burned minutes of wall time.
         """
         if self.inputs.seed_mesh != "fsaverage3":
             raise ValueError(
-                f"pipeline_config.json: backend_{step}={backend!r} "
-                f"requires bold_inputs.json seed_mesh='fsaverage3'; "
-                f"got {self.inputs.seed_mesh!r}. Use "
-                f"backend_{step}={alternatives}."
+                f"pipeline_config.json: backend_{step}='gpu' requires "
+                f"bold_inputs.json seed_mesh='fsaverage3' (ceil(D/8) <= "
+                f"256); got {self.inputs.seed_mesh!r}. Use "
+                f"backend_{step}='cpu'."
             )
 
     def _prior_includes_beta(self) -> bool:
@@ -179,10 +191,11 @@ class Pipeline:
                     f"Mode A min-input check: group prior not found at "
                     f"{prior_path}. Stage a Params_Final.mat there before "
                     f"running Mode A - e.g. copy one from a CBIG checkout's "
-                    f"lib/group_priors/, from the in-tree example priors "
-                    f"under arealmshbm/data/group_priors/, or from another "
-                    f"project's modeB_train_prior output. (Mode B writes "
-                    f"this slot itself via step2.)"
+                    f"stable_projects/brain_parcellation/"
+                    f"Kong2022_ArealMSHBM/lib/group_priors/, or from "
+                    f"another project's Mode B output (see "
+                    f"arealmshbm/data/README.md). (Mode B writes this "
+                    f"slot itself via step2.)"
                 )
             return prior_path
         return None
@@ -251,8 +264,8 @@ class Pipeline:
         overlaps the whole stack. See
         :mod:`arealmshbm.pipeline._step0_stage_pipeline`.
 
-        CPU backend stays sequential (numba threads inside each call
-        already saturate cores).
+        The CPU backend runs the same four stage threads, without cupy
+        streams.
         """
         from arealmshbm.step0_pipeline import Step0Config, Step0Pipeline
         from ._step0_bold_prefetcher import Step0BoldPrefetcher
@@ -344,21 +357,23 @@ class Pipeline:
         and the cohort.json write at the end.
 
         GPU backend: the subgraphs are chained in memory / on device
-        (``packed_sink`` → ``packed_subjects`` → ``lh_avg_dev``) and
-        every disk write runs on a background thread joined once at
-        the end (:func:`step1_runners.join_step1_writers`); on CPU
-        that background writer carries the group.mat write alone. The
-        one-time GPU costs are prewarmed on a daemon thread that
-        :meth:`run` starts before step 0. Holding every subject's
-        packed slab until avg_profiles costs ~72 MB/subject at
-        fsaverage6 with 6 sessions.
+        (the profile leaf folds each packed session into
+        ``avg_accumulator`` as it packs it → ``lh_avg_dev``) and every
+        disk write runs on a background thread joined once at the end
+        (:func:`step1_runners.join_step1_writers`); on CPU that
+        background writer carries the group.mat write alone. Part of
+        the one-time GPU cost is prewarmed on a daemon thread that
+        :meth:`run` starts before step 0. No subject's packed bytes
+        outlive its .b2nd write: the average lives in two ``(V_h, D)``
+        fp32 device sums, whatever the cohort size.
 
         Returns the bundle of artifacts the cohort writer needs to
         emit ``cohort.json``.
         """
         from .step1_runners import (
-            join_step1_writers, resolve_group_labels, run_avg_profiles,
-            run_generate_profiles, run_ini_params, run_radius_mask,
+            join_step1_writers, make_avg_accumulator, resolve_group_labels,
+            run_avg_profiles, run_generate_profiles, run_ini_params,
+            run_radius_mask,
         )
 
         subjects = self.inputs.subject_ids()
@@ -379,10 +394,12 @@ class Pipeline:
         # Subgraph 1 — per-subject profile arrays → bitpacked .b2nd.
         # The stage pipeline emits per-subject ``step1`` state events
         # internally; the driver injects ``self._progress`` via the
-        # runner's keyword arg. On GPU the packed bytes stay in memory
-        # for subgraph 2 and the single-subject .b2nd write is joined
-        # at the end of the step.
-        packed_sink: Optional[Dict[str, Any]] = {} if is_gpu else None
+        # runner's keyword arg. On GPU subgraph 2's sums are built on
+        # device while the leaf packs, and the single-subject .b2nd
+        # write is joined at the end of the step.
+        avg_acc = (make_avg_accumulator(targ_mesh=targ, seed_mesh=seed,
+                                        num_sess=len(sessions))
+                   if is_gpu else None)
         write_handles: Optional[list] = [] if is_gpu else None
         profile_b2nd_paths = run_generate_profiles(
             project_dir=self.layout.project_dir,
@@ -395,7 +412,7 @@ class Pipeline:
             backend=backend,
             verbose=True,
             progress=self._progress,
-            packed_sink=packed_sink,
+            avg_accumulator=avg_acc,
             write_handles=write_handles,
         )
 
@@ -413,11 +430,6 @@ class Pipeline:
             # directly.
             self._progress.emit_state("step1_avg", COHORT_SUB_ID, "running")
             try:
-                if packed_sink:
-                    packed_subjects = [packed_sink[str(s)][0] for s in subjects]
-                    D_unpacked = packed_sink[str(subjects[0])][1]
-                else:
-                    packed_subjects, D_unpacked = None, None
                 avg_res = run_avg_profiles(
                     project_dir=self.layout.project_dir,
                     num_sub=len(subjects),
@@ -425,8 +437,7 @@ class Pipeline:
                     seed_mesh=seed,
                     targ_mesh=targ,
                     backend=backend,
-                    packed_subjects=packed_subjects,
-                    D=D_unpacked,
+                    accumulator=avg_acc,
                 )
             except BaseException as e:
                 self._progress.emit_state(
@@ -492,26 +503,23 @@ class Pipeline:
                 except BaseException:      # noqa: BLE001 — never mask
                     pass                   # the failure being propagated
         avg_paths = (avg_res.lh_path, avg_res.rh_path)
-        # Both names hold the same per-subject slabs (the single-subject
-        # slab is a view on the pooled pinned block) — drop both so the
-        # pinned pool can reclaim them in the epilogue below.
-        packed_sink = packed_subjects = None
+        # The pending single-subject write handle is the last reference
+        # to the leaf's pinned D2H block, and the accumulator holds the
+        # device means ``ini_params`` has already consumed — drop both
+        # so the epilogue below can reclaim them.
         write_handles = None
+        avg_acc = None
         if is_gpu:
             # Hand back step 1's device AND pinned host memory before
-            # step 2 starts: the ingest staging block and the D2H pool
-            # are module globals (~600 MB at fsaverage6/6 sessions) that
+            # step 2 starts: the ingest staging block is a module global
+            # and the leaf's D2H block sits in CuPy's pinned pool; both
             # would otherwise stay resident for the rest of the process.
             try:
                 import cupy as cp
                 from arealmshbm.data_io.gifti_bold_gpu import (
                     release_staging_buffer,
                 )
-                from arealmshbm.generate_profiles.profiles_subject_gpu import (
-                    release_pinned_staging,
-                )
                 del avg_res
-                release_pinned_staging()
                 release_staging_buffer()
                 cp.get_default_memory_pool().free_all_blocks()
                 cp.get_default_pinned_memory_pool().free_all_blocks()
@@ -614,22 +622,20 @@ class Pipeline:
 
         ``gradient_by_sub`` is the dict returned by step0 — each entry
         is the in-memory ``(N, n_grad_components)`` fp32 gradient_mat
-        for one subject. fetch_data uses it directly instead of
-        re-reading the cohort's gradient .npy files. After processing a
-        subject we drop the reference so its ~33 MB (81924 × 100 × 4 B
-        at fsa6 with n_grad_components=100) is reclaimable; this matters
-        at large K.
+        for one subject. fetch_data (``cpu``) or fetch_gradient (``gpu``)
+        uses it directly instead of re-reading the cohort's gradient .npy
+        files. After processing a subject we drop the reference so its
+        ~33 MB (81924 × 100 × 4 B at fsa6 with n_grad_components=100) is
+        reclaimable; this matters at large K.
 
         **Pipeline-parallel by phase (GPU backend, K ≥ 2).** The
         single-subject pipeline runs three phases sequentially (LOAD:
         disk reads + setup + H2D, EM: intra_em outer loop, SAVE: argmax
-        + .mat write). On ``gpu_full`` the EM body (~2.4 s on the YS
-        profile reference) gates the wall; LOAD (~0.9 s) and SAVE
-        (~0.05 s) would otherwise serialize behind EM. We pipeline by
-        phase across subjects: one stage thread per phase, with cupy
-        streams on LOAD and EM (cross-stream event sync on the LOAD→EM
-        device-buffer handoff), so subject K+1's LOAD overlaps subject
-        K's EM and subject K-1's SAVE. See
+        + .mat write); LOAD and SAVE would otherwise serialize behind
+        EM. We pipeline by phase across subjects: one stage thread per
+        phase, with cupy streams on LOAD and EM (cross-stream event sync
+        on the LOAD→EM device-buffer handoff), so subject K+1's LOAD
+        overlaps subject K's EM and subject K-1's SAVE. See
         :mod:`arealmshbm.pipeline._step3_stage_pipeline`.
 
         CPU backend and single-subject runs stay on the serial
@@ -639,9 +645,7 @@ class Pipeline:
         from arealmshbm.step3_pipeline import Step3Config, Step3Pipeline
 
         subjects = list(self.inputs.subjects)
-        is_gpu = self.config.backend_step3 in (
-            "gpu_elambda", "gpu_full", "gpu_sparse",
-        )
+        is_gpu = self.config.backend_step3 == "gpu"
 
         # ``**asdict(k3)`` splats every Step3Knobs field into Step3Config
         # via the field-name 1:1 mapping pinned by
@@ -671,29 +675,16 @@ class Pipeline:
 
         if is_gpu and len(subjects) >= 2:
             from ._step3_stage_pipeline import Step3StagePipeline
-            # em_concurrency=1 by default — empirically 2-worker EM on
-            # an RTX 5090 24 GB delivered +29 % step3 wall (worse than
-            # single-EM) AND once triggered a WHEA hardware MCE under
-            # the combined GPU + PCIe load. The cuBLAS / cupy
-            # memory-pool / PCIe DMA paths all serialize on cross-
-            # thread access, so two EM workers spend more time
-            # contending than overlapping. Tuning ceiling left as an
-            # explicit knob so future configurations (multi-GPU,
-            # workstation-class PCIe, different cuBLAS revisions) can
-            # opt in — see _step3_stage_pipeline.py docstring for the
-            # measurement that motivated the default.
             coord = Step3StagePipeline(
                 subject_ids=[sub.id for sub in subjects],
                 configs=configs,
                 gradients=gradient_by_sub,
-                backend=self.config.backend_step3,
-                em_concurrency=1,
                 progress=self._progress,
             )
             coord.run()
             return
 
-        # CPU backend or K=1: keep the original serial loop. The
+        # CPU backend or K=1: the serial loop. The
         # stage pipeline's overhead (queues, threads, stream sync)
         # has no payoff to amortize without multiple subjects. The
         # serial path owns the running/done/failed emits directly —
@@ -780,25 +771,50 @@ class Pipeline:
             timings["stage_bold_lists"] = time.perf_counter() - t
 
             current_phase = "prewarm"
-            # Step 2's GPU backend compiles one RawModule at first
-            # use. Kick that NVRTC compile onto a daemon thread now so it
-            # overlaps step 0 + step 1 instead of landing inside step 2's
-            # first EM iter. Compile plus a 32x32 gemm that pays cuBLAS's
-            # process-wide module load — no pinned buffers, because the
-            # pools get drained right after step 0 and anything allocated
-            # here would be reclaimed before step 2 runs (see the
-            # step2_runners docstring).
             # Mode A never runs step 2.
-            if (not self.config.is_mode_a
-                    and self.config.backend_step2 == "gpu"):
-                from .step2_runners import prewarm_step2_gpu
-                prewarm_step2_gpu(background=True)
+            step2_gpu = (not self.config.is_mode_a
+                         and self.config.backend_step2 == "gpu")
 
-            # Step 1's one-time GPU costs (RawKernel NVRTC compiles,
-            # the cuBLAS handle, the nvCOMP load, pinned staging) are
-            # paid on a daemon thread that overlaps step 0. The leaf's
-            # prewarm is lock-guarded and idempotent, so the call step 1
-            # makes itself later just waits for this one.
+            # Every gpu backend needs CuPy, a visible CUDA device and
+            # NVRTC. Checked first, so a run whose earlier steps are on
+            # cpu does not get through them before a gpu step fails.
+            if step2_gpu or "gpu" in (self.config.backend_step0,
+                                      self.config.backend_step1,
+                                      self.config.backend_step3):
+                _require_cuda_device()
+
+            # ``psutil`` is a dependency of backend_step2='gpu' (it
+            # sizes the packed host BOLD cache); importing it here fails
+            # a missing install before step 0.
+            if step2_gpu:
+                import psutil  # noqa: F401
+
+            # backend_step3='gpu' with gMSHBM / cMSHBM needs the
+            # cooperative connected-components kernel, which links
+            # cudadevrt from the CUDA toolkit at CUDA_PATH. Check the
+            # device's cooperative-launch support and compile the kernel
+            # now so a device or toolkit that cannot run it fails before
+            # step 0.
+            if self.config.backend_step3 == "gpu":
+                from arealmshbm.step3_pipeline.variant import VariantSpec
+                if VariantSpec.from_pipeline_type(
+                        self.config.variant).use_check_connectedness:
+                    from arealmshbm.check_connectedness.connectedness_gpu import (
+                        prewarm_connectedness_gpu,
+                    )
+                    prewarm_connectedness_gpu()
+
+            # backend_step1='gpu' ingests BOLD through nvCOMP only.
+            # The call resolves the nvCOMP binding on this thread
+            # first, so a missing or unloadable nvidia-nvcomp-cu12
+            # fails before step 0. The profile leaf's RawKernel NVRTC
+            # compiles, the cuBLAS module load and the pinned staging
+            # buffer are then paid on a daemon thread that overlaps
+            # step 0; the GIFTI ingest kernels, CuPy's elementwise
+            # kernels and the avg / ini_params / radius_mask kernels
+            # compile at their first launch. The leaf's prewarm is
+            # lock-guarded and idempotent, so the call step 1 makes
+            # itself later just waits for this one.
             if self.config.backend_step1 == "gpu":
                 from .step1_runners import (
                     bold_pairs_for_prewarm, prewarm_step1_gpu,
@@ -806,6 +822,19 @@ class Pipeline:
                 prewarm_step1_gpu(bold_pairs_for_prewarm(
                     self.layout.project_dir,
                     self.inputs.subject_ids(), self.inputs.session_ids()))
+
+            # Step 2's GPU backend compiles one RawModule at first
+            # use. Kick that NVRTC compile onto a daemon thread now so it
+            # overlaps step 0 + step 1 instead of landing inside step 2's
+            # first EM iter. Compile plus a 32x32 gemm that pays cuBLAS's
+            # process-wide module load — no pinned buffers, because the
+            # pools get drained right after step 0 and anything allocated
+            # here would be reclaimed before step 2 runs (see the
+            # step2_runners docstring). It starts after the dependency
+            # checks above, so a failed check has no thread to wait for.
+            if step2_gpu:
+                from .step2_runners import prewarm_step2_gpu
+                prewarm_step2_gpu(background=True)
 
             # Step 0: gradients per subject. Returns the in-memory dict
             # ``{sub_id: gradient_mat}`` that step3 will consume directly,
