@@ -1,8 +1,8 @@
 """step2_em_iter_master — fused EM-iter master kernel.
 
-Pulls every leaf in the step-2 outer-EM iter body
-(``CBIG_ArealMSHBM_cdgMSHBM_estimate_group_priors_sequential.m`` lines
-425-676) into a single numba ``@njit`` pipeline, calling per-phase
+Pulls every leaf in the step-2 outer-EM iter body (the EM split across
+``CBIG_ArealMSHBM_{g,d}MSHBM_estimate_group_priors_parent.m`` and
+``..._child.m``) into a single numba ``@njit`` pipeline, calling per-phase
 ``@njit`` sub-kernels that numba inlines into one fused master:
 
 * Phase A — Precompute ``X_dot_sl[s, t, l, d] = Σ_n s_lambda[s, n, l]

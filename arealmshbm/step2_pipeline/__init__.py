@@ -3,8 +3,8 @@
 End-to-end Python step-2 group-prior estimation (Mode B). Coupled
 multi-subject EM that produces ``Params = (mu, theta, epsil, sigma,
 kappa)``. Mirrors MATLAB's
-``CBIG_ArealMSHBM_cdgMSHBM_estimate_group_priors_sequential.m`` under
-the ``mode ∈ {gMSHBM, dMSHBM}`` dispatch; cMSHBM is not wired.
+``CBIG_ArealMSHBM_{g,d}MSHBM_estimate_group_priors_{parent,child}.m``
+under the ``mode ∈ {gMSHBM, dMSHBM}`` dispatch; cMSHBM is not wired.
 
 Two EM-body implementations sit behind ``Step2Config.backend``:
 

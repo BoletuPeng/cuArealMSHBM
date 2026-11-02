@@ -52,12 +52,13 @@ FUSED_BLOCK = 256       # M-step block reduce over D
 REDUCE_BLOCK = 256
 REDUCE_GRID = 1024      # FIXED grid -> fixed reduction order
 ROW_BLOCK = 256         # thread-per-row kernels
-INIT_WARPS = 8          # warps per init_hard_labels block
+INIT_WARPS = 8          # warps per init_soft block
 INIT_RR = 4             # rows carried per warp (register tile)
 INIT_ROWS = INIT_WARPS * INIT_RR   # rows per block
 INIT_BLOCK = 32 * INIT_WARPS       # threads per block
 INIT_MAXJ = 16          # per-lane accumulators -> L <= 32 * INIT_MAXJ
 MAX_CLUSTERS = 32 * INIT_MAXJ   # the L ceiling ``check_dims`` enforces
+INIT_DT_MAX = 128       # d-tile cap of ``init_dt``
 ACC_BLOCK = 768         # K6 members per block (see the acc_P comment)
 CONNECT_BLOCK = 128
 FLAG_BLOCK = 256        # intra_flags_rel: one block, power of two
@@ -351,14 +352,19 @@ void widen_exact(const unsigned char* __restrict__ packed,  // (T, N, Db)
 
 _SRC_INIT = r"""
 // =====================================================================
-// K1a -- per-(s,n) hard label + medial flag (design 1.2).
+// K1a -- per-(s,n) stock soft init row on P (design 1.2): the in-mask
+// row-normalised posterior exp(v - rowmax) of the init logits
+// v[l] = kappa_T * mean_t(X[n,t]) . g[:,l], with stock's single-precision
+// semantics (fp32 shifted logits, exp rounded to fp32 with subnormals
+// kept, fp32 serial row sum, fp32 divide; an all-underflow row stays 0).
 //
 // INIT_WARPS warps per block, each warp owning INIT_RR consecutive rows, so
 // a block covers INIT_ROWS = INIT_WARPS*INIT_RR rows.  Each (n, l)
 // accumulator stays a private serial ascending-d fp32 sum, which is what
-// makes every (INIT_WARPS, INIT_RR, DT) choice bit-identical.
+// makes every (INIT_WARPS, INIT_RR, DT) choice bit-identical (and equal to
+// the CPU ``profile_to_soft_init_kernel``).
 //
-// Two properties set the speed (7.9 ms on the S=1 bench):
+// Two properties set the speed of the accumulation (7.9 ms on the S=1 bench):
 //  1. the ``at`` stage is BYTE-based -- one packed byte yields 8 d values,
 //     so each packed / row_mean / row_inv load serves 8 d values;
 //  2. a warp carries INIT_RR rows in registers, so each ``g_DL`` load feeds
@@ -367,6 +373,9 @@ _SRC_INIT = r"""
 // ``g_DL`` is read straight from global: it is 1.4 MB, L2-resident, and every
 // block sweeps it in the same order, so a shared-memory stage measured no
 // better (19.6 vs 19.9 ms at INIT_RR = 1) while capping DT.
+// The epilogue stages one warp's logit row in shared memory (L floats per
+// warp, after the ``at`` stage) and lets lane 0 walk the row's P cells
+// (~P/N, 7-10 of them) serially in ascending p, the CPU's order.
 // =====================================================================
 #define INIT_WARPS INIT_WARPS_VALUE
 #define INIT_RR    INIT_RR_VALUE
@@ -374,16 +383,18 @@ _SRC_INIT = r"""
 #define INIT_MAXJ INIT_MAXJ_VALUE
 
 extern "C" __global__
-void init_hard_labels(const unsigned char* __restrict__ packed,  // (S,T,N,Db)
-                      const float* __restrict__ row_mean,        // (S,T,N)
-                      const float* __restrict__ row_inv,         // (S,T,N)
-                      const float* __restrict__ g_DL,            // (D,L)
-                      int* __restrict__ hard_label,              // (S,N)
-                      unsigned char* __restrict__ medial,        // (S,N)
-                      int S, int T, int N, int D, int Db, int L,
-                      int DT, float inv_T)
+void init_soft(const unsigned char* __restrict__ packed,  // (S,T,N,Db)
+               const float* __restrict__ row_mean,        // (S,T,N)
+               const float* __restrict__ row_inv,         // (S,T,N)
+               const float* __restrict__ g_DL,            // (D,L)
+               const int* __restrict__ row_ptr,           // (N+1,)
+               const int* __restrict__ col,               // (P,)
+               float* __restrict__ s_lambda,              // (S,P) zero-filled
+               int S, int T, int N, int D, int Db, int L,
+               int DT, float inv_T, float kappa_T, long long P)
 {
-    extern __shared__ float at[];             // INIT_ROWS * DT
+    extern __shared__ float at[];             // INIT_ROWS * DT, then INIT_WARPS * L
+    float* vrow_all = at + INIT_ROWS * DT;
 
     const int s = blockIdx.y;
     const int base_n = blockIdx.x * INIT_ROWS;
@@ -456,76 +467,74 @@ void init_hard_labels(const unsigned char* __restrict__ packed,  // (S,T,N,Db)
         }
     }
 
-    // First index of the strict maximum (matches the CPU's '>' update).
+    // Epilogue: per row, shifted logits over ALL L (stock's rowmax is taken
+    // before the mask), then the masked exp / sum / divide on the row's P
+    // cells.  n_my is warp-uniform, so the early continue keeps every lane.
+    float* vrow = vrow_all + wid * L;
+    float* out = s_lambda + (long long)s * P;
     #pragma unroll
     for (int r = 0; r < INIT_RR; ++r) {
         const int n_my = base_n + wid * INIT_RR + r;
         if (n_my >= N) continue;
-        float best = 0.0f;
-        int bl = -1;
+        const bool medial_row =
+            (__shfl_sync(0xffffffffu, nsq[r], 0) == 0.0f);   // nsq lives on lane 0
+        float lmax = f_ninf();
         #pragma unroll
         for (int j = 0; j < INIT_MAXJ; ++j) {
             const int l = lane + 32 * j;
             if (l < L) {
-                if (bl < 0) { best = acc[r][j]; bl = l; }
-                else if (acc[r][j] > best) { best = acc[r][j]; bl = l; }
+                const float v = acc[r][j] * kappa_T;
+                vrow[l] = v;
+                lmax = fmaxf(lmax, v);
             }
         }
-        for (int off = 16; off > 0; off >>= 1) {
-            const float ov = __shfl_down_sync(0xffffffffu, best, off);
-            const int oi = __shfl_down_sync(0xffffffffu, bl, off);
-            if (oi >= 0 && (bl < 0 || ov > best || (ov == best && oi < bl))) {
-                best = ov; bl = oi;
+        for (int off = 16; off > 0; off >>= 1)
+            lmax = fmaxf(lmax, __shfl_xor_sync(0xffffffffu, lmax, off));
+        __syncwarp();
+        if (lane == 0 && !medial_row) {           // medial: the row stays 0
+            const int p0 = row_ptr[n_my], p1 = row_ptr[n_my + 1];
+            float rs = 0.0f;
+            for (int p = p0; p < p1; ++p) {
+                const float e = f32_rn(exp(f32_to_f64(vrow[col[p]] - lmax)));
+                out[p] = e;
+                rs = f32_add_rn(rs, e);
+            }
+            if (f32_pos(rs)) {                    // else 0/0: the row stays 0
+                const double rsd = f32_to_f64(rs);
+                for (int p = p0; p < p1; ++p)
+                    out[p] = f32_rn(f32_to_f64(out[p]) / rsd);
             }
         }
-        if (lane == 0) {
-            hard_label[(long long)s * N + n_my] = bl;
-            medial[(long long)s * N + n_my] = (nsq[r] == 0.0f) ? 1 : 0;
-        }
+        __syncwarp();
     }
 }
 
-// =====================================================================
-// K1b(i) -- sparse one-hot write of s_lambda on P.
-extern "C" __global__
-void init_slambda(const int* __restrict__ hard_label,       // (S,N)
-                  const unsigned char* __restrict__ medial, // (S,N)
-                  const int* __restrict__ row_ptr,          // (N+1,)
-                  const int* __restrict__ col,              // (P,)
-                  float* __restrict__ s_lambda,             // (S,P) zero-filled
-                  int S, int N, long long P)
-{
-    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= (long long)S * N) return;
-    const long long s = i / N;
-    const int n = (int)(i - s * N);
-    if (medial[i]) return;
-    const int l_act = hard_label[i];
-    int lo = row_ptr[n], hi = row_ptr[n + 1] - 1;
-    while (lo <= hi) {
-        const int mid = (lo + hi) >> 1;
-        const int c = col[mid];
-        if (c == l_act) { s_lambda[s * P + mid] = 1.0f; return; }
-        if (c < l_act) lo = mid + 1; else hi = mid - 1;
-    }
-}
-
-// K1b(ii) -- theta / log_theta / active flag from the composed s_lambda.
+// K1b -- theta / log_theta / active flag from the composed s_lambda:
+// stock ``mean(s_lambda, 3)``, ``./ theta_num`` (subjects nonzero at the
+// cell), ``+ eps``, all in single; a cell no subject touches is 0 + eps.
 extern "C" __global__
 void init_theta(const float* __restrict__ s_lambda,   // (S,P)
                 float* __restrict__ theta,            // (P,)
                 float* __restrict__ log_theta,        // (P,)
                 int* __restrict__ active,             // (P,)
-                int S, long long P,
-                float theta_on, float theta_off)
+                int S, long long P, double eps_f64)
 {
     const long long p = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (p >= P) return;
-    bool any = false;
+    float acc = 0.0f;
+    int cnt = 0;
     for (int s = 0; s < S; ++s) {
-        if (f32_nonzero(s_lambda[(long long)s * P + p])) { any = true; break; }
+        const float v = s_lambda[(long long)s * P + p];
+        if (f32_nonzero(v)) { acc = f32_add_rn(acc, v); ++cnt; }
     }
-    const float th = any ? theta_on : theta_off;
+    float th;
+    if (cnt > 0) {
+        th = f32_rn(f32_to_f64(acc) / (double)S);
+        th = f32_rn(f32_to_f64(th) / (double)cnt);
+        th = f32_rn(f32_to_f64(th) + eps_f64);
+    } else {
+        th = f32_rn(eps_f64);                 // stock: 0 + eps, in single
+    }
     theta[p] = th;
     const bool on = f32_pos(th);
     active[p] = on ? 1 : 0;
@@ -1719,7 +1728,7 @@ def grid(n: int, block: int) -> int:
 
 
 def init_dt() -> int:
-    """d-tile width of ``init_hard_labels``: the largest 8-multiple of
+    """d-tile width of ``init_soft``: the largest 8-multiple of
     ``d`` values whose ``at`` stage (``INIT_ROWS * DT`` floats) fits in
     shared memory.  DT must be a multiple of 8 because the stage is
     byte-based (one packed byte -> 8 ``d`` values); every DT gives
@@ -1727,7 +1736,15 @@ def init_dt() -> int:
     serial ascending-d fp32 sum).
     """
     dt = (20000 // (4 * INIT_ROWS)) & ~7
-    return max(8, min(128, int(dt)))
+    return max(8, min(INIT_DT_MAX, int(dt)))
+
+
+# ``init_soft``'s dynamic shared memory at the backend's L ceiling: the ``at``
+# stage plus one fp32 logit row per warp (design §1.2 / K1a). The constants
+# are static, so the 48 KiB default per-block limit is asserted once here
+# rather than surfacing as a launch failure.
+INIT_SMEM_MAX = (INIT_ROWS * init_dt() + INIT_WARPS * MAX_CLUSTERS) * 4
+assert INIT_SMEM_MAX <= 49152, INIT_SMEM_MAX
 
 
 def check_dims(D: int, Db: int, L: int, dim: int, D_grad: int) -> None:
@@ -1765,4 +1782,5 @@ __all__ = [
     "REDUCE_BLOCK", "REDUCE_GRID", "ROW_BLOCK", "INIT_ROWS", "INIT_MAXJ",
     "MAX_CLUSTERS", "MAX_D_GRAD", "CONNECT_STATIC_SHARED",
     "ACC_BLOCK", "CONNECT_BLOCK", "FLAG_BLOCK", "INIT_WARPS", "INIT_RR", "INIT_BLOCK",
+    "INIT_DT_MAX", "INIT_SMEM_MAX",
 ]

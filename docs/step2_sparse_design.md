@@ -92,9 +92,12 @@ Consequences: alive rows of `X` have unit norm (up to one rounding),
 `|lv_sum| ≤ n_alive`, and `tmp_idx[n] ⟺ n_alive[n] == 0` (R1 §4 Q1(b): exact
 for `κ < Cdln(κ) ≈ 2308`; production κ ∈ [400, 1200]; warn once if `κ ≥ 2308`).
 
-### 1.2 Init (`compose_init_state`) — exact
+### 1.2 Init (`compose_init_state`) — exact given device `exp`
 
-Per subject, per vertex `n` (CPU `step2_init/_kernels.py:40-102, 105-174`):
+The stock CBIG init (`CBIG_ArealMSHBM_{g,d}MSHBM_estimate_group_priors_child.m`
+`ini_s_lambda` block; `..._parent.m` mask / normalise / `theta_num` block), in
+stock's single precision. Per subject, per vertex `n` (CPU
+`step2_init/_kernels.py` `profile_to_soft_init_kernel`, `compose_theta_kernel`):
 
 ```
 inv_T   = f32(1)/f32(T)
@@ -102,17 +105,41 @@ mean_d[d] = serial-over-t fp32 sum (start 0.0f) of X[n,t,d]   (X = f32(bit)-mean
 a_d     = mean_d[d] * inv_T
 norm_sq = serial ascending-d fp32 sum of a_d*a_d
 acc[l]  = serial ascending-d fp32 sum of a_d * g[d,l]      (g = f32(mtc), (D,L); no FMA)
-hard_label = first index of the strict maximum of acc (best=acc[0]; update on '>')
-medial     = (norm_sq == 0)
-s_lambda[s, n, l_act] = 1  iff  !medial and (n, l_act) ∈ P     (else the row stays 0)
-theta[n,l] = f32( f64(inv_S_f32) + eps_f64 ) if any subject wrote (n,l) else f32(eps_f64)
+v[l]    = acc[l] * kappa_T                                 (kappa_T = f32(ini_val)*f32(T), one host scalar; stock: kappa_ini * Σ_t, plus a per-session Cdln(kappa_ini) row constant the port omits — §8)
+rowmax  = max over ALL L of v[l]                           (stock's rowmax is taken before the mask)
+medial  = (norm_sq == 0)                      -> the row stays 0           (stock ``mask``)
+e[p]    = f32_rn( exp_f64( v[col[p]] - rowmax ) )  for the row's P cells   (fp32 subtraction; exp rounded to fp32, subnormals kept)
+rs      = serial ascending-p fp32 sum of e[p]
+s_lambda[s, p] = f32_rn( f64(e[p]) / f64(rs) )  if rs > 0, else the row stays 0  (stock's 0/0 -> NaN -> 0)
+theta[p] = f32_rn( f32_rn( f32_rn( Σ_s^{fp32, nonzero only} s_lambda[s,p] / S ) / #nonzero_s ) + eps_f64 )   (stock mean(.,3) ./ theta_num + eps)
+         = f32(eps_f64) if no subject is nonzero at p
 theta_out  = f32(eps_f64) = 2.2204460e-16     (every cell outside P; §1.6)
 ```
 
-`inv_S_f32 = f32(1)/f32(S)` (identical to the E.2 constant `f32(1.0/S)` for all
-S ≤ 2000), `eps_f64 = 2.220446049250313e-16`. `initialize_state()` zero-fills
-`s_lambda (S,P)`, `lv_sum`, `log_vmf`, `scr` before K1 and fills `log_theta`
-from `theta` with the same kernel E.2 uses.
+Cells more than ~104 nats below the row max underflow to 0 in fp32, as in
+stock, so a share of the masked rows starts all-zero (T-dependent: a few per
+cent at T=2, 16 % on the T=6 bench) and revives at the first E-step, since
+`theta = eps` keeps them active. `eps_f64 = 2.220446049250313e-16`.
+`initialize_state()` zero-fills `s_lambda (S,P)`, `lv_sum`, `log_vmf`, `scr`
+before K1 and fills `log_theta` from `theta` with the same kernel E.2 uses.
+The CPU and GPU init are bit-identical by construction (same serial fp32
+accumulation order, every later op an fp32 op or an fp64 op rounded to fp32
+through `f32_rn`); the only non-reproducible input is `exp_f64` itself (≤ 1
+ulp between libm and CUDA, invisible after the fp32 rounding except on a
+measure-zero set — measured 0 differing cells of `s_lambda` / `theta` on the
+S=1 and S=2 bench projects, and the K1 tests pin the bit pattern). The EM
+that follows starts from soft weights, so CPU-vs-GPU agreement after it is
+the port-vs-port band of §7 (S=1: 2 flips, `kappa` 1.5e-5).
+
+**Precision split, deliberate.** The init reproduces stock's single
+precision in full — including the underflow deaths, which the first E-step
+revives — while E.1 (§1.6) normalises in fp64 and keeps the rows stock's
+fp32 normalisation would kill. Matching stock in E.1 is a separate decision
+with a measured effect (`docs/step2_em_iter_master_kernel.md` § "Why the
+softmax `exp` and row-normalise stay fp64"; for dMSHBM stock's first E-step
+after this init zeroes 23.4 % of the (row, subject) pairs against 1.1 % in
+fp64). Do not align either side to the
+other without re-running the step-2 gate against stock MATLAB.
 
 ### 1.3 Phase A — reassoc
 
@@ -282,7 +309,7 @@ the test at the end. `mu` update: fp64 sum over `s`, fp32 store, norm² of the
 
 ### 1.9 Bit-exact vs reassoc vs deviation, summarised
 
-Exact: row stats/X, init, sigma_psi, sum_lambda, u/u_sq/grad_sq/vmf/T-fold given
+Exact: row stats/X, init given device `exp` (§1.2), sigma_psi, sum_lambda, u/u_sq/grad_sq/vmf/T-fold given
 `u_update`/`cross`, lam assembly given `lv_sum`, rmax from iteration 2, the
 dead-column decision, E.1 and E.2 given `scr`, per-row cost given `scr`,
 outer-leaf arithmetic given the libm scalars. Reassoc: `X_dot_sl`, `lv_sum`, `u_update`, `cross`,
@@ -312,7 +339,8 @@ Rules:
 * Tests on possibly-subnormal fp32 values use bit patterns: `theta > 0` ⇒
   `__float_as_int(theta) > 0` (positive non-zero, incl. subnormal);
   `s_lambda != 0` ⇒ `(bits & 0x7fffffff) != 0`.
-* Sites that MUST use these helpers: E.1 store, E.2 accumulate + scale,
+* Sites that MUST use these helpers: the init's `exp` store, row sum and
+  divide (K1a) and its `theta` compose (K1b), E.1 store, E.2 accumulate + scale,
   `log_theta` (widen via `f32_to_f64`), every `theta`/`s_lambda` non-zero test,
   the active-support compaction flag, `theta_export`. Sites left native
   (deviation, negligible): the cost chain, `w_n = s_lambda·inv` in K3,
@@ -351,7 +379,7 @@ test oracles in `arealmshbm/step2_io/tests/_layout_oracle.py`.
 | `row_mean`, `row_inv`, `n_alive` | `(S, T, N)` fp32 ×2, `(S, N)` int32 — device-resident for ALL S in both cache modes (computed once in the ctor; stream mode only H2Ds the packed bytes per visit) | §1.1 |
 | `n_alive` | `(S, N)` int32 | |
 | `grad`, `grad_sq` | `(S, N, Dg)` fp32, `(S, N)` fp32 | gMSHBM only; device-resident (no stream mode for grad in v1) |
-| `mtc_DL`, `mtc_LD` | `(D, L)`, `(L, D)` fp32 | init argmax / reset source |
+| `mtc_DL`, `mtc_LD` | `(D, L)`, `(L, D)` fp32 | init logits / reset source |
 | `mu`, `s_psi`, `sigma_psi` | `(L, D)`, `(S, L, D)`, `(S, L, D)` fp32 | |
 | `s_t_nu`, `X_dot_sl` | `(S, T, L, D)` fp32 | in-place M-step state |
 | `s_lambda` | `(S, P)` fp32 | CSR order; subnormals allowed |
@@ -426,8 +454,8 @@ pinned-slot D2H (`.get(out=pinned)`).
 | # | kernel | geometry | contract |
 |---|---|---|---|
 | K0 | `row_stats_exact` | thread per (s,t,n) row | §1.1; writes `row_mean`, `row_inv`; a second kernel counts `n_alive` |
-| K1a | `init_hard_labels` | block per 32 rows (s,n) (8 warps × 4 rows): 256 threads; lanes own `l`, each warp owns 4 rows; the rows' `a_d` staged in smem per d-tile; `g[d, :]` read from global, each load reused across the warp's 4 rows | §1.2; per-(n,l) accumulator stays a private serial ascending-d fp32 sum; warp argmax with first-index tie rule; `norm_sq` serial fp32 |
-| K1b | `init_compose` | thread per (s,n); then thread per p | §1.2: binary-search `l_act` in `col[row_ptr[n]:row_ptr[n+1]]`; `theta[p]` from `Σ_s s_lambda[s,p] > 0` |
+| K1a | `init_soft` | block per 32 rows (s,n): 8 warps × 4 rows; lanes own `l`; `g[d, :]` streamed per d-tile and reused across the rows; one L-float logit row per warp in smem | §1.2; per-(n,l) accumulator stays a private serial ascending-d fp32 sum; warp max over all L; lane 0 walks the row's P cells in ascending p (fp32 exp / serial sum / divide, subnormal-aware) |
+| K1b | `init_theta` | thread per p | §1.2: fp32 sum over the subjects nonzero at p, `/S`, `/count`, `+eps`; `active[p] = theta[p] > 0` (every P cell) |
 | K2 | `sigma_psi_SLD` | grid-stride | exact |
 | K3 | `x_dot_sl_bits` | one launch per subject s: grid T·L (block per (t,l)), 256 thr × 1 byte, dyn smem `64*8` B (member weights + row ids) | the kernel text shared with step 3 (`m_step/_xdot_kernel.py`) over the **active** CSC; no host wrapper — `check_dims` (session ctor) rejects `Db > 256` (the kernel's `XDOT_BLOCK × XDOT_MAX_NB`) with a `ValueError` naming the seed mesh: `backend='gpu'` supports `ceil(D/8) ≤ 256`, i.e. seed mesh fsaverage3 |
 | K4a | `kappa_sum_stage1` / `reduce_stage2` | fixed grid 1024×256 / 1 block | fp32 product, fp64 tree |
@@ -516,13 +544,16 @@ class Step2SparseInputs:
                                         # the Session may call it from up to _INGEST_DEPTH worker threads at once (distinct subjects and buffers)
     grad_reader: Optional[Callable[[int, np.ndarray], None]]   # grad_reader(s_1, out_NDg) (gMSHBM), else None
     timings: Dict[str, float]
-    @classmethod
-    def from_arrays(cls, layout, packed_STNDb, mtc, *, D=None, grad_SNDg=None) -> "Step2SparseInputs"  # tests
-                                        # NOTE the keyword is ``D`` (the profile cell count), NOT ``dim`` (= D-1).
 
 def load_step2_sparse_inputs(cfg: Step2Config, *, overlap: bool = True) -> Step2SparseInputs
 ```
 
+* `load_step2_sparse_inputs` is the only place the package builds one. Its
+  readers hold nothing (one subject per call, from disk, into the caller's
+  buffer), so the cohort is on the host only where the Session's residency
+  choice (§2.2) puts it: in the stream-mode host cache when that fits, nowhere
+  otherwise. Tests go through the same loader — on a synthetic project they
+  write (`step2_io/tests/_synthetic_project.py`), or on the bench project.
 * cohort.json + the same consistency checks as today (`num_sub`, `num_session`,
   mesh targ/seed); MW contract verification of subject 1 / session 1 (packed
   bytes at MARS rows must be zero); dims from vlmeta.
@@ -634,7 +665,8 @@ Fixtures: `testdata/step2_bench/proj` (S=1) and `proj2` (S=2), env override
    on the S=1 fixture, each against the CPU numba kernel on identical inputs:
    K0 bit-exact (reconstruct `(bit−mean)·inv` for sampled rows vs
    `_widen_normalize_bitpacked_to_f32_NTD_kernel`, `np.array_equal`); K1
-   labels/medial/s_lambda/theta `np.array_equal` vs `compose_init_state`; K3 vs an
+   `s_lambda`/`theta` bit patterns `np.array_equal` vs `compose_init_state` (the
+   fixture's subnormal cells and all-underflow rows included); K3 vs an
    fp64 matmul: max rel ≤ 1e-4 and ≤ 10× the fp32 sgemm's error; K4c in-place: run
    with `eps = 0` for ≥ 2 iter_m, assert `cos != 1` and `s_t_nu` bit-equal to a
    ping-pong reference; K5 `sum_lambda` exact, `grad_sq` within 1e-3 × max of an
@@ -649,9 +681,10 @@ Fixtures: `testdata/step2_bench/proj` (S=1) and `proj2` (S=2), env override
    leaves: `psi` `np.array_equal`, `sigma/epsil/mu` ≤ 1e-9 rel, cost ≤ 1e-10 rel,
    plus a synthetic all-zero `(s,l)` column; **determinism**: every kernel launched
    twice → equal uint32 views.
-2. **Session vs CPU master, 1 EM iter** on a synthetic **binary** cohort built with
-   `Step2SparseInputs.from_arrays` (S=2, T=2, `N = 2·n_lh` small, L=16, D ≥ 256 so
-   `invad` is asymptotic, real `Step2Layout` from a synthetic block-diagonal mask)
+2. **Session vs CPU master, 1 EM iter** on a synthetic **binary** cohort written
+   as a project and loaded through `load_step2_sparse_inputs` (S=2, T=2,
+   `N = 2·n_lh` small, L=16, D ≥ 256 so `invad` is asymptotic, real `Step2Layout`
+   from a synthetic block-diagonal mask, a tiny fake mesh with no medial wall)
    against `Step2EmIterSession` (CPU) fed the same bits through
    `InMemoryProfileLoader` after the CPU widen: bars `s_t_nu/theta/s_lambda
    ≤ 5e-3`, `kappa ≤ 1e-4`;
@@ -659,8 +692,9 @@ Fixtures: `testdata/step2_bench/proj` (S=1) and `proj2` (S=2), env override
 3. **End-to-end A/B** (the internal step-2 comparison harness) on S=1 and S=2: `gpu`
    twice → identical on every saved field (**required**); vs CPU: theta argmax
    flips ≤ 500,
-   dead-alive rows within ±100 of the CPU's (1 303 at S=1; the dense port: 4 744 /
-   +4 225), `|kappa − kappa_cpu|/kappa_cpu ≤ 2e-2`, first-inter `Record` within
+   dead-alive rows within ±100 of the CPU's (705 vs 707 at S=1, 60 vs 60 at
+   S=2 with the stock init, 2026-11-01; the dense port: 4 744 / +4 225),
+   `|kappa − kappa_cpu|/kappa_cpu ≤ 2e-2`, first-inter `Record` within
    5e-3 rel.
 
    **Additionally REPORTED (not barred), every A/B:** `epsil` max-rel *and* the
@@ -680,6 +714,9 @@ Fixtures: `testdata/step2_bench/proj` (S=1) and `proj2` (S=2), env override
 
 * M-step `‖col‖`/`cos` in fp64 (CPU fp32 serial).
 * Device `exp` ≤ 1 ulp (6 % of inputs), device `Cdln`.
+* The init omits stock's per-session `Cdln(kappa_ini)` logit constant (a row
+  constant under `exp(v − rowmax)`; adding it in fp32 left the 8-subject gMSHBM
+  prior at 94.07 % / 98.16 % vs stock either way).
 * Device `invad`: **≤ 1e-12 rel — that tolerance, not bit-exactness, is what
   `test_device_invad_matches_invad_numba` asserts (`test_device_cdln_bitexact`
   is the bit-exact one); on the secant branch ~12 % of `rbar` values differ by
@@ -736,10 +773,10 @@ Fixtures: `testdata/step2_bench/proj` (S=1) and `proj2` (S=2), env override
 | `load_inputs` / `session_ctor` / `init_device` / closure / save | 0.100 / 0.058 / 0.009 / 0.019 / 0.006 s | 0.174 / 0.086 / 0.017 / 0.063 / 0.006 s |
 | per-launch: K3 / K6 / K8-10 / K4 per iter_m / K5 / K12 / K7 once | 0.34 / 0.35 / 0.40 / 0.17 / 0.15 / 0.22 / 25 ms | 0.85 / 0.44 / 0.40 / 0.31 / 0.19 / 0.22 / 23 ms |
 | fresh process (cold interpreter, prewarm on a thread) | ~1.4 s | ~2.0 s |
-| vs CPU: theta argmax flips / support-diff rows / dead-alive rows | 0 / 1 / 1303 = 1303 | 0 / 0 / 168 = 168 |
-| vs CPU: `kappa` / first-inter `Record` rel / `sigma` max-rel | 0.0 / 4.0e-6 / 3.9e-3 | 0.0 / 1.4e-6 / 3.7e-4 |
+| vs CPU: theta argmax flips / support-diff rows / dead-alive rows (2026-11-01, stock init §1.2) | 2 / 5 / 705 vs 707 (GPU stops after 9 outer iterations, CPU 10) | 1 / 1 / 60 = 60 |
+| vs CPU: `kappa` / first-inter `Record` rel / `sigma` max-rel (2026-11-01) | 1.5e-5 / 2.7e-5 / 3.4e-3 | 4.3e-7 / 9.9e-7 / 1.1e-3 |
 | run-to-run | identical on every saved field | identical |
-| step 3 labels from this prior vs from the CPU prior (sub-001, step-3 dense GPU EM) | identical (0 / 73 641) | — |
+| step 3 labels from this prior vs from the CPU prior (sub-001, 6 sessions, step-3 `gpu`; 2026-11-01) | 2 / 74 239 cortex vertices differ | — |
 | the dense GPU port (2026-09-03), for comparison: flips / dead rows / step-3 label agreement | 4 744 / 5 528 / 93.5 % | 5 071 / 1 140 / — |
 
 Kernel history of the perf pass (every step gated on bit-identical saved
@@ -751,7 +788,7 @@ not chain: dropping the byte stage + 256×1 696 → 490 µs on a 73 693-member
 one, the 4-deep prefetch 403 → 284 µs); K6 uses 768-thread blocks (the 75-533-member
 columns then take one pass) and an 8-byte prefetch (0.77 → 0.35 ms);
 `widen_exact` is a warp per row (1.5 → 0.36 ms per 8192-row tile, K7 39 → 25
-ms); `init_hard_labels` is register-tiled (22.9 → 8.5 ms); `connect_u` stages
+ms); the init kernel is register-tiled (22.9 → 8.5 ms); `connect_u` stages
 the member list once per chunk (148 → 105 µs); `intra_flags_rel` is a block
 with shared-memory staging (128 → 118 µs); the closure dots
 `intra_sigma_dot` / `cost_terms_perl` are block trees (863/997 → 37/47 µs) while

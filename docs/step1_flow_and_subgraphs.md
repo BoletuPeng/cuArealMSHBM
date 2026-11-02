@@ -288,8 +288,16 @@ runs exactly as the driver keeps them warm across a cohort.
 The GPU paths match CPU at sub-ULP across the four numeric subgraphs.
 Subgraph 3's ε computes via a different fp64 reduction order between
 numba and cupy, producing a ~4.7e-16 rel-diff that round-trips
-through ``invAd`` without visible effect. Beyond that, CPU and GPU
-outputs are bit-exact on the binary-mask and avg-profile paths.
+through ``invAd`` without visible effect. The avg-profile accumulation
+is bit-exact given the same packed input
+(`test_avg_profiles_accumulator_gpu.py`). The binary masks are not
+bit-exact across backends, and no test pins them to be: on HCP
+fsaverage6 (K=1175, N=81924, T=941–1200; 2026-09-26)
+`profiles.compute_profile_arrays` and the fused GPU leaf differ in
+2–11 bits per session out of 96,260,700 — correlations sitting on the
+fp32 threshold, which one cuBLAS sgemm and two per-hemi OpenBLAS
+sgemms, over differently ordered z-score reductions, round to opposite
+sides.
 
 ## Single-subject wall (2026-09-04)
 

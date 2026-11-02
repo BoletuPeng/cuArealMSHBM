@@ -203,7 +203,7 @@ class Step2Config:
                     f"seed_mesh='fsaverage3' (ceil(D/8) <= 256); got "
                     f"{self.seed_mesh!r}. Use backend='cpu'."
                 )
-            # The other two static kernel limits: ``init_hard_labels``
+            # The other two static kernel limits: ``init_soft``
             # keeps ``INIT_MAXJ`` per-lane accumulators over a 32-lane
             # warp, and ``connect_u`` stages one float per gradient
             # component in shared memory. Checked here as well as in

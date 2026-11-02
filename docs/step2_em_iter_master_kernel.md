@@ -125,8 +125,9 @@ forced `-ftz=true` (`f32_rn` / `f32_to_f64` helpers). Its numerics
 contract — which sites are bit-exact, which are merely reassociated, and
 the full deviation list — is `docs/step2_sparse_design.md` §1 and §8.
 CuPy's parallel-tree reductions differ from numba's serial accumulators
-at ULP level; bit equality across backends is NOT a goal (measured: 0
-`theta` argmax flips vs the CPU at S=1 and S=2, 2 at S=10).
+at ULP level; bit equality across backends is NOT a goal (measured
+2026-11-01: 2 `theta` argmax flips vs the CPU at S=1, 1 at S=2 —
+`docs/step2_sparse_design.md` §9).
 
 Why the softmax `exp` and row-normalise stay fp64 (measured 2026-09-03
 on a dense CuPy port that ran both in fp32; CuPy's

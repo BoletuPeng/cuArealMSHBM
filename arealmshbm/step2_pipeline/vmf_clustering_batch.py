@@ -1,9 +1,8 @@
 """vmf_clustering_batch.py
 
 The ⟨A⟩ subgraph of step 2 — the inter-region vMF clustering EM body.
-Equivalent to MATLAB's ``vmf_clustering_batch`` subfunction in
-``CBIG_ArealMSHBM_cdgMSHBM_estimate_group_priors_sequential.m`` (lines
-425-676).
+Equivalent to the inter-region vMF clustering EM of the stock
+``CBIG_ArealMSHBM_{g,d}MSHBM_estimate_group_priors_{parent,child}.m``.
 
 One control loop, :func:`_em_loop`, serves both Session families:
 

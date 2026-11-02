@@ -354,7 +354,7 @@ def _ingest_groups(pairs, *, n_lh, n_rh, prep_stream, dec_stream,
             read_futs = [read_pool.submit(_readinto, p, host, o, s)
                          for p, o, s in zip(paths, offsets, sizes)]
 
-        t_subject = None
+        t_call = None
 
         for g0 in range(0, n_sess, gs):
             g1 = min(g0 + gs, n_sess)
@@ -455,8 +455,10 @@ def _ingest_groups(pairs, *, n_lh, n_rh, prep_stream, dec_stream,
                 T0 = per_file_T[0]
                 if any(t != T0 for t in per_file_T):
                     raise ValueError(
-                        f"iter_subject_bold_gpu: all files of a subject "
-                        f"must share T; got {per_file_T}")
+                        f"iter_subject_bold_gpu: all files of one call "
+                        f"must share T (a subject whose runs differ in "
+                        f"length is read one equal-T block per call); "
+                        f"got {per_file_T}")
 
                 starts_all = np.concatenate(chunk_starts)
                 lens_all = np.concatenate(chunk_lens)
@@ -520,13 +522,15 @@ def _ingest_groups(pairs, *, n_lh, n_rh, prep_stream, dec_stream,
 
             dec_stream.wait_event(prep_evt)
 
-            if t_subject is None:
-                t_subject = T0
-            elif T0 != t_subject:
+            if t_call is None:
+                t_call = T0
+            elif T0 != t_call:
                 raise ValueError(
-                    f"iter_subject_bold_gpu: all files of a subject must "
-                    f"share T; group {g0}..{g1 - 1} has T={T0}, earlier "
-                    f"groups had T={t_subject}")
+                    f"iter_subject_bold_gpu: all files of one call must "
+                    f"share T (a subject whose runs differ in length is "
+                    f"read one equal-T block per call); group "
+                    f"{g0}..{g1 - 1} has T={T0}, earlier groups had "
+                    f"T={t_call}")
 
             with dec_stream:
                 sess_bufs = [cp.empty((T0, n_full), dtype=cp.float32)

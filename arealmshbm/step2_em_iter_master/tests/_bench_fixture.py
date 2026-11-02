@@ -4,8 +4,10 @@ Loads the on-disk bench projects (``testdata/step2_bench/proj`` for S=1,
 ``proj2`` for S=2; override the root with ``MSHBM_STEP2_BENCH_DIR``) once
 per process and exposes both
 
-* a :class:`~arealmshbm.step2_io.sparse_inputs.Step2SparseInputs` built
-  through ``from_arrays`` from the raw bit-packed bytes, and
+* the :class:`~arealmshbm.step2_io.sparse_inputs.Step2SparseInputs` the
+  production loader (``load_step2_sparse_inputs``) reads from the
+  project, plus the bit-packed bytes and gradients its readers deliver,
+  kept as the kernel tests' reference copies, and
 * the matching **CPU-side reference objects** — the real
   ``Step2Pipeline.load_inputs()`` / ``initialize_params()`` output, so each
   kernel test can compare against the numba kernels on identical inputs.
@@ -20,7 +22,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 import numpy as np
 import pytest
@@ -35,16 +37,12 @@ _CACHE: Dict[str, Any] = {}
 class BenchFixture:
     """Everything the kernel tests need for one bench project."""
 
-    __slots__ = ("project_dir", "S", "T", "N", "D", "Db", "L", "n_lh", "L_lh",
+    __slots__ = ("S", "T", "N", "D", "Db", "L", "n_lh", "L_lh",
                  "D_grad", "dim", "layout", "inputs", "cpu_inputs", "Params",
-                 "packed", "grad", "boundary_mask", "mtc", "ini_val", "cfg")
+                 "packed", "grad", "boundary_mask", "ini_val", "cfg")
 
     def __init__(self, project_dir: Path, S: int, mode: str = "gMSHBM"):
-        from arealmshbm.data_io.profile_io import read_subject_profile_packed_tnd
-        from arealmshbm.step2_io.sparse_inputs import Step2SparseInputs
-        from arealmshbm.step2_io.tests._layout_oracle import (
-            build_step2_layout_dense,
-        )
+        from arealmshbm.step2_io import load_step2_sparse_inputs
         from arealmshbm.step2_pipeline import Step2Config, Step2Pipeline
 
         cfg = Step2Config(
@@ -59,7 +57,6 @@ class BenchFixture:
             verbose=False,
         )
         self.cfg = cfg
-        self.project_dir = project_dir
         pipe = Step2Pipeline(cfg)
         cpu_inputs = pipe.load_inputs()
         Params = pipe.initialize_params(cpu_inputs)
@@ -68,7 +65,6 @@ class BenchFixture:
         self.Params = Params
         self.ini_val = float(Params["ini_val"])
         self.boundary_mask = cpu_inputs.boundary_mask
-        self.mtc = cpu_inputs.mtc
         self.dim = int(cpu_inputs.dim)
 
         self.S = S
@@ -81,33 +77,18 @@ class BenchFixture:
         self.L_lh = self.L // 2
         self.D_grad = int(cpu_inputs.D_grad)
 
-        self.layout = build_step2_layout_dense(self.boundary_mask)
-
-        # Raw packed BOLD, exactly the on-disk bytes the CPU loader widens.
-        packed = np.empty((S, self.T, self.N, self.Db), dtype=np.uint8)
+        # The Session's inputs, and what their readers deliver: a kernel
+        # test's Session and its CPU reference start from the same bytes.
+        self.inputs = load_step2_sparse_inputs(cfg)
+        self.layout = self.inputs.layout
+        self.packed = np.empty((S, self.T, self.N, self.Db), dtype=np.uint8)
         for s in range(S):
-            path = cpu_inputs.bold_loader.subject_path(s + 1) \
-                if hasattr(cpu_inputs.bold_loader, "subject_path") else None
-            if path is None:
-                path = _profile_path(project_dir, s + 1)
-            arr, d_unpacked = read_subject_profile_packed_tnd(path)
-            if int(d_unpacked) != self.D:
-                raise AssertionError(
-                    f"bench sub{s+1}: D_unpacked={d_unpacked} != D={self.D}")
-            packed[s] = arr
-        self.packed = packed
-
-        grad = None
-        if cpu_inputs.grad_loader is not None:
-            grad = np.empty((S, self.N, self.D_grad), dtype=np.float32)
-            buf = np.empty((self.T, self.N, self.D_grad), dtype=np.float32)
+            self.inputs.bold_reader(s + 1, self.packed[s])
+        self.grad = None
+        if self.inputs.grad_reader is not None:
+            self.grad = np.empty((S, self.N, self.D_grad), dtype=np.float32)
             for s in range(S):
-                cpu_inputs.grad_loader.load_into(s + 1, buf)
-                grad[s] = buf[0]
-        self.grad = grad
-
-        self.inputs = Step2SparseInputs.from_arrays(
-            self.layout, packed, self.mtc, grad_SNDg=grad)
+                self.inputs.grad_reader(s + 1, self.grad[s])
 
     # ── convenience ──
     def bold_f32(self, s: int) -> np.ndarray:
@@ -119,14 +100,6 @@ class BenchFixture:
         _widen_normalize_bitpacked_to_f32_NTD_kernel(
             np.ascontiguousarray(self.packed[s].transpose(1, 0, 2)), out, self.D)
         return out
-
-
-def _profile_path(project_dir: Path, s_1: int) -> Path:
-    import json
-    with open(Path(project_dir) / "cohort.json", "r", encoding="utf-8") as fh:
-        man = json.load(fh)
-    rel = man["subjects"][s_1 - 1]["profile_b2nd"]
-    return Path(project_dir) / rel
 
 
 def bench_available(name: str = "proj") -> bool:

@@ -76,7 +76,7 @@ def test_the_config_sparse_limits_match_the_kernel_constants() -> None:
 
 
 def test_gpu_rejects_more_clusters_than_the_kernels_take() -> None:
-    """``init_hard_labels``'s per-lane accumulators cap L (``check_dims``).
+    """``init_soft``'s per-lane accumulators cap L (``check_dims``).
 
     Checked at config time, not at Session-ctor time: the ctor only runs
     after the step-2 loader and the kernel compile.

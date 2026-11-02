@@ -279,20 +279,25 @@ def test_t_blocks_splits_on_the_header_hint(tmp_path: Path):
 
 
 @_needs_e2e
-def test_sessions_may_differ_in_T_and_run_count(tmp_path: Path):
+@pytest.mark.parametrize("layout", [
+    # sess 1: two runs of T=4; sess 2: one run of T=6; sess 3: one of
+    # T=4 -- ``run_counts=[2, 1, 1]`` across three reader calls.
+    [(4, 4), (6,), (4,)],
+    # A short session, then three of equal length: the second reader
+    # call is a 3-pair block the ingest splits into groups of 2 + 1.
+    [(5,), (7,), (7,), (7,)],
+])
+def test_sessions_may_differ_in_T_and_run_count(tmp_path: Path, layout):
     """Sessions of different length and a session with two runs, through
     the real ingest: ``_t_blocks`` splits the reader calls on ``T`` and
-    ``_grouped`` folds the flat per-run stream back into sessions
-    (``run_counts=[2, 1, 1]`` across three reader calls). The oracle is
-    the compute leaf fed the same arrays directly; the .b2nd read back
-    from disk must equal the in-memory slab."""
+    ``_grouped`` folds the flat per-run stream back into sessions. The
+    oracle is the compute leaf fed the same arrays directly; the .b2nd
+    read back from disk must equal the in-memory slab."""
     from arealmshbm.data_io.profile_io import read_subject_profile_packed_tnd
 
     seed_idx, mw, n_lh, n_rh = M.subject_seed_and_mw("fsaverage3",
                                                      "fsaverage6")
     n_full = n_lh + n_rh
-    # sess 1: two runs of T=4; sess 2: one run of T=6; sess 3: one of T=4.
-    layout = [(4, 4), (6,), (4,)]
     rng = np.random.default_rng(11)
     fl = tmp_path / "data_list" / "fMRI_list"
     fl.mkdir(parents=True)

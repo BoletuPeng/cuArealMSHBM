@@ -2,19 +2,20 @@
 
 Step-2 leaf L9 — bilateral block-diagonal boundary mask, mode-dispatched.
 
-Mirrors MATLAB
-``CBIG_ArealMSHBM_cdgMSHBM_estimate_group_priors_sequential.m`` lines
-166-170::
+Mirrors the ``boundary_mask`` line of the stock parents
+(``CBIG_ArealMSHBM_gMSHBM_estimate_group_priors_parent.m`` line 237 and
+``CBIG_ArealMSHBM_dMSHBM_estimate_group_priors_parent.m`` line 225 at
+CBIG 2296385)::
 
-    if strcmp(mode, 'gMSHBM')
-        boundary_mask = [lh_boundary zeros(size(rh_boundary));
-                         zeros(size(lh_boundary)) rh_boundary]
-    else  % dMSHBM
-        boundary_mask = [lh_boundary zeros(size(lh_boundary));
-                         zeros(size(rh_boundary)) rh_boundary]
+    % gMSHBM parent
+    boundary_mask = [lh_boundary zeros(size(rh_boundary));
+                     zeros(size(lh_boundary)) rh_boundary];
+    % dMSHBM parent
+    boundary_mask = [lh_boundary zeros(size(lh_boundary));
+                     zeros(size(rh_boundary)) rh_boundary];
 
 For bilateral fsaverage6 (``size(lh_boundary) == size(rh_boundary)``)
-both branches produce numerically identical block-diagonal matrices.
+both forms produce numerically identical block-diagonal matrices.
 The dispatch is preserved for forward-compat with asymmetric meshes
 should they ever arise.
 

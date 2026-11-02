@@ -167,7 +167,8 @@ Step2Pipeline.run(cfg)                                                [arealmshb
 │   ├── load_spatial_mask                                             data_io/load_spatial_mask
 │   ├── build_step2_boundary_mask(mode)                               step2_init/boundary_mask
 │   └── compose_init_state(bold_loader)                               step2_init/compose_init_state
-│       (fused per-sub argmax + theta + (S, N, L) fp32 s_lambda;
+│       (stock init: per-sub soft masked posterior under the group
+│        centroids + theta_num theta, (S, N, L) fp32 s_lambda;
 │        streams one subject's BOLD at a time)
 │
 ├── initialize_params()                                               inline + initialize_concentration
@@ -253,7 +254,7 @@ Indentation in the **Component** column mirrors call depth (`├` / `│`
 |  9 | `│  ├ load_group_mtc` | leaf | [step2_io/load_group_mtc.py](../arealmshbm/step2_io/load_group_mtc.py) | 1 |
 | 10 | `│  ├ load_spatial_mask` | leaf | [data_io/load_spatial_mask.py](../arealmshbm/data_io/load_spatial_mask.py) | 1 |
 | 11 | `│  ├ build_step2_boundary_mask` | leaf | [step2_init/boundary_mask.py](../arealmshbm/step2_init/boundary_mask.py) | 1 |
-| 12 | `│  └ compose_init_state` (fused per-sub argmax+theta+s_lambda) | leaf | [step2_init/compose_init_state.py](../arealmshbm/step2_init/compose_init_state.py) | 1 |
+| 12 | `│  └ compose_init_state` (stock init: per-sub soft masked posterior + theta_num theta) | leaf | [step2_init/compose_init_state.py](../arealmshbm/step2_init/compose_init_state.py) | 1 |
 | 14 | `├ initialize_params` | phase | pipeline.py | 1 |
 | 15 | `│  └ initialize_concentration` | leaf | [initialize_concentration/](../arealmshbm/initialize_concentration/) | 1 |
 | 16 | `├ outer-inter loop` (≤ I) | loop | pipeline.py | 1 |
@@ -339,8 +340,8 @@ arealmshbm/
 ├── step2_init/                            # init-phase leaves
 │   ├── _kernels.py                        numba init kernels
 │   ├── boundary_mask.py                   L9 — block-diagonal (g/dMSHBM)
-│   └── compose_init_state.py              L8 — fused per-subject argmax +
-│                                          theta + s_lambda init
+│   └── compose_init_state.py              L8 — stock init: per-subject soft
+│                                          masked posterior + theta_num theta
 │
 └── step2_em_outer/                        # outer-EM closed-form leaves
     ├── intra_subject_var_loop.py          L17 — s_psi + sigma while-loop
@@ -384,7 +385,7 @@ port measured on the same bench (2026-09-03).
 (The dense-port / `cpu` columns are the pre-rewrite baselines recorded
 in [`step2_sparse_design.md`](step2_sparse_design.md) §0; the `'gpu'`
 column was re-measured 2026-09-03 on the final HEAD, after the F3 kernel
-pass — K3/K6 0.80/0.77 → 0.34/0.35 ms per launch, `init_hard_labels`
+pass — K3/K6 0.80/0.77 → 0.34/0.35 ms per launch, the init kernel
 22.9 → 8.5 ms, K7 39 → 25 ms, every change bit-identical in output.)
 
 Per-stage, warm, S=1 → S=2: `load_inputs` 0.100 → 0.174 s ·
@@ -412,18 +413,18 @@ Per-launch means (S=1): K3 `x_dot_sl_bits` 0.34 ms, K6 `acc_P` 0.35,
 K8-K10 E-step rows 0.40, M-step 0.17 per `iter_m` (×2.4), K5 connect
 0.15, K12 theta 0.22.
 
-Parity vs the CPU reference (internal step-2 comparison harness, §7.3 bars):
-S=1 theta argmax flips **0** (bar ≤ 500), support-diff rows 1, dead-alive
-rows **1 303 vs 1 303**, `kappa` max-rel **0.0** (bit-identical),
-first-inter `Record` rel **3.99e-6** (bar ≤ 5e-3), `iter_inter` 10 == 10.
-S=2 argmax flips **0**, dead-alive **168 vs 168**, `kappa` **0.0**,
-first-inter `Record` rel **1.38e-6**. Two `gpu` runs are `np.array_equal`
-on every saved field at both S (theta compared as its csc triplet).
-Downstream: step 3 (dense GPU EM, sub-001) run from the `'gpu'` prior
-produces **exactly the same labels** as from the CPU prior (0 of 73 641
-cortex vertices differ); the dense step-2 port's prior differed on 4 758
-(93.5 % agreement). `epsil` max-rel ~1.0 vs CPU at S=1/S=2 is the
-ill-conditioned `invAd(dim, R→1)` and has no downstream effect.
+Parity vs the CPU reference (internal step-2 comparison harness, §7.3 bars;
+2026-11-01, stock init): S=1 theta argmax flips **2** (bar ≤ 500),
+support-diff rows 5, dead-alive rows **705 vs 707**, `kappa` max-rel
+**1.5e-5**, first-inter `Record` rel **2.7e-5** (bar ≤ 5e-3), `iter_inter`
+9 vs 10 (the `gpu` run meets the inter stop test one iteration earlier).
+S=2 argmax flips **1**, support-diff rows 1, dead-alive **60 vs 60**,
+`kappa` **4.3e-7**, first-inter `Record` rel **9.9e-7**. Two `gpu` runs
+are `np.array_equal` on every saved field at both S (theta compared as its
+csc triplet). Downstream: step 3 (`gpu`, sub-001, 6 sessions) run from the
+`'gpu'` prior vs from the CPU prior differs on **2 of 74 239** cortex
+vertices. `epsil` max-rel ~1.0 vs CPU at S=1/S=2 is the ill-conditioned
+`invAd(dim, R→1)` and has no downstream effect.
 
 Reproduce:
 

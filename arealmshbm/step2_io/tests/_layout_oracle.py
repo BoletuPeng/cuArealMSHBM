@@ -1,12 +1,11 @@
 """_layout_oracle.py — dense-input reference builder for the step-2
 :class:`~arealmshbm.step2_io.sparse_layout.Step2Layout`.
 
-The test oracle for :func:`arealmshbm.step2_io.build_step2_layout` and
-the layout builder of the synthetic step-2 session fixtures. It finishes
-through the library's private ``_finish`` (the shared CSR/CSC assembly
-and invariant checks), so the equality it pins is on the CSR extraction
-from the mask. ``layouts_equal`` is the structural equality the tests
-assert.
+The test oracle for :func:`arealmshbm.step2_io.build_step2_layout`. It
+finishes through the library's private ``_finish`` (the shared CSR/CSC
+assembly and invariant checks), so the equality it pins is on the CSR
+extraction from the mask. ``layouts_equal`` is the structural equality
+the tests assert.
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """
