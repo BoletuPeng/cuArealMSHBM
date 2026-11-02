@@ -240,13 +240,28 @@ def test_row_stats_exact(ctx):
 
 
 def test_init_matches_compose_init_state(ctx):
-    """K1: hard labels / medial / s_lambda / theta equal ``compose_init_state``."""
+    """K1: s_lambda / theta are bit-equal to ``compose_init_state`` (design §1.2).
+
+    Bit-identical by construction (one serial fp32 accumulation order, every
+    later op fp32 or fp64-rounded-to-fp32); ``exp`` is the one op evaluated
+    by two libraries (libm vs CUDA, ≤ 1 ulp in fp64 before the fp32
+    rounding) and measured at 0 differing cells, so the test pins the bit
+    pattern: a failure is a summation-order / FMA regression or a libm
+    change, not noise. The fixture has to carry the subnormal and the
+    all-underflow cases (§1.10) for the check to cover them on device.
+    """
     fx = ctx["fx"]
     init = ctx["init"]
-    assert np.array_equal(init["s_lambda"], fx.Params["s_lambda"])
+    ref = fx.Params["s_lambda"]
+    assert np.array_equal(_bits(init["s_lambda"]), _bits(ref))
     theta_ref = fx.Params["theta"].copy()
     theta_ref[fx.boundary_mask == 0] = 0.0      # P-layout carries no out-of-P cell
-    assert np.array_equal(init["theta"], theta_ref)
+    assert np.array_equal(_bits(init["theta"]), _bits(theta_ref))
+    sl = ref[0]
+    assert ((sl != 0) & ((_bits(sl) & 0x7f800000) == 0)).any(), \
+        "the fixture must contain subnormal init cells"
+    assert ((sl == 0).all(axis=1) & (fx.boundary_mask != 0).any(axis=1)).any(), \
+        "the fixture must contain all-underflow rows"
 
 
 def test_x_dot_sl_bits_vs_fp64(ctx):
@@ -876,6 +891,10 @@ def test_outer_leaves_zero_norm_column():
     assert np.isfinite(new).all() and np.isfinite(cos).all()
 
 
+def _bits(a):
+    return np.ascontiguousarray(a, dtype=np.float32).view(np.uint32)
+
+
 def _rel(a, b):
     a = np.asarray(a, np.float64).ravel()
     b = np.asarray(b, np.float64).ravel()
@@ -941,3 +960,14 @@ def test_connect_u_shared_limit_is_exact():
     assert static == K.CONNECT_STATIC_SHARED
     assert 4 * K.MAX_D_GRAD + static <= limit
     assert limit < 4 * (K.MAX_D_GRAD + 1) + static
+
+
+def test_init_soft_shared_limit():
+    """``INIT_SMEM_MAX`` is ``init_soft``'s dynamic shared memory at the L
+    ceiling (the ``at`` stage + one logit row per warp) and sits inside the
+    device's per-block default, so a constant edit fails here, not at launch.
+    """
+    limit = int(cp.cuda.Device().attributes["MaxSharedMemoryPerBlock"])
+    assert K.INIT_SMEM_MAX == (K.INIT_ROWS * K.init_dt()
+                               + K.INIT_WARPS * K.MAX_CLUSTERS) * 4
+    assert K.INIT_SMEM_MAX <= limit

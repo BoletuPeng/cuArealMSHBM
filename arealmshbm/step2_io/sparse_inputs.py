@@ -1,10 +1,11 @@
 """sparse_inputs.py — inputs of the step-2 ``gpu`` backend.
 
 Contract: ``docs/step2_sparse_design.md`` §5. The dataclass below is the
-hand-off between the loader (``load_step2_sparse_inputs``) and the device
-Session (``step2_em_iter_master.session_gpu.Step2SparseSession``);
-``Step2SparseInputs.from_arrays`` builds the same object from in-memory
-arrays for tests and benches.
+hand-off between the loader (``load_step2_sparse_inputs``, the only
+place the package builds one) and the device Session
+(``step2_em_iter_master.session_gpu.Step2SparseSession``). Tests go
+through the same loader, on a synthetic project they write
+(``step2_io/tests/_synthetic_project.py``) or on the bench project.
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """
@@ -36,6 +37,13 @@ GradReader = Callable[[int, np.ndarray], None]      # out: (N, D_grad) fp32
 @dataclass
 class Step2SparseInputs:
     """Everything the sparse Session needs, host-side.
+
+    Built by :func:`load_step2_sparse_inputs`, the only place the package
+    constructs one. Its two readers pull one subject from disk into a
+    caller-owned buffer and hold nothing themselves, so the cohort is on
+    the host only where the Session's residency choice (design §2.2)
+    puts it: in the stream-mode host cache when that fits, nowhere
+    otherwise.
 
     Attributes
     ----------
@@ -78,63 +86,6 @@ class Step2SparseInputs:
     def L(self) -> int:
         """Parcel count, taken from the layout."""
         return int(self.layout.L)
-
-    def __post_init__(self) -> None:
-        if self.layout.N != self.N:
-            raise ValueError(f"layout.N={self.layout.N} != N={self.N}")
-        if self.n_lh + self.n_rh != self.N or self.layout.n_lh != self.n_lh:
-            raise ValueError("n_lh / n_rh inconsistent with N / layout")
-        mtc = np.asarray(self.mtc)
-        if mtc.ndim != 2 or mtc.shape[0] != self.D or mtc.shape[1] != self.layout.L:
-            raise ValueError(
-                f"mtc shape {mtc.shape} != (D={self.D}, L={self.layout.L})")
-        if self.dim != self.D - 1:
-            raise ValueError(f"dim={self.dim} must equal D-1={self.D - 1}")
-
-    # ── in-memory constructor (tests / benches) ──
-    @classmethod
-    def from_arrays(
-        cls,
-        layout: Step2Layout,
-        packed_STNDb: np.ndarray,
-        mtc: np.ndarray,
-        *,
-        D: Optional[int] = None,
-        grad_SNDg: Optional[np.ndarray] = None,
-    ) -> "Step2SparseInputs":
-        """Build inputs from a ``(S, T, N, Db)`` uint8 packed stack (+ optional
-        ``(S, N, D_grad)`` fp32 gradients). ``D`` defaults to ``mtc.shape[0]``.
-        """
-        pk = np.ascontiguousarray(packed_STNDb, dtype=np.uint8)
-        if pk.ndim != 4:
-            raise ValueError("packed_STNDb must be (S, T, N, Db)")
-        S, T, N, Db = (int(x) for x in pk.shape)
-        mtc = np.ascontiguousarray(mtc, dtype=np.float64)
-        D = int(mtc.shape[0] if D is None else D)
-        if (D + 7) // 8 != Db:
-            raise ValueError(f"ceil(D/8)={(D + 7) // 8} != Db={Db}")
-
-        def _bold(s_1: int, out: np.ndarray) -> None:
-            np.copyto(out, pk[s_1 - 1])
-
-        grad_reader: Optional[GradReader] = None
-        D_grad = 0
-        if grad_SNDg is not None:
-            g = np.ascontiguousarray(grad_SNDg, dtype=np.float32)
-            if g.ndim != 3 or g.shape[0] != S or g.shape[1] != N:
-                raise ValueError("grad_SNDg must be (S, N, D_grad)")
-            D_grad = int(g.shape[2])
-
-            def _grad(s_1: int, out: np.ndarray) -> None:
-                np.copyto(out, g[s_1 - 1])
-
-            grad_reader = _grad
-
-        return cls(
-            layout=layout, S=S, T=T, N=N, D=D, D_grad=D_grad,
-            n_lh=layout.n_lh, n_rh=N - layout.n_lh, mtc=mtc, dim=D - 1,
-            bold_reader=_bold, grad_reader=grad_reader,
-        )
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -202,9 +153,9 @@ def _check_subject_header(view, shape: Tuple[int, int, int], D: int,
     not from the loader (the CPU loader,
     ``subject_loaders.SubjectProfileLoader``, runs the same pair):
 
-    * packed shape ``== (T, N, ceil(D/8))``. ``np.copyto`` broadcasts, so
-      a subject holding a single session would otherwise be replicated
-      into all ``T`` slots instead of raising;
+    * packed shape ``== (T, N, ceil(D/8))``. The decode would refuse the
+      mismatched buffer on its own, with an error that names neither
+      the subject nor its file;
     * ``D_unpacked == D``, which the shape does not pin: 1174 and 1175
       share ``Db = 147``, so a cohort mixing the two would be normalised
       and unpacked with subject 1's ``D``.

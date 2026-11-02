@@ -429,8 +429,9 @@ def _spatial_connect_per_subject_numba(
 ):
     """Sum-across-T-sessions of -||grad - u_parcel||² per (n, l), in fp32.
 
-    Implements MATLAB lines 549-565 of
-    ``cdgMSHBM_estimate_group_priors_sequential.m`` for one subject
+    Implements the stock child's spatial-connectedness block
+    (``CBIG_ArealMSHBM_gMSHBM_estimate_group_priors_child.m`` lines
+    225-241 at CBIG 2296385, ``log_connect_vmf``) for one subject
     using the gemm-trick decomposition from
     :class:`arealmshbm.spatial_priors.spatial_connect.ConnectSession`.
 

@@ -29,6 +29,8 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 import cupy as cp
 import numpy as np
 
+from arealmshbm.step2_init import init_kappa_T
+
 from . import _kernels_gpu as K
 
 
@@ -481,45 +483,40 @@ class Step2SparseSession:
         self._rmax.fill(0)
         self._rmax_dense.fill(0)
 
-        hard = cp.empty(S * N, dtype=cp.int32)
-        med = cp.empty(S * N, dtype=cp.uint8)
         dt = self._init_dt
-        smem = K.INIT_ROWS * dt * 4      # the ``at`` stage only
+        # the ``at`` stage + one fp32 logit row per warp (§1.2)
+        smem = (K.INIT_ROWS * dt + K.INIT_WARPS * L) * 4
         inv_T = np.float32(1.0) / np.float32(T)
+        kappa_T = init_kappa_T(self.ini_val, T)
         if self._bold_cache_mode == "eager_bitpacked":
-            self._call("init_hard_labels",
+            self._call("init_soft",
                        (K.grid(N, K.INIT_ROWS), S), (K.INIT_BLOCK,),
                        (self._packed, self._row_mean, self._row_inv,
-                        self._mtc_DL, hard, med,
+                        self._mtc_DL, self._lay["row_ptr"], self._lay["col"],
+                        self._s_lambda,
                         np.int32(S), np.int32(T), np.int32(N), np.int32(D),
                         np.int32(Db), np.int32(L), np.int32(dt),
-                        np.float32(inv_T)),
+                        np.float32(inv_T), np.float32(kappa_T), np.int64(P)),
                        shared_mem=smem)
         else:
             for s in range(S):
                 self._stream_subject(s)
-                self._call("init_hard_labels",
+                self._call("init_soft",
                            (K.grid(N, K.INIT_ROWS), 1), (K.INIT_BLOCK,),
                            (self._packed, self._row_mean[s], self._row_inv[s],
-                            self._mtc_DL, hard[s * N:], med[s * N:],
+                            self._mtc_DL, self._lay["row_ptr"], self._lay["col"],
+                            self._s_lambda[s],
                             np.int32(1), np.int32(T), np.int32(N), np.int32(D),
                             np.int32(Db), np.int32(L), np.int32(dt),
-                            np.float32(inv_T)),
+                            np.float32(inv_T), np.float32(kappa_T), np.int64(P)),
                            shared_mem=smem)
 
-        self._call("init_slambda", (K.grid(S * N, 256),), (256,),
-                   (hard, med, self._lay["row_ptr"], self._lay["col"],
-                    self._s_lambda, np.int32(S), np.int32(N), np.int64(P)))
-
         eps_f64 = K.EPS_F64
-        inv_S_f32 = np.float32(1.0) / np.float32(S)
-        theta_on = np.float32(np.float64(inv_S_f32) + eps_f64)
-        theta_off = np.float32(eps_f64)
         self._call("init_theta", (K.grid(P, 256),), (256,),
                    (self._s_lambda, self._theta, self._log_theta,
                     self._active, np.int32(S), np.int64(P),
-                    np.float32(theta_on), np.float32(theta_off)))
-        self._theta_out = float(theta_off)
+                    np.float64(eps_f64)))
+        self._theta_out = float(np.float32(eps_f64))   # every cell outside P (§1.6)
         self._rebuild_active(fold_slot=None)
 
         self._sigma.fill(np.float32(self.ini_val))
@@ -530,7 +527,6 @@ class Step2SparseSession:
         self._kappa_seed = float(np.float32(self.ini_val))
         self._kappa_final = float(self.ini_val)
 
-        del hard, med
         cp.cuda.get_current_stream().synchronize()
         self.timings["initialize_state"] = time.perf_counter() - t0
 

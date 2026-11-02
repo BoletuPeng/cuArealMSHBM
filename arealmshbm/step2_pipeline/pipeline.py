@@ -13,7 +13,8 @@ Stages:
                             from subject 1; subjects are decoded on demand,
                             not preloaded).
     2. initialize_params  — sigma/s_psi/epsil/mu/kappa/s_t_nu from group.mat;
-                            init s_lambda per subject via mtc-argmax projection;
+                            init s_lambda per subject via the stock soft masked
+                            posterior (compose_init_state);
                             init theta from s_lambda.
     3. outer EM loop      — interleave intra-EM with inter_subject_var. Inside
                             each intra-EM iter, run ``vmf_clustering_batch`` +
@@ -397,18 +398,19 @@ class Step2Pipeline:
             "Record": [],
         }
 
-        # Fused compose of Params["s_lambda"] + Params["theta"] (MATLAB
-        # lines 137-180). Streams per-subject BOLD through a single
+        # Fused compose of Params["s_lambda"] + Params["theta"]: the
+        # stock child's ``ini_s_lambda`` + the parent's mask / normalise /
+        # ``theta_num`` block. Streams per-subject BOLD through a single
         # scratch slot (one per decode worker, up to 4, when
-        # bold_cache_mode='stream'), writes Params["s_lambda"] directly
-        # in (S, N, L) fp32 layout, and computes theta inline from the
-        # per-(n, l) active-subject count.
+        # bold_cache_mode='stream') and writes Params["s_lambda"] directly
+        # in (S, N, L) fp32 layout.
         t_compose = time.perf_counter()
         Params["s_lambda"], Params["theta"] = compose_init_state(
             bold_loader=inputs.bold_loader,
             group_mtc=inputs.mtc,
             boundary_mask=inputs.boundary_mask,
             num_clusters=L,
+            ini_val=ini_val,
         )
         self.timings["initialize_params.compose"] = time.perf_counter() - t_compose
 
@@ -760,7 +762,7 @@ class Step2Pipeline:
                 f"resolved={sess.bold_cache_mode!r}"
             )
 
-        # Device-side init: K1 (hard labels + compose) + log_theta +
+        # Device-side init: K1 (init_soft + init_theta) + log_theta +
         # the first active-support build. Replaces the CPU path's
         # host ``compose_init_state`` + ``upload_initial_state`` +
         # ``cache_mtc``.

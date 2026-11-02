@@ -2,11 +2,13 @@
 
 Two layers:
 
-* a **synthetic project** built the way ``test_subject_loaders.py`` does
-  (real ``.b2nd`` + ``cohort.json`` + a hand-written ``group.mat`` /
-  spatial mask / gradients), with ``load_avg_mesh`` monkeypatched to a
-  tiny fake mesh — it exercises both gradient formats, the per-subject
-  reader, ``overlap`` on and off, and the medial-wall contract;
+* a **synthetic project** (``_synthetic_project.make_project``: real
+  ``.b2nd`` + ``cohort.json`` + a hand-written ``group.mat`` / spatial
+  mask / gradients; ``load_project`` loads it with a tiny fake mesh
+  standing in for ``load_avg_mesh`` — the Session tests get their
+  cohort through the same pair) — it exercises both gradient formats,
+  the per-subject reader, ``overlap`` on and off, and the medial-wall
+  contract;
 * a **bench-backed** layer (``MSHBM_STEP2_BENCH_DIR``, default
   ``testdata/step2_bench``) asserting that every field equals what the
   dense ``Step2Pipeline.load_inputs`` path would have produced —
@@ -23,137 +25,25 @@ from pathlib import Path
 import numpy as np
 import pytest
 import scipy.io as sio
-import scipy.sparse as sp
 
 from arealmshbm.data_io.cohort import backfill_cohort_json
 from arealmshbm.data_io.profile_io import profile_path, write_subject_profile_tnd
-from arealmshbm.step2_io import (
-    Step2SparseInputs,
-    load_step2_sparse_inputs,
-)
+from arealmshbm.step2_init.boundary_mask import build_step2_boundary_mask
+from arealmshbm.step2_io import load_step2_sparse_inputs
 from arealmshbm.step2_io.tests._layout_oracle import (
     build_step2_layout_dense,
     layouts_equal,
+)
+from arealmshbm.step2_io.tests._synthetic_project import (
+    SEED,
+    TARG,
+    load_project,
+    make_project,
 )
 from arealmshbm.vmf_clustering.tests._sub001_fixture import missing_avg_mesh
 
 
 BENCH_DIR = Path(os.environ.get("MSHBM_STEP2_BENCH_DIR", "testdata/step2_bench"))
-
-TARG, SEED = "fsaverage6", "fsaverage3"
-
-
-# ─────────────────────────────────────────────────────────────────────
-# Synthetic project fixture
-# ─────────────────────────────────────────────────────────────────────
-class _Cfg:
-    """The subset of ``Step2Config`` the loader reads."""
-
-    def __init__(self, project_dir, S, T, L, mode, n_grad):
-        self.project_dir = project_dir
-        self.num_sub = S
-        self.num_session = T
-        self.num_clusters = L
-        self.mode = mode
-        self.mesh = TARG
-        self.seed_mesh = SEED
-        self.n_grad_components = n_grad
-
-
-def _fake_mesh(n_h: int, mw: np.ndarray):
-    """``load_avg_mesh`` stand-in — only ``MARS_label`` is read."""
-    lab = np.ones((1, n_h), dtype=np.int32) * 2
-    lab[0, mw] = 1                      # 1 == medial wall
-    return lambda hemi, mesh, surf: {"MARS_label": lab}
-
-
-def _make_project(tmp_path: Path, *, S=2, T=2, n_h=9, L_h=3, D=11,
-                  n_grad=4, grad_fmt="npy", mw=(0, 4), break_mw=False,
-                  seed=0):
-    """Write a complete synthetic step-2 project; return ``(cfg, refs)``."""
-    rng = np.random.default_rng(seed)
-    N, L = 2 * n_h, 2 * L_h
-    mw_idx = np.asarray(mw, dtype=np.int64)
-
-    raws = []
-    for s in range(1, S + 1):
-        raw = (rng.random((T, N, D)) < 0.4).astype(np.float32)
-        if not break_mw:
-            raw[:, mw_idx, :] = 0.0             # LH medial wall
-            raw[:, n_h + mw_idx, :] = 0.0       # RH medial wall
-        write_subject_profile_tnd(profile_path(tmp_path, str(s), TARG, SEED),
-                                  np.ascontiguousarray(raw))
-        raws.append(raw)
-
-    grads = []
-    for s in range(1, S + 1):
-        gdir = tmp_path / "gradients" / f"sub{s}"
-        gdir.mkdir(parents=True, exist_ok=True)
-        lh = rng.standard_normal((n_h, n_grad + 2)).astype(np.float32)
-        rh = rng.standard_normal((n_h, n_grad + 2)).astype(np.float32)
-        if grad_fmt == "npy":
-            np.save(gdir / f"lh_emb_{n_grad}_distance_matrix.npy", lh)
-            np.save(gdir / f"rh_emb_{n_grad}_distance_matrix.npy", rh)
-        else:
-            sio.savemat(gdir / f"lh_emb_{n_grad}_distance_matrix.mat",
-                        {"emb": lh})
-            sio.savemat(gdir / f"rh_emb_{n_grad}_distance_matrix.mat",
-                        {"emb": rh})
-        grads.append(np.concatenate([lh[:, :n_grad], rh[:, :n_grad]], axis=0))
-
-    (tmp_path / "group").mkdir(parents=True, exist_ok=True)
-    mtc = rng.standard_normal((D, L))
-    sio.savemat(tmp_path / "group" / "group.mat",
-                {"mtc": mtc,
-                 "epsil": np.array([[3.0]]),
-                 "lh_labels": np.arange(n_h).reshape(-1, 1),
-                 "rh_labels": np.arange(n_h).reshape(-1, 1),
-                 "lambda": rng.standard_normal((D, 4 * L))},
-                do_compression=True, format="5")
-
-    (tmp_path / "spatial_mask").mkdir(parents=True, exist_ok=True)
-    lh_b = (rng.random((n_h, L_h)) < 0.5).astype(np.float64)
-    rh_b = (rng.random((n_h, L_h)) < 0.5).astype(np.float64)
-    for m in (lh_b, rh_b):
-        m[:, 0] = 0.0
-        m[3, 0] = 1.0                            # no empty column
-    sio.savemat(tmp_path / "spatial_mask" / f"spatial_mask_{TARG}.mat",
-                {"lh_boundary": sp.csc_matrix(lh_b),
-                 "rh_boundary": sp.csc_matrix(rh_b)},
-                do_compression=True, format="5")
-
-    backfill_cohort_json(tmp_path,
-                         subjects=[str(s) for s in range(1, S + 1)],
-                         sessions=[str(t) for t in range(1, T + 1)],
-                         targ_mesh=TARG, seed_mesh=SEED,
-                         n_grad_components=n_grad)
-
-    cfg = _Cfg(tmp_path, S, T, L, "gMSHBM", n_grad)
-    refs = {"raws": raws, "grads": grads, "mtc": mtc,
-            "lh_b": lh_b, "rh_b": rh_b, "n_h": n_h, "N": N, "L": L, "D": D,
-            "mw": mw_idx}
-    return cfg, refs
-
-
-@pytest.fixture()
-def patched_mesh(monkeypatch):
-    # ``arealmshbm.data_io.load_avg_mesh`` names the re-exported function
-    # in the package namespace, so the dotted-string form of setattr
-    # resolves to the function, not the module. Grab the module itself.
-    import importlib
-    mod = importlib.import_module("arealmshbm.data_io.load_avg_mesh")
-
-    def _install(n_h, mw):
-        monkeypatch.setattr(mod, "load_avg_mesh",
-                            _fake_mesh(n_h, np.asarray(mw, dtype=np.int64)))
-    return _install
-
-
-def _dense_bm(lh_b, rh_b):
-    n_h, L_h = lh_b.shape
-    top = np.concatenate([lh_b, np.zeros((n_h, L_h))], axis=1)
-    bot = np.concatenate([np.zeros((n_h, L_h)), rh_b], axis=1)
-    return np.concatenate([top, bot], axis=0)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -161,12 +51,11 @@ def _dense_bm(lh_b, rh_b):
 # ─────────────────────────────────────────────────────────────────────
 @pytest.mark.parametrize("grad_fmt", ["npy", "mat"])
 @pytest.mark.parametrize("overlap", [True, False])
-def test_synthetic_project_round_trip(tmp_path: Path, patched_mesh,
-                                      grad_fmt: str, overlap: bool) -> None:
-    cfg, refs = _make_project(tmp_path, grad_fmt=grad_fmt)
-    patched_mesh(refs["n_h"], refs["mw"])
+def test_synthetic_project_round_trip(tmp_path: Path, grad_fmt: str,
+                                      overlap: bool) -> None:
+    cfg, refs = make_project(tmp_path, grad_fmt=grad_fmt)
 
-    inp = load_step2_sparse_inputs(cfg, overlap=overlap)
+    inp = load_project(cfg, refs, overlap=overlap)
 
     assert (inp.S, inp.T, inp.N, inp.D) == (2, 2, refs["N"], refs["D"])
     assert inp.dim == refs["D"] - 1
@@ -180,7 +69,8 @@ def test_synthetic_project_round_trip(tmp_path: Path, patched_mesh,
     assert np.array_equal(inp.mtc, refs["mtc"])
 
     # layout == the dense pipeline's boundary mask
-    ref_lay = build_step2_layout_dense(_dense_bm(refs["lh_b"], refs["rh_b"]))
+    ref_lay = build_step2_layout_dense(build_step2_boundary_mask(
+        refs["lh_b"], refs["rh_b"], "gMSHBM"))
     assert layouts_equal(inp.layout, ref_lay)
 
     # packed BOLD: bit-identical to what the writer packed
@@ -202,15 +92,14 @@ def test_synthetic_project_round_trip(tmp_path: Path, patched_mesh,
 
 
 def test_a_second_subject_with_another_D_unpacked_raises(
-        tmp_path: Path, patched_mesh) -> None:
+        tmp_path: Path) -> None:
     """D=11 and D=12 share ceil(D/8)=2, so the shape check cannot see it.
 
     Only ``vlmeta.D_unpacked`` distinguishes them, and it is read off
     subject 1; without a per-call check subject 2 would be normalised
     and unpacked with subject 1's D.
     """
-    cfg, refs = _make_project(tmp_path, D=11, seed=17)
-    patched_mesh(refs["n_h"], refs["mw"])
+    cfg, refs = make_project(tmp_path, D=11, seed=17)
 
     rng = np.random.default_rng(5)
     N, T = refs["N"], 2
@@ -222,22 +111,17 @@ def test_a_second_subject_with_another_D_unpacked_raises(
     assert (11 + 7) // 8 == (12 + 7) // 8      # the shapes really do agree
 
     # Only subject 1 is read at load time; the reader checks subject 2.
-    inp = load_step2_sparse_inputs(cfg)
+    inp = load_project(cfg, refs)
     out = np.empty((inp.T, inp.N, inp.D_bytes), dtype=np.uint8)
     with pytest.raises(ValueError, match="D_unpacked"):
         inp.bold_reader(2, out)
 
 
-def test_a_second_subject_with_fewer_sessions_raises(
-        tmp_path: Path, patched_mesh) -> None:
-    """A T=1 subject must raise, not be broadcast into all T slots.
-
-    ``np.copyto`` broadcasts a leading axis of length 1, so without the
-    packed-shape check subject 2 would silently become T identical
-    copies of its single session.
-    """
-    cfg, refs = _make_project(tmp_path, T=2, seed=23)
-    patched_mesh(refs["n_h"], refs["mw"])
+def test_a_second_subject_with_fewer_sessions_raises(tmp_path: Path) -> None:
+    """A T=1 subject raises from the reader, naming the subject and its
+    file; the loader, which reads subject 1's header only, cannot see
+    it."""
+    cfg, refs = make_project(tmp_path, T=2, seed=23)
 
     rng = np.random.default_rng(9)
     raw2 = (rng.random((1, refs["N"], refs["D"])) < 0.4).astype(np.float32)
@@ -246,96 +130,66 @@ def test_a_second_subject_with_fewer_sessions_raises(
     write_subject_profile_tnd(profile_path(tmp_path, "2", TARG, SEED),
                               np.ascontiguousarray(raw2))
 
-    inp = load_step2_sparse_inputs(cfg)
+    inp = load_project(cfg, refs)
     out = np.empty((inp.T, inp.N, inp.D_bytes), dtype=np.uint8)
     with pytest.raises(ValueError, match="packed shape"):
         inp.bold_reader(2, out)
 
 
-def test_medial_wall_contract_violation_raises(tmp_path: Path,
-                                               patched_mesh) -> None:
-    cfg, refs = _make_project(tmp_path, break_mw=True, seed=3)
-    patched_mesh(refs["n_h"], refs["mw"])
+def test_medial_wall_contract_violation_raises(tmp_path: Path) -> None:
+    cfg, refs = make_project(tmp_path, break_mw=True, seed=3)
     with pytest.raises(ValueError, match="MW vertices"):
-        load_step2_sparse_inputs(cfg)
+        load_project(cfg, refs)
 
 
-def test_dmshbm_needs_no_gradient(tmp_path: Path, patched_mesh) -> None:
-    cfg, refs = _make_project(tmp_path)
-    patched_mesh(refs["n_h"], refs["mw"])
+def test_dmshbm_needs_no_gradient(tmp_path: Path) -> None:
+    cfg, refs = make_project(tmp_path)
     cfg.mode = "dMSHBM"
-    inp = load_step2_sparse_inputs(cfg)
+    inp = load_project(cfg, refs)
     assert inp.grad_reader is None and inp.D_grad == 0
 
 
-def test_mixed_gradient_suffix_raises(tmp_path: Path, patched_mesh) -> None:
+def test_mixed_gradient_suffix_raises(tmp_path: Path) -> None:
     """Subject 1 with an lh ``.npy`` and an rh ``.mat`` is rejected."""
-    cfg, refs = _make_project(tmp_path)
-    patched_mesh(refs["n_h"], refs["mw"])
+    cfg, refs = make_project(tmp_path)
     rh = tmp_path / "gradients" / "sub1" / "rh_emb_4_distance_matrix.npy"
     sio.savemat(rh.with_suffix(".mat"), {"emb": np.load(rh)})
     rh.unlink()
     backfill_cohort_json(tmp_path, subjects=["1", "2"], sessions=["1", "2"],
                          targ_mesh=TARG, seed_mesh=SEED, n_grad_components=4)
     with pytest.raises(ValueError, match="mixed gradient suffix"):
-        load_step2_sparse_inputs(cfg)
+        load_project(cfg, refs)
 
 
-def test_cohort_disagreement_raises(tmp_path: Path, patched_mesh) -> None:
-    cfg, refs = _make_project(tmp_path)
-    patched_mesh(refs["n_h"], refs["mw"])
+def test_cohort_disagreement_raises(tmp_path: Path) -> None:
+    cfg, refs = make_project(tmp_path)
     cfg.num_sub = 3
     with pytest.raises(ValueError, match="num_sub"):
-        load_step2_sparse_inputs(cfg)
+        load_project(cfg, refs)
     cfg.num_sub = 2
     cfg.num_session = 5
     with pytest.raises(ValueError, match="num_session"):
-        load_step2_sparse_inputs(cfg)
+        load_project(cfg, refs)
     cfg.num_session = 2
     cfg.seed_mesh = "fsaverage4"
     with pytest.raises(ValueError, match="seed_mesh"):
-        load_step2_sparse_inputs(cfg)
+        load_project(cfg, refs)
 
 
-def test_num_clusters_disagreement_raises(tmp_path: Path,
-                                          patched_mesh) -> None:
-    cfg, refs = _make_project(tmp_path)
-    patched_mesh(refs["n_h"], refs["mw"])
+def test_num_clusters_disagreement_raises(tmp_path: Path) -> None:
+    cfg, refs = make_project(tmp_path)
     cfg.num_clusters = 8
     with pytest.raises(ValueError, match="num_clusters"):
-        load_step2_sparse_inputs(cfg)
+        load_project(cfg, refs)
 
 
-def test_bold_reader_rejects_a_wrong_buffer(tmp_path: Path,
-                                            patched_mesh) -> None:
-    cfg, refs = _make_project(tmp_path)
-    patched_mesh(refs["n_h"], refs["mw"])
-    inp = load_step2_sparse_inputs(cfg)
+def test_bold_reader_rejects_a_wrong_buffer(tmp_path: Path) -> None:
+    cfg, refs = make_project(tmp_path)
+    inp = load_project(cfg, refs)
     with pytest.raises(ValueError):
         inp.bold_reader(1, np.empty((inp.T, inp.N, inp.D_bytes), np.float32))
     with pytest.raises(ValueError):
         inp.grad_reader(1, np.empty((inp.N, inp.D_grad + 1), np.float32))
-
-
-def test_from_arrays_matches_a_loaded_bundle(tmp_path: Path,
-                                             patched_mesh) -> None:
-    cfg, refs = _make_project(tmp_path)
-    patched_mesh(refs["n_h"], refs["mw"])
-    inp = load_step2_sparse_inputs(cfg)
-
-    packed = np.empty((inp.S, inp.T, inp.N, inp.D_bytes), dtype=np.uint8)
-    for s in range(inp.S):
-        inp.bold_reader(s + 1, packed[s])
-    grads = np.stack(refs["grads"])
-    mem = Step2SparseInputs.from_arrays(inp.layout, packed, inp.mtc,
-                                        grad_SNDg=grads)
-    assert (mem.S, mem.T, mem.N, mem.D, mem.dim) == \
-           (inp.S, inp.T, inp.N, inp.D, inp.dim)
-    a = np.empty((inp.T, inp.N, inp.D_bytes), np.uint8)
-    b = np.empty_like(a)
-    inp.bold_reader(1, a)
-    mem.bold_reader(1, b)
-    assert np.array_equal(a, b)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -363,7 +217,6 @@ def test_bench_inputs_match_the_dense_path() -> None:
     from arealmshbm.data_io.cohort import read_cohort, resolve_path
     from arealmshbm.data_io.load_spatial_mask import load_spatial_mask
     from arealmshbm.data_io.profile_io import read_subject_profile_packed_tnd
-    from arealmshbm.step2_init.boundary_mask import build_step2_boundary_mask
     from arealmshbm.step2_io import SubjectGradientLoader, load_group_mtc
 
     cfg = _bench_cfg(_BENCH_PROJ, 1)
