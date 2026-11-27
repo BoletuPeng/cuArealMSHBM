@@ -9,10 +9,14 @@
 parcellation from resting-state fMRI, ported end-to-end to Python with
 numba (CPU) and CuPy (GPU) backends. Validated at large scale (300+
 subjects, 1,800+ fMRI sessions) against the original MATLAB
-implementation. **v2.2.0** gives step 2 the reference implementation's
+implementation. **v2.3.0** fixes the surface scheme in code — parcels at
+the fsaverage6 vertices, RSFC seeds at the fsaverage3 vertices — and
+removes the configuration keys, file-name suffixes and rebuild path that
+only ever had one usable value; its results are bit-identical to
+v2.2.0's. Since v2.2.0 step 2 uses the reference implementation's
 initialisation (the soft masked posterior with `theta_num`, on both
 backends): against the reference's own step 2 on the same inputs, the
-trained gMSHBM prior's agreement rises from 78.9 % to 94.1 % (dMSHBM:
+trained gMSHBM prior's agreement rose from 78.9 % to 94.1 % (dMSHBM:
 71.9 % to 81.2 %), at no cost in speed or memory. Since v2.1.0 the
 candidate-set session is the one GPU backend for steps 2 and 3 (step 3:
 all three variants), BOLD is ingested on the GPU through nvCOMP only,
@@ -95,7 +99,7 @@ pipeline runs **~170× faster** end-to-end.
 
 ## Status
 
-**This is the fourth release (v2.2.0)**, containing the CPU and GPU
+**This is the fifth release (v2.3.0)**, containing the CPU and GPU
 backends; the GPU backends for steps 2 and 3 are the candidate-set
 sessions, and step 3's covers all three variants. In large-scale validation — over **300 subjects
 and 1,800 fMRI sessions** to date — it shows alignment with the
@@ -105,7 +109,7 @@ boundaries is mathematically unattainable), together with dramatic
 speed and memory savings (tables below).
 
 The project is still being polished. **All precomputed data** (mesh
-bundles, step-0 caches, pre-trained HCP group priors, spatial masks)
+bundles, step-0 inputs, pre-trained HCP group priors, spatial masks)
 **will be deployed by the installer of the GUI distribution, which is
 under development.** In this source release those assets are
 deliberately absent — see
@@ -119,15 +123,20 @@ All numbers measured on one Windows 11 laptop: RTX 5090 Laptop GPU
 MATLAB baseline is the CBIG reference pipeline **with its compiled MEX
 hot paths** (`mtimesx`), run on the same machine — a stronger baseline
 than a typical cluster node. Every cuArealMSHBM **wall-time** figure
-below was re-measured on the v2.2.0 tree (2026-11-02), and each "total" is
+below was measured on the v2.2.0 tree (2026-11-02) — v2.3.0 changes no
+kernel and no numeric path, so they stand — and each "total" is
 end-to-end driver wall time on a project with no caches (interpreter
 start and input validation included), with the numba and CuPy kernel
 caches warm on disk. The label-agreement rows are carried over from the
 v1.0.0 measurements. The memory rows are measured on the v2.2.0 tree:
 host is the peak resident set of the driver process (except where a row
 names another process), device is the peak `nvidia-smi` usage above the
-idle desktop. Numerically, v2.2.0 reproduces v2.1.0 (itself bit-identical
-to v2.0.0) through step 1: on the 40-subject cohort below, steps 1–3 run on
+idle desktop. Numerically, v2.3.0 reproduces v2.2.0: on the 40-subject
+cohort below, steps 1–3 run on the v2.3.0 tree from the same step-0 output
+reproduce the packed profiles, cohort averages, spatial mask, `group.mat`,
+the trained prior and all 40 label files bit for bit. v2.2.0 in turn
+reproduces v2.1.0 (itself bit-identical
+to v2.0.0) through step 1: on the same cohort, steps 1–3 run on
 the v2.2.0 tree from the same step-0 output reproduce the packed profiles,
 cohort averages, spatial mask and `group.mat` bit for bit; step 2's prior
 differs by design (the new initialisation — see § Agreement below), and
@@ -158,7 +167,7 @@ drops **15.8 s → 3.9 s (4.1×)**: the step-0 Δ-stepping SSSP rewrite,
 the fused whole-subject step-1 GPU leaf, and the step-3 candidate-set
 backend (all v2.0.0); v2.1.0 holds that wall while step 1, and step 2
 in its device-resident cache mode, stop keeping host copies of the
-packed profiles, and v2.2.0 leaves Mode A's code path untouched. The
+packed profiles, and v2.2.0 and v2.3.0 leave Mode A's numerics untouched. The
 6.2 s wall adds ~1.0 s of one-time package import
 (the Mode A min-input check imports the step-3 package to resolve the
 prior path) and ~0.6 s of interpreter start — fixed costs that do not grow with the cohort. Repeat runs in fresh processes land at
@@ -280,7 +289,7 @@ step 3 on the candidate-set session for all three variants. The cMSHBM
 column was re-measured on it for v2.1.0; the gMSHBM and dMSHBM columns are
 the v2.0.0 measurement, whose step-3 backend is this same session under
 its earlier name. Mode A does not run step 2, so v2.2.0 leaves this table
-unchanged.
+unchanged, and v2.3.0 changes no numeric path.
 
 Per-vertex label agreement over cortical vertices, medial wall excluded —
 it is label 0 on both sides and would otherwise count as free agreement.
@@ -370,37 +379,39 @@ Templates: [`projects/sample_modeA_single/`](projects/sample_modeA_single/),
 [`projects/sample_modeA_batch/`](projects/sample_modeA_batch/),
 [`projects/sample_modeB/`](projects/sample_modeB/).
 
+The BOLD must be on the **fsaverage6** surface (40,962 vertices per
+hemisphere). That is the one surface the pipeline runs on: parcels are
+labelled at the fsaverage6 vertices, and RSFC profiles are computed
+against seeds at the fsaverage3 vertices.
+
 ### Before the first run
 
 Two things live outside the repository and must be staged once.
 
 **1. Precomputed assets** — published as release assets under the
-[`assets-v1`](https://github.com/BoletuPeng/cuArealMSHBM/releases/tag/assets-v1) tag (versioned independently of the
+[`assets-v2`](https://github.com/BoletuPeng/cuArealMSHBM/releases/tag/assets-v2) tag (versioned independently of the
 code releases). Extract into `arealmshbm/data/precomputed/`:
 
 ```bash
-curl -L -O https://github.com/BoletuPeng/cuArealMSHBM/releases/download/assets-v1/avg_mesh-fsaverage6.tar.gz
-curl -L -O https://github.com/BoletuPeng/cuArealMSHBM/releases/download/assets-v1/step0_inputs-fsaverage6_sigma2.55_khop3.tar.gz
-tar -xzf avg_mesh-fsaverage6.tar.gz -C arealmshbm/data/precomputed/
-tar -xzf step0_inputs-fsaverage6_sigma2.55_khop3.tar.gz -C arealmshbm/data/precomputed/
+curl -L -O https://github.com/BoletuPeng/cuArealMSHBM/releases/download/assets-v2/avg_mesh.tar.gz
+curl -L -O https://github.com/BoletuPeng/cuArealMSHBM/releases/download/assets-v2/step0_inputs.tar.gz
+tar -xzf avg_mesh.tar.gz -C arealmshbm/data/precomputed/
+tar -xzf step0_inputs.tar.gz -C arealmshbm/data/precomputed/
 ```
 
-Both are **required**. `avg_mesh` (4.3 MB) is where all mesh geometry
-comes from — it is never rebuilt at runtime.
-`step0_inputs-fsaverage6_sigma2.55_khop3.tar.gz` (82.6 MB) is the step-0
-input cache: the pipeline does contain a builder for it
-(`arealmshbm.precompute.step0_inputs_builder`), but that reads raw
-FreeSurfer sphere surfaces from a CBIG checkout at a layout current CBIG
-revisions do not use, so treat the download as the supported path.
-
-Extract both into `arealmshbm/data/precomputed/`. `$MSHBM_PRECOMPUTED_ROOT`
-relocates the `avg_mesh/` bundles only — the step-0 cache is always read
-from inside the package — so do not use it to move the pair elsewhere: the
-run would fail inside step 0 with an unrelated-looking message about a
-missing CBIG checkout.
+Both are **required**, and neither is rebuilt at runtime: a missing one
+is a `FileNotFoundError` that names the path it looked for. `avg_mesh`
+(4.5 MB) is where all mesh geometry comes from. `step0_inputs` (82.7 MB)
+holds the subject-invariant inputs of step 0 — the sphere and
+midthickness meshes, the medial mask, the smoothing gather and the
+cortex neighbour table — with the 2.55 mm smoothing sigma and the 3-hop
+neighbourhood baked in. `$MSHBM_PRECOMPUTED_ROOT` relocates the pair:
+point it at a directory that holds `avg_mesh/` and `step0_inputs/`.
+`assets-v1` carries the same data under the file names v2.2.0 and
+earlier read; this release does not read those.
 
 **2. Atlas directory** — set `MSHBM_ATLAS_DIR` to a directory whose
-`<targ_mesh>/label/` holds the aparc and Schaefer2018 Kong2022 `.annot`
+`fsaverage6/label/` holds the aparc and Schaefer2018 Kong2022 `.annot`
 files (staged from a CBIG checkout). Step 1 reads them live; there is no
 fallback.
 
@@ -451,22 +462,54 @@ backends carry the preconditions below:
 | key | values | notes |
 |---|---|---|
 | `backend_step0` | `cpu`, `gpu` | GPU step 0 is not bit-reproducible run to run — the measured band is in [`docs/step0_flow_and_subgraphs.md`](docs/step0_flow_and_subgraphs.md) |
-| `backend_step1` | `cpu`, `gpu` | packed profiles, averages, spatial mask and `group.mat` labels are bit-identical either way; `group.mat`'s `mtc` / `epsil` agree to within a few fp64 ULP (fp64 reduction order); `gpu` ingests BOLD through nvCOMP (`nvidia-nvcomp-cu12` required) and needs `step1.reduction_dtype: "float64"` (anything else is rejected at validation) |
-| `backend_step2` | `cpu`, `gpu` | `gpu` is the candidate-set session: it needs `seed_mesh: "fsaverage3"`, K ≤ 512 and, for gMSHBM, ≤ 11,772 gradient components — any other shape is rejected at validation, so select `cpu` for it; `psutil` required |
-| `backend_step3` | `cpu`, `gpu` | `gpu` is the candidate-set session for gMSHBM, cMSHBM and dMSHBM: it needs `seed_mesh: "fsaverage3"` (else `cpu`) and, for gMSHBM / cMSHBM, a CUDA toolkit at `CUDA_PATH` plus a device that supports cooperative launch |
+| `backend_step1` | `cpu`, `gpu` | packed profiles, averages, spatial mask and `group.mat` labels are bit-identical either way; `group.mat`'s `mtc` / `epsil` agree to within a few fp64 ULP (fp64 reduction order); `gpu` ingests BOLD through nvCOMP (`nvidia-nvcomp-cu12` required) |
+| `backend_step2` | `cpu`, `gpu` | `gpu` is the candidate-set session: it needs K ≤ 512 and, for gMSHBM, ≤ 11,772 gradient components — any other shape is rejected at validation, so select `cpu` for it; `psutil` required. The key belongs to Mode B: a Mode A config that carries it is rejected |
+| `backend_step3` | `cpu`, `gpu` | `gpu` is the candidate-set session for gMSHBM, cMSHBM and dMSHBM; for gMSHBM / cMSHBM it needs a CUDA toolkit at `CUDA_PATH` plus a device that supports cooperative launch |
 
 Design notes and the measured backend-vs-backend agreement are in
 [`docs/step2_sparse_design.md`](docs/step2_sparse_design.md) and
 [`docs/step3_sparse_design.md`](docs/step3_sparse_design.md).
 
-**Upgrading a v2.1.0 project.** No config key changes. Step 2's
-initialisation changed, so a Mode B project re-run on v2.2.0 trains a
-different group prior than v2.1.0 did, and the individual parcellations
-downstream of it move with it (9.4 % of cortical vertices on the
-40-subject cohort above). Mode A runs under a given prior file are
-unchanged: steps 1 and 3 are the same code.
+**Upgrading a v2.2.0 project.** Results do not change; the configuration
+surface and the file names do.
 
-**Upgrading a v2.0.0 project config.** `backend_step3` accepts `cpu` and
+- `pipeline_config.json`: delete `step0.enable_tf32`, `step0.smooth_sigma`,
+  `step0.K_hop`, `step1.split_flag`, `step1.profile_dtype` and
+  `step1.reduction_dtype`; in a Mode A config also delete `backend_step2`.
+  Each is now rejected as an unknown key (a Mode A `backend_step2` with
+  the message a `step2` block gets). None of them selected anything: the
+  TF32 switch had no effect under the driver, the smoothing sigma and the
+  neighbourhood are baked into the step-0 inputs, and step 1 reduces in
+  fp64 on both backends.
+- `bold_inputs.json`: delete `targ_mesh` and `seed_mesh`. The reader now
+  rejects unknown top-level keys.
+- Assets: download `assets-v2` (§ Before the first run). The data are the
+  ones `assets-v1` carries, under file names without the mesh.
+- A project directory written by v2.2.0 can be re-run in place: the run
+  rewrites every artifact under the new names below and leaves the
+  old-named files behind.
+- Callers of the per-step API: the `targ_mesh` / `seed_mesh` / `mesh`
+  arguments and `Step0Config.cbig_code_dir` are gone from every
+  signature, as are `split_flag` / `profile_dtype` / `reduction_dtype`
+  from the step-1 runners.
+
+| | v2.2.0 | v2.3.0 |
+|---|---|---|
+| per-subject profile | `sub<S>_fsaverage6_roifsaverage3.profile.b2nd` | `sub<S>.profile.b2nd` |
+| average profile | `{lh,rh}_fsaverage6_roifsaverage3_avg_profile.npy` | `{lh,rh}_avg_profile.npy` |
+| spatial mask | `spatial_mask_fsaverage6.mat` | `spatial_mask.mat` |
+| mesh bundles | `avg_mesh/{lh,rh}_fsaverage6_{inflated,sphere}.npz` | `avg_mesh/{lh,rh}_{inflated,sphere}.npz` |
+| step-0 inputs | `step0_inputs/fsaverage6_sigma2.55_khop3/` | `step0_inputs/` |
+
+**Upgrading a v2.1.0 project.** The v2.2.0 note above applies. In
+addition, step 2's initialisation changed in v2.2.0, so a Mode B project
+re-run now trains a different group prior than v2.1.0 did, and the
+individual parcellations downstream of it move with it (9.4 % of cortical
+vertices on the 40-subject cohort above). Mode A runs under a given prior
+file are unchanged: steps 1 and 3 compute the same values.
+
+**Upgrading a v2.0.0 project config.** The notes above apply. In
+addition, `backend_step3` accepts `cpu` and
 `gpu` only: write `"gpu"` where a config said `"gpu_sparse"` (the same
 session), and choose `"gpu"` or `"cpu"` where it said `"gpu_full"` or
 `"gpu_elambda"` (the dense GPU EM is gone; against the reference labels the
@@ -482,8 +525,7 @@ not meet.
 
 **Upgrading a v1.0.0 project config.** The v2.0.0 note above applies.
 In addition, one `step2` key is rejected at parse time: `enable_tf32`
-(delete it; it only ever scoped the dense port's sgemms, and
-`step0.enable_tf32` is unaffected). A config that already said
+(delete it; it only ever scoped the dense port's sgemms). A config that already said
 `backend_step2: "gpu"` still parses, but trains its prior on the
 candidate-set session — which matches the `cpu` reference, where the dense
 port did not.
@@ -495,7 +537,6 @@ arealmshbm/                 — the Python package
   pipeline/                 — unified project-driven driver (preferred entry)
   step{0,2,3}_pipeline/     — per-step super-calls (step 1: pipeline/step1_runners.py)
   data/                     — precomputed-asset mount point (installer-staged)
-  precompute/               — offline cache builders (dev-only)
   <leaf>/                   — one folder per algorithmic primitive
     _kernels.py             — numba CPU kernel
     _kernels_gpu.py         — CuPy / RawKernel GPU kernel (where they diverge)
@@ -526,15 +567,14 @@ original_paper.md           — algorithm reference (Kong et al. 2021)
   `cooperative_groups.h` for the connected-components kernel; dMSHBM
   does not use it). The driver checks CuPy (import, CUDA device,
   NVRTC), nvCOMP, psutil and the CUDA toolkit / cooperative launch
-  before step 0. The
-  step-2 and step-3 `gpu` backends require `seed_mesh` `fsaverage3`.
+  before step 0.
 - Staged precomputed assets (installer-deployed; see
   [`arealmshbm/data/README.md`](arealmshbm/data/README.md)) and
   `MSHBM_ATLAS_DIR` pointing at a directory whose
-  `<targ_mesh>/label/` holds the Schaefer2018 + aparc `.annot` files
+  `fsaverage6/label/` holds the Schaefer2018 + aparc `.annot` files
   (the atlas dir's only runtime role)
 
-BOLD input is GIFTI `.func.gii` only.
+BOLD input is GIFTI `.func.gii` only, on the fsaverage6 surface.
 
 Tests:
 
@@ -578,7 +618,7 @@ field, we extend our sincere greetings and deepest respect.
 
 [English](#english) | **简体中文**
 
-**CPU/GPU 加速的 Areal-MSHBM** —— 基于静息态 fMRI 的个体化皮层分区，以 numba（CPU）与 CuPy（GPU）双后端完成端到端的 Python 移植。已在大规模数据（300+ 名被试、1,800+ 个 fMRI session）上与原版 MATLAB 实现完成对照校验。**v2.2.0** 让 step 2 采用参考实现的初始化（带 `theta_num` 的软掩膜后验，两个后端相同）：在同一份输入上与参考实现自身的 step 2 对照，训练出的 gMSHBM 组先验一致率从 78.9 % 升至 94.1 %（dMSHBM：71.9 % → 81.2 %），速度与内存不变。自 v2.1.0 起，候选集 session 是 step 2 / step 3 唯一的 GPU 后端（step 3 覆盖全部三个变体），GPU 上的 BOLD 读入只走 nvCOMP，并且当位打包队列放得进显存时不在主机内存中保留它的副本：单被试从原始 BOLD 到分区结果，在一张笔记本 GPU 上端到端只需 **6.2 秒**；40 名被试的队列从原始 BOLD 经组先验训练到全部 40 份分区结果 **74.0–75.6 秒**完成（其中 step 2 组先验训练单独运行 16.5 秒）。
+**CPU/GPU 加速的 Areal-MSHBM** —— 基于静息态 fMRI 的个体化皮层分区，以 numba（CPU）与 CuPy（GPU）双后端完成端到端的 Python 移植。已在大规模数据（300+ 名被试、1,800+ 个 fMRI session）上与原版 MATLAB 实现完成对照校验。**v2.3.0** 把表面方案固定在代码里 —— 在 fsaverage6 顶点上分区，RSFC 种子取 fsaverage3 顶点 —— 并删去了那些从来只有一个可用取值的配置键、文件名后缀与重建路径；其结果与 v2.2.0 逐位相同。自 v2.2.0 起，step 2 采用参考实现的初始化（带 `theta_num` 的软掩膜后验，两个后端相同）：在同一份输入上与参考实现自身的 step 2 对照，训练出的 gMSHBM 组先验一致率从 78.9 % 升至 94.1 %（dMSHBM：71.9 % → 81.2 %），速度与内存不变。自 v2.1.0 起，候选集 session 是 step 2 / step 3 唯一的 GPU 后端（step 3 覆盖全部三个变体），GPU 上的 BOLD 读入只走 nvCOMP，并且当位打包队列放得进显存时不在主机内存中保留它的副本：单被试从原始 BOLD 到分区结果，在一张笔记本 GPU 上端到端只需 **6.2 秒**；40 名被试的队列从原始 BOLD 经组先验训练到全部 40 份分区结果 **74.0–75.6 秒**完成（其中 step 2 组先验训练单独运行 16.5 秒）。
 
 ---
 
@@ -611,13 +651,13 @@ cuArealMSHBM 用 Python 重新实现了全部四个流水线步骤（RSFC 梯度
 
 ## 项目状态
 
-**这是第四个发布版本（v2.2.0）**，包含 CPU 与 GPU 后端；step 2 与 step 3 的 GPU 后端即候选集 session，其中 step 3 覆盖全部三个变体。在迄今超过 **300 名被试、1,800 个 fMRI session** 的大规模校验中，它与原版实现的输出在数值所允许的极限水平上保持一致（逐顶点一致率约 98%；跨 BLAS/归约顺序边界的位级一致在数学上不可达），同时带来显著的速度与内存节约（见下方表格）。
+**这是第五个发布版本（v2.3.0）**，包含 CPU 与 GPU 后端；step 2 与 step 3 的 GPU 后端即候选集 session，其中 step 3 覆盖全部三个变体。在迄今超过 **300 名被试、1,800 个 fMRI session** 的大规模校验中，它与原版实现的输出在数值所允许的极限水平上保持一致（逐顶点一致率约 98%；跨 BLAS/归约顺序边界的位级一致在数学上不可达），同时带来显著的速度与内存节约（见下方表格）。
 
-项目仍在持续完善中。**所有预计算数据**（网格资产包、step-0 缓存、预训练 HCP 组先验、空间掩膜）**将由带 GUI 的发行版（开发中）的安装程序部署。** 本源码版本刻意不包含这些资产 —— 安装程序部署的目录布局见 [`arealmshbm/data/README.md`](arealmshbm/data/README.md)。
+项目仍在持续完善中。**所有预计算数据**（网格资产包、step-0 输入、预训练 HCP 组先验、空间掩膜）**将由带 GUI 的发行版（开发中）的安装程序部署。** 本源码版本刻意不包含这些资产 —— 安装程序部署的目录布局见 [`arealmshbm/data/README.md`](arealmshbm/data/README.md)。
 
 ## 基准测试
 
-所有数字均在同一台 Windows 11 笔记本上测得：RTX 5090 Laptop GPU（Blackwell，24 GB）、Python 3.13、numba 0.63.1、CuPy 13.6.0。MATLAB基线为 CBIG 参考流水线**并启用其编译 MEX 热路径**（`mtimesx`），在同一台机器上运行 —— 比典型集群节点更强的基线。下表中 cuArealMSHBM 的每一个**耗时**数字都在 v2.2.0 代码上重新测得（2026-11-02），每一项"总计"均为无缓存项目上的端到端驱动器墙钟时间（含解释器启动与输入校验），numba 与 CuPy 的内核缓存在磁盘上已预热；标签一致率各行沿用 v1.0.0 的测量结果。内存各行在 v2.2.0 代码上实测：主机为驱动器进程的常驻内存峰值（表中另注进程者除外），设备为 `nvidia-smi` 相对空闲桌面的用量峰值。数值上，v2.2.0 到 step 1 为止与 v2.1.0（后者与 v2.0.0 逐位相同）完全一致：在下文的 40 被试队列上，用 v2.2.0 代码从同一份 step-0 输出起运行 step 1–3，得到的位打包 profile、队列均值、空间掩膜与 `group.mat` 逐位相同；step 2 的组先验按设计有所不同（新的初始化，见下文"与参考实现的一致性"），其下游 40 份标签文件中有 9.4 % 的皮层顶点标签改变（逐被试 7.0–12.6 %）。
+所有数字均在同一台 Windows 11 笔记本上测得：RTX 5090 Laptop GPU（Blackwell，24 GB）、Python 3.13、numba 0.63.1、CuPy 13.6.0。MATLAB基线为 CBIG 参考流水线**并启用其编译 MEX 热路径**（`mtimesx`），在同一台机器上运行 —— 比典型集群节点更强的基线。下表中 cuArealMSHBM 的每一个**耗时**数字都在 v2.2.0 代码上测得（2026-11-02）—— v2.3.0 没有改动任何内核与数值路径，这些数字继续有效 —— 每一项"总计"均为无缓存项目上的端到端驱动器墙钟时间（含解释器启动与输入校验），numba 与 CuPy 的内核缓存在磁盘上已预热；标签一致率各行沿用 v1.0.0 的测量结果。内存各行在 v2.2.0 代码上实测：主机为驱动器进程的常驻内存峰值（表中另注进程者除外），设备为 `nvidia-smi` 相对空闲桌面的用量峰值。数值上，v2.3.0 与 v2.2.0 逐位相同：在下文的 40 被试队列上，用 v2.3.0 代码从同一份 step-0 输出起运行 step 1–3，得到的位打包 profile、队列均值、空间掩膜、`group.mat`、训练出的组先验与全部 40 份标签文件逐位相同。v2.2.0 则到 step 1 为止与 v2.1.0（后者与 v2.0.0 逐位相同）完全一致：在同一队列上，用 v2.2.0 代码从同一份 step-0 输出起运行 step 1–3，得到的位打包 profile、队列均值、空间掩膜与 `group.mat` 逐位相同；step 2 的组先验按设计有所不同（新的初始化，见下文"与参考实现的一致性"），其下游 40 份标签文件中有 9.4 % 的皮层顶点标签改变（逐被试 7.0–12.6 %）。
 
 ### Mode A —— 基于预训练先验的个体化分区
 
@@ -662,7 +702,7 @@ cuArealMSHBM 将这一切收拢到单个设备上：每份二值化 profile 在�
 
 ### Mode A —— 同一先验下的个体化分区
 
-以**未经修改的 CBIG 原版**为基准，在三个队列共 30 名被试上实测 —— K = 300、β = 5、w = 50、c = 10，目标网格 fsaverage6 / 种子网格 fsaverage3，两侧载入同一份组先验文件。后端：`backend_step0` / `backend_step1` / `backend_step3` = `gpu` —— step 3 在全部三个变体上都运行候选集 session。cMSHBM 一列已在该后端上为 v2.1.0 重新测得；gMSHBM 与 dMSHBM 两列沿用 v2.0.0 的测量结果，其 step-3 后端就是这同一个 session（当时名字不同）。Mode A 不运行 step 2，因此 v2.2.0 不改变这张表。
+以**未经修改的 CBIG 原版**为基准，在三个队列共 30 名被试上实测 —— K = 300、β = 5、w = 50、c = 10，目标网格 fsaverage6 / 种子网格 fsaverage3，两侧载入同一份组先验文件。后端：`backend_step0` / `backend_step1` / `backend_step3` = `gpu` —— step 3 在全部三个变体上都运行候选集 session。cMSHBM 一列已在该后端上为 v2.1.0 重新测得；gMSHBM 与 dMSHBM 两列沿用 v2.0.0 的测量结果，其 step-3 后端就是这同一个 session（当时名字不同）。Mode A 不运行 step 2，因此 v2.2.0 不改变这张表；v2.3.0 没有改动任何数值路径。
 
 逐顶点标签一致率，仅计皮层顶点、剔除内侧壁 —— 内侧壁两侧同为标签 0，计入会白送一致率。括号内为全顶点口径。
 
@@ -708,22 +748,24 @@ projects/<name>/
 [`projects/sample_modeA_batch/`](projects/sample_modeA_batch/)、
 [`projects/sample_modeB/`](projects/sample_modeB/)。
 
+BOLD 必须在 **fsaverage6** 表面上（每个半球 40,962 个顶点）。这是流水线唯一运行的表面：分区标签落在 fsaverage6 顶点上，RSFC profile 以 fsaverage3 顶点为种子计算。
+
 ### 首次运行前
 
 有两样东西不在仓库里，需要先就位一次。
 
-**1、预计算资产** —— 以 release asset 形式发布在 [`assets-v1`](https://github.com/BoletuPeng/cuArealMSHBM/releases/tag/assets-v1) tag 下（与代码版本独立编号）。解压到 `arealmshbm/data/precomputed/`：
+**1、预计算资产** —— 以 release asset 形式发布在 [`assets-v2`](https://github.com/BoletuPeng/cuArealMSHBM/releases/tag/assets-v2) tag 下（与代码版本独立编号）。解压到 `arealmshbm/data/precomputed/`：
 
 ```bash
-curl -L -O https://github.com/BoletuPeng/cuArealMSHBM/releases/download/assets-v1/avg_mesh-fsaverage6.tar.gz
-curl -L -O https://github.com/BoletuPeng/cuArealMSHBM/releases/download/assets-v1/step0_inputs-fsaverage6_sigma2.55_khop3.tar.gz
-tar -xzf avg_mesh-fsaverage6.tar.gz -C arealmshbm/data/precomputed/
-tar -xzf step0_inputs-fsaverage6_sigma2.55_khop3.tar.gz -C arealmshbm/data/precomputed/
+curl -L -O https://github.com/BoletuPeng/cuArealMSHBM/releases/download/assets-v2/avg_mesh.tar.gz
+curl -L -O https://github.com/BoletuPeng/cuArealMSHBM/releases/download/assets-v2/step0_inputs.tar.gz
+tar -xzf avg_mesh.tar.gz -C arealmshbm/data/precomputed/
+tar -xzf step0_inputs.tar.gz -C arealmshbm/data/precomputed/
 ```
 
-两个都是**必需的**。`avg_mesh`（4.3 MB）是所有网格几何的唯一来源，运行时不会重建。`step0_inputs-fsaverage6_sigma2.55_khop3.tar.gz`（82.6 MB）是 step 0 的输入缓存：仓库里确实带了它的构建器（`arealmshbm.precompute.step0_inputs_builder`），但它需要从 CBIG checkout 读原始 FreeSurfer 球面，而其期待的目录布局与当前 CBIG 版本不一致，因此请以下载为准。两个都请解压到 `arealmshbm/data/precomputed/`。`$MSHBM_PRECOMPUTED_ROOT` 只能重定向 `avg_mesh/` bundle —— step 0 的缓存始终从包内读取 —— 所以不要用它把两者一起搬走：那样会在 step 0 里以一条看上去不相干的、抱怨 CBIG checkout 缺失的错误失败。
+两个都是**必需的**，运行时都不会重建：缺少任何一个都会以 `FileNotFoundError` 报错，并给出它查找的路径。`avg_mesh`（4.5 MB）是所有网格几何的唯一来源。`step0_inputs`（82.7 MB）是 step 0 中与被试无关的输入 —— 球面与 midthickness 网格、内侧壁掩膜、平滑用的 gather 矩阵以及皮层邻接表 —— 2.55 mm 的平滑 sigma 与 3 跳邻域已经固化在其中。`$MSHBM_PRECOMPUTED_ROOT` 可以把两者一起搬走：把它指向一个含有 `avg_mesh/` 与 `step0_inputs/` 的目录即可。`assets-v1` 中是同一份数据，只是文件名是 v2.2.0 及更早版本读取的那一套；本版本不读取它们。
 
-**2、Atlas 目录** —— 把 `MSHBM_ATLAS_DIR` 指向一个目录，其 `<targ_mesh>/label/` 下存放 aparc 与 Schaefer2018 Kong2022 的 `.annot` 文件（从 CBIG checkout 里准备）。step 1 会实时读取它们，没有降级路径。
+**2、Atlas 目录** —— 把 `MSHBM_ATLAS_DIR` 指向一个目录，其 `fsaverage6/label/` 下存放 aparc 与 Schaefer2018 Kong2022 的 `.annot` 文件（从 CBIG checkout 里准备）。step 1 会实时读取它们，没有降级路径。
 
 组先验与空间掩码**不**在此发布 —— 它们与 CBIG 的文件逐字节相同，需要时从 CBIG checkout 取用。完整布局与出处见
 [`arealmshbm/data/README.md`](arealmshbm/data/README.md)。
@@ -761,17 +803,33 @@ Mode A 读取 `<project>/priors/<variant>/beta<B>/Params_Final.mat`（dMSHBM 为
 | 配置项 | 可选值 | 说明 |
 |---|---|---|
 | `backend_step0` | `cpu`、`gpu` | GPU 版 step 0 不保证逐次运行的位级可复现，实测波动范围见 [`docs/step0_flow_and_subgraphs.md`](docs/step0_flow_and_subgraphs.md) |
-| `backend_step1` | `cpu`、`gpu` | 位打包 profile、平均 profile、空间掩膜与 `group.mat` 的标签在两个后端上逐位一致；`group.mat` 的 `mtc` / `epsil` 一致到几个 fp64 ULP 以内（fp64 归约顺序）；`gpu` 通过 nvCOMP 读入 BOLD（需要 `nvidia-nvcomp-cu12`），并要求 `step1.reduction_dtype: "float64"`（其他取值在校验阶段即被拒绝） |
-| `backend_step2` | `cpu`、`gpu` | `gpu` 即候选集 session：要求 `seed_mesh: "fsaverage3"`、K ≤ 512、gMSHBM 还要求梯度分量数 ≤ 11,772；其他形状在校验阶段即被拒绝，请为其选择 `cpu`；需要 `psutil` |
-| `backend_step3` | `cpu`、`gpu` | `gpu` 即候选集 session，覆盖 gMSHBM、cMSHBM 与 dMSHBM：要求 `seed_mesh: "fsaverage3"`（否则选 `cpu`）；gMSHBM / cMSHBM 还需要 `CUDA_PATH` 指向的 CUDA 工具包以及支持 cooperative launch 的设备 |
+| `backend_step1` | `cpu`、`gpu` | 位打包 profile、平均 profile、空间掩膜与 `group.mat` 的标签在两个后端上逐位一致；`group.mat` 的 `mtc` / `epsil` 一致到几个 fp64 ULP 以内（fp64 归约顺序）；`gpu` 通过 nvCOMP 读入 BOLD（需要 `nvidia-nvcomp-cu12`） |
+| `backend_step2` | `cpu`、`gpu` | `gpu` 即候选集 session：要求 K ≤ 512、gMSHBM 还要求梯度分量数 ≤ 11,772；其他形状在校验阶段即被拒绝，请为其选择 `cpu`；需要 `psutil`。该键只属于 Mode B：Mode A 配置里带它会被拒绝 |
+| `backend_step3` | `cpu`、`gpu` | `gpu` 即候选集 session，覆盖 gMSHBM、cMSHBM 与 dMSHBM；gMSHBM / cMSHBM 需要 `CUDA_PATH` 指向的 CUDA 工具包以及支持 cooperative launch 的设备 |
 
 设计说明与后端之间实测的一致性数据见 [`docs/step2_sparse_design.md`](docs/step2_sparse_design.md) 与 [`docs/step3_sparse_design.md`](docs/step3_sparse_design.md)。
 
-**从 v2.1.0 升级项目。** 配置键没有变化。step 2 的初始化变了，因此同一个 Mode B 项目在 v2.2.0 上重跑会训练出与 v2.1.0 不同的组先验，其下游的个体化分区也随之改变（在上文的 40 被试队列上为 9.4 % 的皮层顶点）。Mode A 在给定先验文件下的结果不变：step 1 与 step 3 的代码相同。
+**从 v2.2.0 升级项目。** 结果不变，变的是配置面与文件名。
 
-**从 v2.0.0 升级项目配置。** `backend_step3` 只接受 `cpu` 与 `gpu`：原来写 `"gpu_sparse"` 的请改写为 `"gpu"`（同一个 session）；原来写 `"gpu_full"` 或 `"gpu_elambda"` 的请改为 `"gpu"` 或 `"cpu"`（稠密 GPU EM 已不存在；对照参考实现的标签，候选集 session 与它持平或更优）。`w` 在所有后端上都必须 ≥ 1：`w = 0` 时 E-step 的 `w · log θ` 项在先验支撑集之外没有定义，参考实现同样如此。v2.0.0 中"找得到才用"的四项依赖是硬性要求：`python-isal`（所有后端）、`nvidia-nvcomp-cu12`（`backend_step1: "gpu"`）、`psutil`（`backend_step2: "gpu"`），以及 `CUDA_PATH` 指向的 CUDA 工具包加上支持 cooperative launch 的设备（`backend_step3: "gpu"` 搭配 gMSHBM / cMSHBM）—— 机器不满足某一步的要求时，请为该步选择 `"cpu"`。
+- `pipeline_config.json`：删除 `step0.enable_tf32`、`step0.smooth_sigma`、`step0.K_hop`、`step1.split_flag`、`step1.profile_dtype` 与 `step1.reduction_dtype`；Mode A 配置还要删除 `backend_step2`。它们现在都会作为未知键被拒绝（Mode A 中的 `backend_step2` 得到的是与 `step2` 块相同的报错）。这些键从未真正选择过任何东西：TF32 开关在驱动器下不起作用，平滑 sigma 与邻域已固化在 step-0 输入里，step 1 在两个后端上都以 fp64 归约。
+- `bold_inputs.json`：删除 `targ_mesh` 与 `seed_mesh`。读取器现在拒绝未知的顶层键。
+- 资产：下载 `assets-v2`（见"首次运行前"）。数据与 `assets-v1` 相同，文件名里不再带网格名。
+- v2.2.0 写出的项目目录可以原地重跑：运行会以下表的新文件名重写全部产物，旧文件名的文件留在原处。
+- 逐步骤 API 的调用方：`targ_mesh` / `seed_mesh` / `mesh` 参数与 `Step0Config.cbig_code_dir` 已从所有签名中移除，step-1 runner 的 `split_flag` / `profile_dtype` / `reduction_dtype` 同样如此。
 
-**从 v1.0.0 升级项目配置。** 上面 v2.0.0 的说明同样适用。此外，`step2` 块中有一个键会在解析阶段被拒绝：`enable_tf32`（直接删除；它从来只作用于稠密移植的 sgemm，`step0.enable_tf32` 不受影响）。原本就写 `backend_step2: "gpu"` 的配置仍可解析，但其组先验由候选集 session 训练 —— 后者与 `cpu` 参考实现一致，而稠密移植并不一致。
+| | v2.2.0 | v2.3.0 |
+|---|---|---|
+| 逐被试 profile | `sub<S>_fsaverage6_roifsaverage3.profile.b2nd` | `sub<S>.profile.b2nd` |
+| 平均 profile | `{lh,rh}_fsaverage6_roifsaverage3_avg_profile.npy` | `{lh,rh}_avg_profile.npy` |
+| 空间掩膜 | `spatial_mask_fsaverage6.mat` | `spatial_mask.mat` |
+| 网格资产包 | `avg_mesh/{lh,rh}_fsaverage6_{inflated,sphere}.npz` | `avg_mesh/{lh,rh}_{inflated,sphere}.npz` |
+| step-0 输入 | `step0_inputs/fsaverage6_sigma2.55_khop3/` | `step0_inputs/` |
+
+**从 v2.1.0 升级项目。** 上面 v2.2.0 的说明同样适用。此外，step 2 的初始化在 v2.2.0 中变了，因此同一个 Mode B 项目重跑会训练出与 v2.1.0 不同的组先验，其下游的个体化分区也随之改变（在上文的 40 被试队列上为 9.4 % 的皮层顶点）。Mode A 在给定先验文件下的结果不变：step 1 与 step 3 算出的数值相同。
+
+**从 v2.0.0 升级项目配置。** 上面的说明同样适用。此外，`backend_step3` 只接受 `cpu` 与 `gpu`：原来写 `"gpu_sparse"` 的请改写为 `"gpu"`（同一个 session）；原来写 `"gpu_full"` 或 `"gpu_elambda"` 的请改为 `"gpu"` 或 `"cpu"`（稠密 GPU EM 已不存在；对照参考实现的标签，候选集 session 与它持平或更优）。`w` 在所有后端上都必须 ≥ 1：`w = 0` 时 E-step 的 `w · log θ` 项在先验支撑集之外没有定义，参考实现同样如此。v2.0.0 中"找得到才用"的四项依赖是硬性要求：`python-isal`（所有后端）、`nvidia-nvcomp-cu12`（`backend_step1: "gpu"`）、`psutil`（`backend_step2: "gpu"`），以及 `CUDA_PATH` 指向的 CUDA 工具包加上支持 cooperative launch 的设备（`backend_step3: "gpu"` 搭配 gMSHBM / cMSHBM）—— 机器不满足某一步的要求时，请为该步选择 `"cpu"`。
+
+**从 v1.0.0 升级项目配置。** 上面 v2.0.0 的说明同样适用。此外，`step2` 块中有一个键会在解析阶段被拒绝：`enable_tf32`（直接删除；它从来只作用于稠密移植的 sgemm）。原本就写 `backend_step2: "gpu"` 的配置仍可解析，但其组先验由候选集 session 训练 —— 后者与 `cpu` 参考实现一致，而稠密移植并不一致。
 
 ## 仓库结构
 
@@ -780,7 +838,6 @@ arealmshbm/                 — Python 包
   pipeline/                 — 统一的项目驱动入口（首选）
   step{0,2,3}_pipeline/     — 逐步骤超调用（step 1 在 pipeline/step1_runners.py）
   data/                     — 预计算资产挂载点（由安装程序部署）
-  precompute/               — 离线缓存构建器（仅开发用）
   <leaf>/                   — 每个算法原语一个目录
     _kernels.py             — numba CPU 内核
     _kernels_gpu.py         — CuPy / RawKernel GPU 内核（与 CPU 分叉处）
@@ -795,10 +852,10 @@ original_paper.md           — 算法出处（Kong et al. 2021）
 
 - Python 3.13；numba 0.63.1、numpy 2.2.6、scipy 1.16.0。numba 必须运行在线程安全的线程层上（OpenMP 或 TBB；两者任一运行时存在时 numba 会自动选用）：流水线会从多个线程发起并行内核，numba 的后备线程层 `workqueue` 遇到这种情况会直接中止进程
 - `python-isal`（pip 包名为 `isal`；GIFTI 读取器与流式 MAT 读取器中的 isal_zlib 解压）与 `blosc2`（`.b2nd` profile 文件）；以 MAT v7.3 保存的输入（组先验、空间掩膜或梯度文件）需要 `h5py`
-- GPU 后端：CuPy 13.6.0（全部 GPU 后端）；`nvidia-nvcomp-cu12`（`backend_step1='gpu'` —— 其 BOLD 读入只走 nvCOMP，未安装或无法加载会在 step 0 之前以 `ImportError` 报错）；`psutil`（`backend_step2='gpu'`）；`CUDA_PATH` 指向的 CUDA 工具包以及支持 cooperative launch 的设备（`backend_step3='gpu'` 搭配 gMSHBM / cMSHBM —— 连通分量内核需要 `cudadevrt` 与 `cooperative_groups.h`；dMSHBM 不使用它）。驱动器会在 step 0 之前检查 CuPy（导入、CUDA 设备、NVRTC）、nvCOMP、psutil 以及 CUDA 工具包 / cooperative launch。step 2 与 step 3 的 `gpu` 后端要求 `seed_mesh` 为 `fsaverage3`。
-- 已部署的预计算资产（由安装程序部署；见[`arealmshbm/data/README.md`](arealmshbm/data/README.md)），以及指向 `<targ_mesh>/label/` 下含 Schaefer2018 + aparc `.annot` 文件目录的 `MSHBM_ATLAS_DIR`（图谱目录在运行时的唯一用途）
+- GPU 后端：CuPy 13.6.0（全部 GPU 后端）；`nvidia-nvcomp-cu12`（`backend_step1='gpu'` —— 其 BOLD 读入只走 nvCOMP，未安装或无法加载会在 step 0 之前以 `ImportError` 报错）；`psutil`（`backend_step2='gpu'`）；`CUDA_PATH` 指向的 CUDA 工具包以及支持 cooperative launch 的设备（`backend_step3='gpu'` 搭配 gMSHBM / cMSHBM —— 连通分量内核需要 `cudadevrt` 与 `cooperative_groups.h`；dMSHBM 不使用它）。驱动器会在 step 0 之前检查 CuPy（导入、CUDA 设备、NVRTC）、nvCOMP、psutil 以及 CUDA 工具包 / cooperative launch。
+- 已部署的预计算资产（由安装程序部署；见[`arealmshbm/data/README.md`](arealmshbm/data/README.md)），以及指向 `fsaverage6/label/` 下含 Schaefer2018 + aparc `.annot` 文件目录的 `MSHBM_ATLAS_DIR`（图谱目录在运行时的唯一用途）
 
-BOLD 输入仅支持 GIFTI `.func.gii`。
+BOLD 输入仅支持 GIFTI `.func.gii`，且必须在 fsaverage6 表面上。
 
 测试：
 
