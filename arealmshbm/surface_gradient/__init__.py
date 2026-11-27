@@ -1,6 +1,6 @@
 """surface_gradient
 
-Pure-numpy port of HCP Workbench ``wb_command -cifti-gradient`` for the
+Numba port of HCP Workbench ``wb_command -cifti-gradient`` for the
 surface portion of CIFTI dtseries data.
 
 Public API:
@@ -11,7 +11,7 @@ the Workbench source — area-weighted tangent-plane LS with the
 "unrolled" curvature correction, applied per hemisphere, per column):
 
     1. Scatter cortex-only data to a full-mesh layout where medial
-       vertices hold zero, then split into lh / rh halves. Smoothing
+       vertices hold zero, then split into lh / rh halves. The gradient
        does not bleed across the medial wall or the inter-hemisphere
        boundary because each hemisphere's mesh is processed
        independently.
@@ -49,6 +49,6 @@ columns). The output is cast to fp32 to match the upstream
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """
 
-from .surface_gradient import cifti_gradient, prepare_gradient_mesh
+from .surface_gradient import cifti_gradient
 
-__all__ = ["cifti_gradient", "prepare_gradient_mesh"]
+__all__ = ["cifti_gradient"]

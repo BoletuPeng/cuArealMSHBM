@@ -1,6 +1,6 @@
 """v_lambda.py
 
-V_lambda — the Potts close-form MRF smoothness term in the gMSHBM
+V_lambda — the Potts close-form MRF smoothness term in the step-3
 E-step.
 
 Public API:

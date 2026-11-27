@@ -3,7 +3,7 @@
 Per-EM-call setup arrays the EM body consumes:
 
     boundary_mask : (N, L) — bilateral block diagonal built from
-                    ``spatial_mask_<mesh>.mat`` per-hemi masks.
+                    ``spatial_mask.mat`` per-hemi masks.
     neighborhood  : (M1, N_active) — concatenated LH+RH ``vertexNbors``
                     with medial-wall collapse and RH offset; Potts MRF
                     stencil.

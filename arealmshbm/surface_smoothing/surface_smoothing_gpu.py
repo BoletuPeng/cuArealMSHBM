@@ -1,9 +1,8 @@
 """surface_smoothing_gpu.py
 
-CuPy mirror of the per-call hot path in :mod:`.surface_smoothing`. The
-Dijkstra / gather assembly stays on CPU (it runs exactly once per hemi
-at ``Step0Pipeline.load_inputs`` regardless of backend), and only the
-SpMV + per-row scale + ROI mask move to device.
+CuPy mirror of the per-call hot path in :mod:`.surface_smoothing`: the
+SpMV + per-row scale + ROI mask on device, over the gather that
+``Step0Pipeline.load_inputs`` reads from the step-0 inputs bundle.
 
 Hot path:
     out[j, k] = sum_i gather_W[j, i] * data[i, k] / weight_sum[j]
@@ -28,7 +27,7 @@ from typing import Tuple, Union
 
 import numpy as np
 
-# Cupy + cupyx imports kept lazy at module-top level — this file is
+# Cupy + cupyx imported eagerly at module top — this file is
 # only loaded via the ``backend == 'gpu'`` dispatch in
 # :mod:`arealmshbm.step0_pipeline.pipeline`.
 import cupy as cp
@@ -43,10 +42,10 @@ SmoothingGatherGPU = Tuple[cpsp.csr_matrix, cp.ndarray]
 def prepare_smoothing_gather_gpu(cpu_gather) -> SmoothingGatherGPU:
     """Push a CPU (gather_W, inv_weight_sum) bundle to device as fp32.
 
-    The CPU gather is built once per hemi at ``Step0Pipeline.load_inputs``
-    by :func:`.surface_smoothing.prepare_smoothing_gather`. For the GPU
-    backend the pipeline calls THIS function right after the CPU build
-    and caches the device-resident bundle on ``Step0Inputs``.
+    The CPU gather is read once per hemi at ``Step0Pipeline.load_inputs``
+    from the step-0 inputs bundle. For the GPU backend the pipeline
+    calls THIS function right after that read and caches the
+    device-resident bundle on ``Step0Inputs``.
 
     Parameters
     ----------
@@ -80,8 +79,7 @@ def cifti_smoothing_gpu(data: Union[np.ndarray, cp.ndarray],
     the production caller passes a device array straight from the
     GPU accumulator chain, so ``cp.asarray`` is a no-op alias.
 
-    Returns a device-resident ``cp.ndarray`` (PR #56-pattern
-    device-stay refactor). The downstream consumer ``find_minima_gpu``
+    Returns a device-resident ``cp.ndarray``. The downstream consumers ``find_minima_gpu``
     + ``watershed_edge_count_gpu`` both accept device input; tests
     cp.asnumpy at their assertion boundary.
 

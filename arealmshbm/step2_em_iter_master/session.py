@@ -180,26 +180,25 @@ def _validate_initial_state_params(Params: Dict[str, np.ndarray],
 class Step2EmIterSession:
     """Holds scratch + caches for the EM-iter master kernel.
 
-    Construct ONCE per :meth:`Step2Pipeline.run_em`; every
-    ``vmf_clustering_batch`` call (one per intra-EM iter) reuses it.
-    Per ``run_iter`` invocation: ONE outer-EM iter of the inner-iter
-    while-loop, spatial prior, fused E-step, normalize, and theta
-    update.
+    Construct ONCE per ``Step2Pipeline.run_em`` (``s_psi`` / ``sigma``
+    are re-staged per intra-EM iter via :meth:`refresh_s_psi_sigma`).
+    Per ``run_iter`` invocation: ONE outer-EM
+    iter of the inner-iter while-loop, spatial prior, fused E-step,
+    normalize, and theta update.
 
     The caller (vmf_clustering_batch) handles the EM-convergence test
     in Python between ``run_iter`` calls.
 
     Construction-time work (per Session, once):
-      * BOLD: holds the caller's ``bold_loader`` and allocates one
-        ``(N, T, D)`` fp32 C-contig scratch slot that the loader fills
-        on each subject visit (Phase A.3 and Phase D). Those phases
+      * BOLD: keeps the caller's ``bold_loader`` and allocates ONE
+        ``(N, T, D)`` fp32 C-contig scratch slot that the loader refills
+        for each subject visit inside ``run_iter``. Phase A.3 and Phase D
         consume it via zero-copy reshape to ``(N, T·D)`` for the
         per-subject big sgemms.
-      * grad (gMSHBM only): holds ``grad_loader`` and one
-        ``(T, N, D_grad)`` fp32 scratch slot, filled on each subject
-        visit before Phase C. Gradients keep TND layout — Phase C's
-        block-diagonal sgemms consume the per-t ``(N, D_grad)``
-        C-contig slice directly.
+      * grad: same pattern with ``grad_loader`` and one
+        ``(T, N, D_grad)`` slot (gMSHBM only). Gradients keep TND
+        layout — Phase C's block-diagonal sgemms consume the per-t
+        ``(N, D_grad)`` C-contig slice directly.
       * Copy caller's ``s_psi`` (S, L, D) into Session-owned buffer.
         ~5.6 MB. No transpose — Params hold internal layout natively.
 
@@ -212,18 +211,19 @@ class Step2EmIterSession:
       * Invoke the master kernel — operates on the Session-owned
         buffers directly.
 
-    Memory budget (fsaverage6 / S=3 / L=400 / D=1174 / T=6 / D_grad=100):
-      * BOLD scratch (one subject, independent of S)
-                              : 2.31 GB
+    Memory budget (fsaverage6 / S=3 / L=400 / D=1175 / T=6 / D_grad=100;
+    one (N, L) fp32 buffer is 131 MB):
+      * BOLD scratch (1 subj) : 2.31 GB
       * grad scratch (gMSHBM) : 197 MB
-      * s_lambda fp32 + (N, L) fp64 scratch
-                              : 393 + 262 = 655 MB
+      * s_lambda (fp32) + fp64 per-subject scratch
+                              : 393 + 262 MB
       * s_t_nu (A + B)        : 33.8 MB × 2 = 67.6 MB
       * X_dot_sl + sigma_psi  : 33.8 + 5.6 = 39 MB
-      * theta + bm + log_*    : ~525 MB
-      * tmp_idx + flag_ST     : ~33 MB
+      * theta + bm + log_connect + log_vmf + log_lambda
+                              : 5 × 131 = 655 MB
+      * tmp_idx (bool)        : 32.8 MB
       * Phase D scratch       : 11.3 MB (s_t_nu_TDL transpose for big sgemm B-operand)
-      * Spatial scratch       : ~132 MB
+      * Spatial scratch       : 131 MB (cross_NL; the other slots are KB-sized)
     """
 
     __slots__ = (
@@ -307,7 +307,7 @@ class Step2EmIterSession:
         # ── BOLD per-subject scratch: ONE (N, T, D) fp32 slot, re-used ──
         # The loader fills this on each subject visit (Phase A.3 and
         # again at Phase D); the bytes are evictable between visits.
-        # At fsa6/T=6/D=1175 this is ~2.3 GB regardless of S.
+        # At fsa6/T=6/D=1175 this is 2.31 GB regardless of S.
         self._bold_loader = bold_loader
         self._bold_scratch_NTD = np.empty(
             (self.N, self.T, self.D), dtype=np.float32
@@ -387,8 +387,7 @@ class Step2EmIterSession:
 
         # Phase D scratch — (T, D, L) fp32 buffer that holds the
         # transpose of s_t_nu_TLD (T, L, D) → (T, D, L) for the big
-        # E-step sgemm's right operand. ~11.3 MB at T=6 / D=1175 /
-        # L=400.
+        # E-step sgemm's right operand. 11.3 MB at T=6 / D=1175 / L=400.
         self._s_t_nu_TDL_scratch = np.empty(
             (self.T, self.D, self.L), dtype=np.float32
         )

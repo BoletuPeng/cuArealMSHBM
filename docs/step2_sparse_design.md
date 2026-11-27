@@ -187,7 +187,8 @@ drift     = |kappa_prev - kappa| / kappa_prev
 ```
 
 **fp32 kappa round-trip (CPU parity).** The CPU carries `kappa` in an fp32 array
-between `run_iter` calls and resets (`pipeline.py:365, 513`; `session.py:559, 620`).
+between `run_iter` calls and resets (`Step2Pipeline.initialize_params` / `run_em`'s
+`Params['kappa'][...] = ini_val`; `Step2EmIterSession.run_iter`'s fp32 `Params['kappa']`).
 So: the seed of the first `iter_m` of every `run_iter` is
 `kappa_prev = f64(f32(kappa_final_of_previous_run_iter))`, and after `reset_intra`
 it is `f64(f32(ini_val))`; the un-rounded fp64 `kappa_final` is what Phase D uses
@@ -201,9 +202,8 @@ bench) single-threaded; acceptable (§8).
 
 ### 1.5 Phase C — spatial_connect (gMSHBM) — exact except `u_update`/`cross` order
 
-Per subject (CPU `_kernels.py::_spatial_connect_per_subject_numba`), all
-`t`-invariant because the gradient is session-invariant; evaluated on the active
-support (§2.3):
+Per subject (CPU `_spatial_connect_per_subject_numba`), all `t`-invariant because the gradient
+is session-invariant; evaluated on the active support (§2.3):
 
 ```
 sum_lambda[l] = serial ascending-n fp32 sum over members(l) of s_lambda      (exact; native fp32, §1.10 note)
@@ -248,8 +248,7 @@ Such cells are `-inf` whenever `theta_out == 0`, i.e. from the first E.2 on. So:
   (§3 K7) with the same fp32 op order;
 * afterwards `rmax = rmax_P(n)` — bit-identical to the dense CPU rmax.
 
-Cost (fp32, per row, ascending `l` over P(n); CPU
-`_kernels.py::_fused_estep_per_subject_NTD`, its "Step 3: per-subject cost" block):
+Cost (fp32, per row, ascending `l` over P(n); CPU `_fused_estep_per_subject_NTD` Step 3):
 
 ```
 row_sum = serial fp32 Σ_l f32(scr[p]) * 1.0f
@@ -293,7 +292,7 @@ E.2 theta[p] = f32_rn( f32_rn(...f32_rn(0 + sl[0,p]) + sl[1,p] ...) * inv_S_f32 
 ### 1.8 Outer leaves — exact except device libm
 
 `intra_subject_var_loop` (L17), `intra_em_cost_step2` (L16), `inter_subject_var`
-(L18) and the two resets move on-device, mirroring `step2_em_outer/_kernels.py`
+(L18) and the two resets run on-device, mirroring `step2_em_outer/_kernels.py`
 op-for-op (R3 §2.2-2.5): fp32 `nu_sum` over `t` (start 0.0f), fp32
 `sigma_l*nu_sum + eps_mu` (no FMA), fp64 norm², **`nrm == 0 ⇒ psi_new[s,l,:] = 0.0f
 and cos = 0.0f`** (NOT the M-step's inf/NaN convention), else `f32(1.0/nrm)`,
@@ -342,7 +341,7 @@ Rules:
 * Sites that MUST use these helpers: the init's `exp` store, row sum and
   divide (K1a) and its `theta` compose (K1b), E.1 store, E.2 accumulate + scale,
   `log_theta` (widen via `f32_to_f64`), every `theta`/`s_lambda` non-zero test,
-  the active-support compaction flag, `theta_export`. Sites left native
+  the active-support compaction flag. Sites left native
   (deviation, negligible): the cost chain, `w_n = s_lambda·inv` in K3,
   `sum_lambda` in K5a.
 * A unit test feeds a row whose `scr/rs` lands at 1e-40 and asserts the stored
@@ -394,7 +393,7 @@ test oracles in `arealmshbm/step2_io/tests/_layout_oracle.py`.
 | M-step scratch | `partials (1024,) fp64`, `cos (S,T,L) fp32`, `flag (S,T) int8`, pinned 4-double slot | |
 | iteration-1 scratch (freed after) | one 8192-row tile: `X_tile (8192, T·D)` fp32 (~230 MB at T=6), `lv_tile (8192, L)` fp32, `cross_tile (8192, L)` fp32; `nu` transposed to `(T·D, L)` fp32 | §3 K7 |
 
-Sizing rule for `bold_cache_mode='auto'` (device bytes, evaluated after draining the cupy pools so `mem_info` reflects what this process can allocate): `packed` + `S·P·4` (`s_lambda`) + `2·S·L·D·4` (psi ping-pong) + `2·S·T·N·4` (row stats) + `S·N·4` (`n_alive`) +
+Sizing rule for `bold_cache_mode='auto'` (device bytes against `mem_info`'s free reading; the cupy pools are drained and the reading retaken only when the first reading is short): `packed` + `S·P·4` (`s_lambda`) + `2·S·L·D·4` (psi ping-pong) + `2·S·T·N·4` (row stats) + `S·N·4` (`n_alive`) +
 `grad`/`grad_sq` + `2·S·T·L·D·4` (`s_t_nu`, `X_dot_sl`) + `2·S·L·D·4` + the
 iteration-1 scratch `8192·(T·D + 2·L)·4 + T·D·L·4` + `bold_cache_safety_margin_gb` must fit in free memory,
 else `stream`. An explicit `eager_bitpacked` that does not fit raises
@@ -457,26 +456,26 @@ pinned-slot D2H (`.get(out=pinned)`).
 | K1a | `init_soft` | block per 32 rows (s,n): 8 warps × 4 rows; lanes own `l`; `g[d, :]` streamed per d-tile and reused across the rows; one L-float logit row per warp in smem | §1.2; per-(n,l) accumulator stays a private serial ascending-d fp32 sum; warp max over all L; lane 0 walks the row's P cells in ascending p (fp32 exp / serial sum / divide, subnormal-aware) |
 | K1b | `init_theta` | thread per p | §1.2: fp32 sum over the subjects nonzero at p, `/S`, `/count`, `+eps`; `active[p] = theta[p] > 0` (every P cell) |
 | K2 | `sigma_psi_SLD` | grid-stride | exact |
-| K3 | `x_dot_sl_bits` | one launch per subject s: grid T·L (block per (t,l)), 256 thr × 1 byte, dyn smem `64*8` B (member weights + row ids) | the kernel text shared with step 3 (`m_step/_xdot_kernel.py`) over the **active** CSC; no host wrapper — `check_dims` (session ctor) rejects `Db > 256` (the kernel's `XDOT_BLOCK × XDOT_MAX_NB`) with a `ValueError` naming the seed mesh: `backend='gpu'` supports `ceil(D/8) ≤ 256`, i.e. seed mesh fsaverage3 |
+| K3 | `x_dot_sl_bits` | one launch per subject s: grid T·L (block per (t,l)), 256 thr × 1 byte, dyn smem `64*8` B (member weights + row ids) | the kernel text shared with step 3 (`m_step/_xdot_kernel.py`) over the **active** CSC; no host wrapper — `check_dims` (session ctor) rejects `Db > 256` (the kernel's `XDOT_BLOCK × XDOT_MAX_NB`; the pipeline's D = 1175 packs to 147 bytes) with a `ValueError` |
 | K4a | `kappa_sum_stage1` / `reduce_stage2` | fixed grid 1024×256 / 1 block | fp32 product, fp64 tree |
-| K4b | `mstep_flags_kappa` | (S·T) blocks for the flags; the last block (or a 1-thread tail) computes `rbar`, device `invad`, clamps, `drift`, `kappa_f32`, `all_flag` → pinned slot | one launch fewer than a separate kappa kernel; the flag pass and the scalar epilogue are ordered by launching the epilogue as a 1-block kernel after the flags (2 launches) if a single-launch grid-wide ordering is not available — either way ≤ 6 launches per iter_m |
+| K4b | `mstep_kappa` / `mstep_flags` | 1 block / (S·T) blocks | `mstep_kappa` (after K4a, before K4c) finishes the `kappa_sum` tree and computes `rbar`, device `invad`, clamps, `drift`, `kappa_f32` into the result slot; `mstep_flags` (after K4c) writes the per-(s,t) flags into the same slot; one D2H of it per iter_m — 4 launches per iter_m |
 | K4c | `mstep_fused_body` | block per (s,t,l), 256 thr, dyn smem `4*D` | §1.4; `kappa_f32` read from the device slot; **read `old` into a register before the in-place store**; writes `cos[s,t,l]` |
 | K4e | `cdln_after_loop` | 1 thread | `cdln_val = f32(Cdln(kappa_final))`, once per `run_iter` |
 | K5a | `connect_u` | grid (L, ntile=4): member tiles, fixed-tree combine in a second stage | `sum_lambda` serial fp32 (ascending members, one thread), `u_update` fp64, `inv_l`, `u`, `u_sq` serial fp32 |
 | K5b | `connect_scv_P` | thread per active p | `cross` fp32 serial over d; `vmf`; T sequential adds; NaN kept |
 | K6 | `acc_P` (lv_sum on active P) | one launch per subject s: grid L (block per l), `ACC_BLOCK` = 768 thr; members of the active column in chunks of 768; inner loop over t restages `nu[s,t,l,:]` **as `Db*8` floats with the tail zero-filled** in smem | thread per member: 147 packed bytes (`__ldg`), `pt = serial ascending-d fp32 Σ` via branch-free `fmaf((float)bit, nu_sm[d], pt)` (measured bit-identical to set-bit iteration and 1.9× faster), `part += (double)inv * ((double)pt − (double)mean * S)`; after T: `lv_sum[p] = f32(part)`. `S[t,l]` from a block-per-(s,t,l) fp64 row-sum kernel. Measured 3.07 ms on full P → ~0.4 ms on the active support |
-| K7 | iteration-1 dense pass (only while `theta_out != 0`) | (i) `widen_exact`: `X_tile[i, t·D+d] = (f32(bit) − mean)·inv` (8192-row tiles, warp per (n, t) row; exact); (ii) `lv_tile = X_tile @ nu.reshape(T·D, L)` via cuBLAS sgemm (**16.6 ms**; `nu` transposed to `(T,D,L)` first); (iii) `cross_tile = grad @ u.T` (sgemm, 0.3 ms); (iv) `rmax_out_k`: warp per (s,n), lanes over l ∉ P(n) (smem scatter of the row's P cols), gMSHBM: same-hemisphere only, `lc = T-fold of ((2f·cross − grad_sq) − u_sq[l])`; dMSHBM: all l, no lc term; `lam = (kappa_f32·lv + f32(n_alive)·cdln) + f32(log(theta_out)) [+ beta_f32·lc]`; NaN skipped; `-inf` if none | ~35-40 ms once per run (S=1), one-tile transient freed after. No TF32 scope wraps step 2, so the sgemm runs strict fp32 |
+| K7 | iteration-1 dense pass (only while `theta_out != 0`) | (i) `widen_exact`: `X_tile[i, t·D+d] = (f32(bit) − mean)·inv` (8192-row tiles, warp per (n, t) row; exact); (ii) `lv_tile = X_tile @ nu.reshape(T·D, L)` via cuBLAS sgemm (**16.6 ms**; `nu` transposed to `(T,D,L)` first); (iii) `cross_tile = grad @ u.T` (sgemm, 0.3 ms); (iv) `rmax_out_k`: warp per (s,n), lanes over l ∉ P(n) (smem scatter of the row's P cols), gMSHBM: same-hemisphere only, `lc = T-fold of ((2f·cross − grad_sq) − u_sq[l])`; dMSHBM: all l, no lc term; `lam = (kappa_f32·lv + f32(n_alive)·cdln) + f32(log(theta_out)) [+ beta_f32·lc]`; NaN skipped; `-inf` if none | ~35-40 ms once per run (S=1), one-tile transient freed after |
 | K8 | `estep_row1` | thread per row n (measured: better than warp-per-row at ≤ 15 cells) | §1.6 up to `scr`; reads `rmax_out` when the flag is set; skips `lv_sum` reads for inactive cells; writes `log_vmf[p]`, `scr[p]`, `rmax[n]` |
 | K9 | `dead_col` | grid (L, ntile) over active members + fixed-tree combine | fp64 NaN-skipping sum; if 0 → write 0 to those `scr[p]` |
 | K10 | `estep_row2` | thread per row n | cost row (fp32) → block partials fp64; E.1 (§1.7, `f32_rn` store) → `s_lambda[s,p]`; `tmp_idx` from `n_alive`; explicit zeros for inactive cells |
 | K11 | `reduce_stage2` | 1 block | `cost_S[s]` fp64 |
-| K12 | `theta_mean_logtheta` + `build_active` | thread per p; scans via cupy | §1.7 E.2 with `f32_rn` emulation; `log_theta`; then §2.3 |
+| K12 | `theta_mean_logtheta` + `compact_scatter` / `gather_i32` / `compact_csc` | thread per p; scans via cupy | §1.7 E.2 with `f32_rn` emulation; `log_theta`; then §2.3 |
 | K13a | `intra_psi_iter` | block per (s,l), threads over d | §1.8 one iteration; zero-norm branch |
-| K13b | `intra_sigma` | block per l (fp64 dot over (s,t,d), fixed tree) then **300 blocks × 1 thread** for `invad` (measured 2.4× faster than one 300-thread block) | `sigma_new`, flags latch (per-s count over l), `rel_mean` → 2-double pinned slot |
+| K13b | `intra_sigma_dot`, `invad_L`, `intra_flags_rel` | block per l (fp64 dot over (s,t,d), fixed tree) then **300 blocks × 1 thread** for `invad` (measured 2.4× faster than one 300-thread block) | `sigma_new`, flags latch (per-s count over l), `rel_mean` → 2-double pinned slot |
 | K13c | `inter_mu`, `inter_eps_dot`, `inter_epsil` | block per l (fp64 sum over s, serial fp64 norm²); **`inter_eps_dot` is deliberately a serial fp64 dot on one thread per parcel** (CPU order) — a fixed tree changes `R` by ~1 ulp and `epsil = invAd(dim, R)` with `R → 1` amplifies that by ~5e9, which at S=1 moved the outer stop test from inter 10 to 7 and cost 4 theta flips; it costs 0.16 ms × 10 per run; `invad_L` as L blocks × 1 thread | §1.8 |
-| K13d | `intra_em_cost` | block per l + reduce; `Cdln` as L blocks × 1 thread | §1.8 |
-| K13e | `reset_broadcast` | grid-stride | `s_t_nu ← mtc_LD`, `s_psi ← mtc_LD`, `sigma ← ini_val` |
-| K14 | `theta_export` | — | `theta` D2H → host csc from `(p_row, col, val)` |
+| K13d | `cost_terms_perl`, `cdln_L`, `cost_epilogue` | block per l + reduce; `Cdln` as L blocks × 1 thread | §1.8 |
+| K13e | `broadcast_LD` | grid-stride | `s_t_nu ← mtc_LD`, `s_psi ← mtc_LD` (`sigma ← ini_val` is a cupy `fill`) |
+| K14 | — (`export_params`) | — | `theta` D2H → host fp64 → csc from `(p_row, col, val)`; no kernel |
 
 ### 3.1 Device scalar functions (fp64)
 
@@ -522,7 +521,7 @@ class Step2SparseSession:
 ```
 
 `run_iter` sequence (S subjects): K2 → [per s: BOLD to device if stream; K3] →
-denom → M-step loop (K4a, K4c, K4b; one D2H per iter_m) → K4e → S-row-sum →
+denom → M-step loop (K4a, `mstep_kappa`, K4c, `mstep_flags`; one D2H per iter_m) → K4e → S-row-sum →
 [per s: BOLD if stream; K5a, K5b (gMSHBM); K6; K7 (iteration 1 only); K8; K9;
 K10; K11] → K12 → `cost_S` D2H. Blocking syncs per `run_iter` = `m_iters + 1`;
 launches ≈ 14 + 5·m_iters + 9·S (≈ 0.25 ms of host floor at m_iters = 2.5, S=1).
@@ -554,9 +553,11 @@ def load_step2_sparse_inputs(cfg: Step2Config, *, overlap: bool = True) -> Step2
   choice (§2.2) puts it: in the stream-mode host cache when that fits, nowhere
   otherwise. Tests go through the same loader — on a synthetic project they
   write (`step2_io/tests/_synthetic_project.py`), or on the bench project.
-* cohort.json + the same consistency checks as today (`num_sub`, `num_session`,
-  mesh targ/seed); MW contract verification of subject 1 / session 1 (packed
-  bytes at MARS rows must be zero); dims from vlmeta.
+* cohort.json + the CPU loader's consistency checks (`num_sub`, `num_session`,
+  every `profile_b2nd` present on disk); `group/group.mat` and
+  `spatial_mask/spatial_mask.mat` at their fixed project-relative paths;
+  MW contract verification of subject 1 / session 1 (packed bytes at MARS
+  rows must be zero); dims from vlmeta.
 * BOLD: subject 1's header + one chunk (the MW contract) are read here, from one open;
   `bold_reader` is `blosc2.open(path, mode='r')` + `get_slice_numpy` straight into the
   caller's buffer (`profile_io.decode_subject_profile_packed_into`; ≈ 47 ms per subject
@@ -600,13 +601,14 @@ build rather than materialising the matrix this module returns.
   `PipelineConfig.backend_step{0,1,2,3}` all validate against
   `_VALID_BACKENDS` = `("cpu", "gpu")`. `pipeline.__exit__` frees the pools on `'gpu'`.
 * `Step2Pipeline.run()` dispatches: `'gpu'` → `load_inputs_sparse()` →
-  `_run_em_sparse()`; the CPU path is untouched. `Step2Inputs` and
+  `initialize_params_sparse()` → `_run_em_sparse()`; `'cpu'` → `load_inputs()` →
+  `initialize_params()` → `run_em()`. `Step2Inputs` and
   `Step2SparseInputs` are both re-exported from `step2_pipeline/__init__.py`.
 * `_run_em_sparse`: same outer/intra/EM control flow, same log lines, same
   progress emits, same `Record`/convergence arithmetic as `run_em`, calling the
-  §4 API. `Step2Result.timings` gains `init_device`, `closure_total`, `save`.
-* Save: `_save_params` moves to `step2_pipeline/_save.py::save_params_final(Params,
-  path)` (T2 lands this first; `pipeline.py` keeps a one-line delegation). `mu`
+  §4 API. `Step2Result.timings` gains `init_device`, `closure_total`.
+* Save: `_save_params` is a one-line delegation to
+  `step2_pipeline/_save.py::save_params_final(Params, path)`. `mu`
   is transposed to `(D, L)`, and the file is the MATLAB-layout dense fp64
   `theta` block with `do_compression=True` on every backend — the sparse
   backend's `export_params()` hands over a `csc_matrix` and the writer
@@ -619,17 +621,14 @@ build rather than materialising the matrix this module returns.
   `warmup_step2_gpu()` (no pinned buffers: those are allocated at
   Session-ctor time — the driver drains the pools after step 0); called from
   `driver.run()` right before step 0 when Mode B and
-  `backend_step2 == 'gpu'`. `Pipeline.__init__`
-  (`_validate_inputs_vs_config` → `_require_fsaverage3_seed`) rejects a
-  `seed_mesh` other than `fsaverage3` for `backend_step2` (Mode B only) and
-  for `backend_step3='gpu'`, so a cohort that the sparse kernels cannot take does
-  not get discovered after step 1 (the other two static limits,
+  `backend_step2 == 'gpu'`. The two static limits,
   `num_clusters <= 32*INIT_MAXJ` = 512 and
   `n_grad_components <= (49152 - 2064)/4` = 11772 — `connect_u`'s dynamic
   shared memory against the 48 KiB per-block default — are refused by the
-  config parser and by `Step2Config.__post_init__`, both mirroring
+  config parser and by `Step2Config.__post_init__` (both mirroring
   `_kernels_gpu`'s `MAX_CLUSTERS` / `MAX_D_GRAD` as literals so the
-  stdlib-only parser never imports cupy).
+  stdlib-only parser never imports cupy), so a configuration the sparse
+  kernels cannot take does not get discovered after step 1.
   `warmup_step2_gpu()` also runs a 32x32 gemm, which pays cuBLAS's
   process-wide kernel-module load that the iteration-1 dense pass (K7) would
   otherwise charge to the first `run_iter`. cupy's cuBLAS handle is per
@@ -740,8 +739,8 @@ Fixtures: `testdata/step2_bench/proj` (S=1) and `proj2` (S=2), env override
   band is ever needed.
 * Device `invad` secant branch ~140 µs single-thread (≈ 20 % of iter_m on the bench).
 * `tmp_idx := (n_alive == 0)`: exact for `κ < 2308`; one-shot warning above.
-* K7 uses cuBLAS once per run, in strict fp32 (no TF32 scope wraps step 2).
-* `backend='gpu'` requires `ceil(D/8) ≤ 256` (seed mesh fsaverage3); grad must fit
+* K7 uses cuBLAS once per run (fp32 sgemm).
+* `backend='gpu'` requires `ceil(D/8) ≤ 256` (the pipeline's D = 1175 → 147); grad must fit
   on device (S ≲ 150 on 24 GB); stream mode costs 2·S·(H2D 72 MB) per EM iter.
 * **`epsil` and `mu` are NOT on the §7.3 bar list, deliberately.**
   `epsil = invAd(dim, R)` with `R -> 1` at small `S` is catastrophically
@@ -794,8 +793,7 @@ with shared-memory staging (128 → 118 µs); the closure dots
 `intra_sigma_dot` / `cost_terms_perl` are block trees (863/997 → 37/47 µs) while
 `inter_eps_dot` stays serial (see §3 K13c). Full pytest suite: 429 passed,
 10 skipped. Driver Mode B end-to-end (two subjects, gpu backends throughout):
-19.7 s total, step 2 0.87 s, step 3 consumes the prior unchanged. These are
-driver runs, so the default dense `theta` writer.
+19.7 s total, step 2 0.87 s, step 3 consumes the prior unchanged.
 
 10-subject YS Mode B on this tree (2026-09-04, step 0/1 pinned `cpu` so every
 arm's step-2 inputs are byte-identical, step 3 on the dense GPU EM): step 2 wall

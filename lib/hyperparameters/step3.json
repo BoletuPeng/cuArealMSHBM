@@ -15,7 +15,7 @@
       "default": "cpu",
       "source": "arealmshbm/pipeline/config.py (PipelineConfig.backend_step3)",
       "description": "step3 backend. 'cpu' is the numba session (VmfClusteringSession), the numerical reference. 'gpu' is the candidate-set EM on the theta support (VmfClusteringSessionSparseCUDA): BOLD stays bit-packed on device and the whole intra_em loop is device-resident.",
-      "notes": "'gpu' contract: docs/step3_sparse_design.md; all three variants, run-to-run deterministic; MATLAB-reference agreement in its section 3. 'gpu' requires seed_mesh 'fsaverage3' in bold_inputs.json (the packed-BOLD kernels cap ceil(D/8) at 256); any other configuration is rejected at config / driver validation, so select backend_step3='cpu' for it."
+      "notes": "'gpu' contract: docs/step3_sparse_design.md; all three variants, run-to-run deterministic; MATLAB-reference agreement in its section 3."
     },
     {
       "key": "step3.connect_th",

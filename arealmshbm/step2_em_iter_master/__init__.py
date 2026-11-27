@@ -2,26 +2,27 @@
 
 Pulls every leaf in the step-2 outer-EM iter body (the EM split across
 ``CBIG_ArealMSHBM_{g,d}MSHBM_estimate_group_priors_parent.m`` and
-``..._child.m``) into a single numba ``@njit`` pipeline, calling per-phase
-``@njit`` sub-kernels that numba inlines into one fused master:
+``..._child.m``) into one master call — a Python orchestrator over
+per-phase ``@njit`` sub-kernels, with the two per-subject loops in
+Python so each subject's BOLD / gradient is decoded on demand:
 
 * Phase A — Precompute ``X_dot_sl[s, t, l, d] = Σ_n s_lambda[s, n, l]
   · BOLD[s, n, t, d]`` via numba ``np.dot`` (BLAS sgemm dispatch).
   ONE big sgemm per subject (``(L, N) × (N, T·D) → (L, T·D)``, then
   transposed to (T, L, D) into ``X_dot_sl_STLD[s]``). Same FLOP count
-  as the pre-fusion S·T smaller (L, N)×(N, D) sgemms, hoisted out of
+  as T smaller (L, N)×(N, D) sgemms per subject, hoisted out of
   the M-step inner while-loop (s_lambda is constant within the inner
   loop). Per-s collapse is required by the NTD BOLD layout — numba's
   ``np.dot`` does not dispatch 2-D strided slices through cblas_sgemm.
 * Phase B — Multi-subject M-step inner while-loop.
   Sgemm-free given X_dot_sl: ``kappa_sum`` is a fp64 reduction over
-  (S, T, L, D); per-(s, t, l) update is unit-stride d. Adapted from
-  the single-subject (T, L, D) layout of an earlier fused-kernel
-  prototype to the multi-subject (S, T, L, D) layout.
+  (S, T, L, D); per-(s, t, l) update is unit-stride d — the
+  single-subject (T, L, D) M-step extended to the multi-subject
+  (S, T, L, D) layout.
 * Phase C — Per-subject spatial_connect prior (gMSHBM only).
   Block-diagonal gemms + assemble in numba (``np.dot`` × 4 per session
   + ``-||grad||² + 2·g·u - ||u||²`` numba loop). gradients use the
-  (S, T, N, D_grad) TND layout — the per-t (N, D_grad) C-contig
+  per-subject (T, N, D_grad) TND layout — the per-t (N, D_grad) C-contig
   slice is the natural sgemm input.
 * Phase D — Per-subject fused E-step (NTD variant). Big sgemm
   ``(N, T·D) × (T·D, L) → (N, L)`` folds both the per-t loop AND the
@@ -49,7 +50,7 @@ Layout invariant (callers MUST honor at the Session boundary):
   ``SubjectGradientLoader.load_into``.
 * s_t_nu           : ``(S, T, L, D)`` fp32 C-contig (UNIFIED layout —
   M-step indexes (s, t, l, d) unit-stride; E-step internally
-  transposes to (T, D, L) into a session-owned 3.76 MB scratch buffer
+  transposes to (T, D, L) into a session-owned 11.3 MB scratch buffer
   for the big sgemm's right operand). No transpose between M-step and
   E-step within an iter.
 * s_lambda         : ``(S, N, L)`` fp32 storage. The E-step's softmax
@@ -57,7 +58,7 @@ Layout invariant (callers MUST honor at the Session boundary):
   through Phase D → Phase E.1; cast to fp32 storage happens once at
   the end of Phase E.1 per subject.
 * s_psi            : ``(S, L, D)`` fp32 C-contig (sigma * s_psi
-  precomputed once per Session prepare; unit-stride d).
+  precomputed once per outer EM iter, Phase A.1; unit-stride d).
 * sigma            : ``(L,)`` fp32.
 * theta            : ``(N, L)`` fp32.
 * boundary_mask    : ``(N, L)`` fp32.
@@ -70,9 +71,9 @@ dtype contract (single fixed production path — no precision interface):
   inside a per-subject (N, L) scratch through Phase D → Phase E.1
   (see _phase_e1_normalize_per_subject_kernel).
 * Reduction accumulators: mixed fp32 / fp64 per the per-site policy
-  table in ``docs/step2_em_iter_master_kernel.md §2``. Three sites
-  MUST stay fp64 (M1 kappa_sum, E row-normalize, D softmax exp at
-  β=5000 subnormal); the rest are fp32-safe.
+  table in ``docs/step2_em_iter_master_kernel.md §2``. Four sites
+  MUST stay fp64 (M1 kappa_sum, B denom, E row-normalize, D softmax
+  exp at β=5000 subnormal); the rest are fp32-safe.
 * kappa scalar: fp64 (Bessel territory). Cast to fp32 inside the
   M-step inner kernel once per iter_m.
 

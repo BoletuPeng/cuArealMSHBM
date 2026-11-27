@@ -1,11 +1,11 @@
 """radius_mask
 
-Step-1 leaf — per-parcel spatial-prior mask on a fsaverage* mesh.
+Step-1 leaf — per-parcel spatial-prior mask on the fsaverage6 mesh.
 
 For each parcel l: bounded multi-source SSSP from every vertex labeled
 l on the area-rescaled inflated surface (≤ ``radius`` mm) → boolean
 column for ``lh_boundary`` / ``rh_boundary``. Pre/post-central sulcus
-is computed once per hemi (SSSP over union of verts in aparc==25 ∨ 23,
+is computed once per hemi (one SSSP from each vert in aparc==25 ∨ 23,
 unbounded, used to derive mean parcel-to-sulcus distance) and used to
 zero parcels whose distance is too small (``truncate_kernel``).
 
@@ -16,15 +16,14 @@ Backends (dispatched by the ``backend=`` kwarg on the supercall):
           central-sulcus distances, batched pull-based Bellman-Ford on
           a (V, L_h) device matrix for the bounded radius mask.
           Classify / truncate stay CPU (small, heavy control flow).
-          cupy imported lazily. Requires V <= 90080, so fsaverage6 /
-          fsaverage5 only — fsaverage is CPU-only for this leaf.
+          cupy imported lazily.
 
 Public API:
-    generate_radius_mask(lh_labels, rh_labels, mesh, radius, out_dir, …,
+    generate_radius_mask(lh_labels, rh_labels, radius, out_dir, …,
                           backend='cpu' | 'gpu')
 
 Output:
-    <out_dir>/spatial_mask/spatial_mask_<mesh>.mat with
+    <out_dir>/spatial_mask/spatial_mask.mat with
         ``lh_boundary``, ``rh_boundary`` — scipy.sparse.csc_matrix
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>

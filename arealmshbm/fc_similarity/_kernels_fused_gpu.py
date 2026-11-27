@@ -44,9 +44,9 @@ void fused_demean_norm_axis0(
     for (int t = 0; t < T; t++) {
         sum += (double)x[(size_t)t * (size_t)K + (size_t)j];
     }
-    // Cast mean to fp32 BEFORE the demean subtract - matches the host
-    // path's ``x_d -= mean64.astype(cp.float32)`` so the stored fp32
-    // demeaned value is bit-identical per cell.
+    // Cast mean to fp32 BEFORE the demean subtract, so the stored fp32
+    // demeaned value is bit-identical per cell to
+    // ``x - float(mean64)``.
     const float mean = (float)(sum / (double)T);
 
     // -- Pass 2: in-place demean + fp64 SS accumulation.
@@ -131,7 +131,7 @@ _AXIS1_BLOCK = 256
 # ─────────────────────────────────────────────────────────────────────
 # Axis-0 divide + demean + norm, one HBM write instead of two.
 #
-# Pass 1 absorbs the caller's two broadcast divides and does NOT store
+# Pass 1 absorbs the divide by mr ⊗ mc and does NOT store
 # the divided value: fp32 division is deterministic, so pass 2's
 # recompute reproduces the exact bits a store would have round-tripped.
 #
@@ -313,8 +313,7 @@ def fused_div_demean_norm_columns_cupy(
 
     Equivalent to the CPU ``_scale_demean_norm_inplace``::
 
-        x_d /= mr_d[:, None]
-        x_d /= mc_d[None, :]
+        x_d /= mr_d[:, None] * mc_d[None, :]
         mag = fused_demean_norm_columns_cupy(x_d)
 
     ``x_d`` (T, K) is mutated in place. ``mr_d`` (T,) is staged whole in

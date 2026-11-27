@@ -63,17 +63,9 @@ from .ini_params import (
 
 def _concat_precomputed_avg_device(
     lh_avg_dev, rh_avg_dev, n_lh: int, n_rh: int,
-    profile_dtype, reduction_dtype,
 ):
-    """Concat the device ``(V_h, D)`` avg profiles into ``(N, D)`` at
-    ``reduction_dtype``, on device.
-
-    Cast semantics match the host path exactly. The host path does
-    ``source → profile_dtype → reduction_dtype``; when those two dtypes
-    are equal the composition collapses to a single cast, which is what
-    production (fp64 / fp64) takes. When they differ we materialise the
-    ``profile_dtype`` intermediate so a deliberately lossy
-    ``profile_dtype`` still rounds at the same place.
+    """Concat the device ``(V_h, D)`` avg profiles into ``(N, D)`` fp64,
+    on device: the stack and the widen are one allocation.
     """
     for name, a in (("lh", lh_avg_dev), ("rh", rh_avg_dev)):
         if not isinstance(a, cp.ndarray):
@@ -107,32 +99,17 @@ def _concat_precomputed_avg_device(
             f"{rh_avg_dev.shape[1]}"
         )
     D = int(lh_avg_dev.shape[1])
-    p_dt = np.dtype(profile_dtype)
-    r_dt = np.dtype(reduction_dtype)
-
-    def _stack(dtype):
-        out = cp.empty((n_lh + n_rh, D), dtype=dtype)
-        out[:n_lh] = lh_avg_dev
-        out[n_lh:] = rh_avg_dev
-        return out
-
-    if p_dt == r_dt:
-        return _stack(r_dt)
-    mid = _stack(p_dt)
-    out = mid.astype(r_dt)
-    del mid
+    out = cp.empty((n_lh + n_rh, D), dtype=cp.float64)
+    out[:n_lh] = lh_avg_dev
+    out[n_lh:] = rh_avg_dev
     return out
 
 
 def generate_ini_params_gpu(
-    seed_mesh: str,
-    targ_mesh: str,
     lh_labels: np.ndarray,
     rh_labels: np.ndarray,
     out_dir: str,
     *,
-    profile_dtype: np.dtype = np.float64,
-    reduction_dtype: np.dtype = np.float64,
     save: bool = True,
     precomputed_lh_avg: Optional[np.ndarray] = None,
     precomputed_rh_avg: Optional[np.ndarray] = None,
@@ -155,18 +132,7 @@ def generate_ini_params_gpu(
     ``save_async``: submit the ``group.mat`` write to a background
     thread and return immediately; the handle is on ``result.writer``
     and the caller MUST ``.wait()`` on it.
-
-    ``reduction_dtype`` must be fp64 on this backend — the demean/L2,
-    groupsum, colnorm and ε RawKernels are all fp64. Use
-    ``backend='cpu'`` for an fp32 reduction.
     """
-    if np.dtype(reduction_dtype) != np.float64:
-        raise ValueError(
-            f"generate_ini_params_gpu: reduction_dtype must be float64 on "
-            f"the GPU backend (the demean/groupsum/colnorm/epsil RawKernels "
-            f"are fp64); got {np.dtype(reduction_dtype)}. Use backend='cpu' "
-            f"for a lower-precision reduction."
-        )
     have_dev = (precomputed_lh_avg_dev is not None
                 and precomputed_rh_avg_dev is not None)
     if (precomputed_lh_avg_dev is None) != (precomputed_rh_avg_dev is None):
@@ -193,7 +159,7 @@ def generate_ini_params_gpu(
     n_lh = lh_labels.size
     n_rh = rh_labels.size
 
-    medial_mask = _load_medial_mask(targ_mesh)
+    medial_mask = _load_medial_mask()
     if medial_mask.shape[0] != n_lh + n_rh:
         raise ValueError(
             f"medial_mask size ({medial_mask.shape[0]}) != lh+rh labels "
@@ -206,26 +172,18 @@ def generate_ini_params_gpu(
 
     if have_dev:
         profile_dev = _concat_precomputed_avg_device(
-            precomputed_lh_avg_dev, precomputed_rh_avg_dev,
-            n_lh, n_rh, profile_dtype, reduction_dtype,
+            precomputed_lh_avg_dev, precomputed_rh_avg_dev, n_lh, n_rh,
         )
         n_total, d_orig = profile_dev.shape
     else:
         if have_host:
             profile_host = _concat_precomputed_avg(
-                precomputed_lh_avg, precomputed_rh_avg,
-                n_lh, n_rh, profile_dtype,
+                precomputed_lh_avg, precomputed_rh_avg, n_lh, n_rh,
             )
         else:
-            profile_host = _read_profile_concat(
-                out_dir, targ_mesh, seed_mesh, profile_dtype,
-            )
+            profile_host = _read_profile_concat(out_dir)
         n_total, d_orig = profile_host.shape
-        # Promote storage to reduction_dtype so the demean+L2 RawKernel's
-        # double* pointer is valid. Production has both at fp64 -> no copy.
-        if profile_host.dtype != reduction_dtype:
-            profile_host = profile_host.astype(reduction_dtype, copy=False)
-        profile_dev = cp.asarray(np.ascontiguousarray(profile_host))
+        profile_dev = cp.asarray(profile_host)
         del profile_host
     if n_total != n_lh + n_rh:
         raise ValueError(
@@ -257,7 +215,7 @@ def generate_ini_params_gpu(
     # the numba _groupsum_kernel's exact accumulation order.
     offsets_dev, rows_dev = build_parcel_csr_cupy(labels_dev, L)
 
-    mtc_dev = cp.empty((d_orig, L), dtype=reduction_dtype)
+    mtc_dev = cp.empty((d_orig, L), dtype=cp.float64)
     groupsum_csr_cupy(profile_dev, offsets_dev, rows_dev, L, mtc_dev)
     colnorm_scale_cupy(mtc_dev)
 
@@ -273,7 +231,7 @@ def generate_ini_params_gpu(
     lam[np.flatnonzero(has_label), keep_labels[has_label] - 1] = 1
 
     # D2H mtc once at the end.
-    mtc_host = cp.asnumpy(mtc_dev).astype(np.float64, copy=False)
+    mtc_host = cp.asnumpy(mtc_dev)
 
     out = IniParamsResult({
         "mtc": mtc_host,

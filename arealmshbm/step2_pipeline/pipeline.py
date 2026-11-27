@@ -6,12 +6,10 @@ Dispatches on ``mode ∈ {gMSHBM, dMSHBM}``. cMSHBM is not wired
 
 Stages:
 
-    1. load_inputs        — mesh + cohort.json + group.mat
-                            + spatial_mask (→ boundary_mask) + per-subject
-                            loaders for the (N, T, D) profiles and, gMSHBM
-                            only, the (N, D_grad) gradients (dims peeked
-                            from subject 1; subjects are decoded on demand,
-                            not preloaded).
+    1. load_inputs        — mesh (medial-wall labels) + cohort.json +
+                            group.mat + spatial_mask (→ boundary_mask) +
+                            per-subject loaders for the profiles and (gMSHBM
+                            only) the gradients; nothing is preloaded.
     2. initialize_params  — sigma/s_psi/epsil/mu/kappa/s_t_nu from group.mat;
                             init s_lambda per subject via the stock soft masked
                             posterior (compose_init_state);
@@ -96,7 +94,7 @@ class Step2Inputs:
     subject's BOLD / gradient from disk on demand when the master
     kernel visits subject ``s`` in Phase A.3 / Phase D (BOLD) or
     Phase C (gradient). Peak per-iter footprint is one subject's
-    slab (~770 MB BOLD + ~200 MB grad at fsa6/T=6) independent of S.
+    slab (2.31 GB BOLD + ~200 MB grad at fsa6/T=6) independent of S.
     """
     # Mesh
     lh_mars: np.ndarray            # (N_lh,) bool — 1 for medial wall
@@ -106,7 +104,7 @@ class Step2Inputs:
 
     # Per-subject loaders.
     bold_loader: SubjectProfileLoader
-    grad_loader: Optional[SubjectGradientLoader]  # gMSHBM/dMSHBM only
+    grad_loader: Optional[SubjectGradientLoader]  # gMSHBM only
 
     # Cached dims peeked from sub 1 at load_inputs time. Used by
     # initialize_params and Session ctor to size scratch buffers
@@ -114,11 +112,11 @@ class Step2Inputs:
     N: int
     T: int
     D: int
-    D_grad: int                     # 0 when no grad_loader (dMSHBM-no-grad)
+    D_grad: int                     # 0 when no grad_loader (dMSHBM)
 
     # Group prior
-    mtc: np.ndarray                 # (D+1, L) fp64 — from group.mat
-    dim: int                        # = D = mtc.shape[0] - 1
+    mtc: np.ndarray                 # (D, L) fp64 — from group.mat
+    dim: int                        # vMF dim = D - 1 = mtc.shape[0] - 1
 
     # Spatial mask
     boundary_mask: np.ndarray       # (N, L) fp32
@@ -213,8 +211,8 @@ class Step2Pipeline:
         t0 = time.perf_counter()
         self._log(f"[step2] load_inputs  mode={cfg.mode}  S={cfg.num_sub}  T={cfg.num_session}  L={cfg.num_clusters}")
 
-        # Read cohort.json — the explicit roster + artifact ledger
-        # written by step1, used as the sole discovery mechanism.
+        # Read cohort.json — the roster and each subject's profile /
+        # gradient paths.
         t_cohort = time.perf_counter()
         cohort = read_cohort(cfg.project_dir)
         if cohort.num_sub != cfg.num_sub:
@@ -227,22 +225,12 @@ class Step2Pipeline:
                 f"Step2Pipeline: cfg.num_session={cfg.num_session} != "
                 f"cohort.json num_session={cohort.num_session}"
             )
-        if cohort.mesh.get("targ") != cfg.mesh:
-            raise ValueError(
-                f"Step2Pipeline: cfg.mesh={cfg.mesh!r} != "
-                f"cohort.json mesh.targ={cohort.mesh.get('targ')!r}"
-            )
-        if cohort.mesh.get("seed") != cfg.seed_mesh:
-            raise ValueError(
-                f"Step2Pipeline: cfg.seed_mesh={cfg.seed_mesh!r} != "
-                f"cohort.json mesh.seed={cohort.mesh.get('seed')!r}"
-            )
         t_cohort = time.perf_counter() - t_cohort
 
         # Mesh — need MARS_label per hemi (for medial-wall zeroing in load_subject_profiles)
         t_mesh = time.perf_counter()
-        lh_inf = load_avg_mesh("lh", cfg.mesh, "inflated")
-        rh_inf = load_avg_mesh("rh", cfg.mesh, "inflated")
+        lh_inf = load_avg_mesh("lh", "inflated")
+        rh_inf = load_avg_mesh("rh", "inflated")
         # MARS_label is (1, N) per MATLAB; flatten + bool-typed (1 == medial wall).
         lh_mars = (np.asarray(lh_inf["MARS_label"]).ravel() == 1)
         rh_mars = (np.asarray(rh_inf["MARS_label"]).ravel() == 1)
@@ -269,8 +257,6 @@ class Step2Pipeline:
         bold_loader = SubjectProfileLoader(
             cohort=cohort,
             project_dir=cfg.project_dir,
-            targ_mesh=cfg.mesh,
-            seed_mesh=cfg.seed_mesh,
             lh_mars=lh_mars,
             rh_mars=rh_mars,
             cache_mode=loader_cache_mode,
@@ -323,7 +309,7 @@ class Step2Pipeline:
         # Group prior
         t_group = time.perf_counter()
         group = load_group_mtc(cfg.project_dir / "group" / "group.mat")
-        mtc = group["mtc"]                                          # (D+1, L) fp64
+        mtc = group["mtc"]                                          # (D, L) fp64
         dim = int(mtc.shape[0] - 1)
         assert mtc.shape[1] == cfg.num_clusters, (
             f"group.mtc has L={mtc.shape[1]} but cfg.num_clusters={cfg.num_clusters}"
@@ -333,7 +319,7 @@ class Step2Pipeline:
         # Boundary mask
         t_boundary = time.perf_counter()
         lh_b, rh_b = load_spatial_mask(
-            cfg.project_dir / "spatial_mask" / f"spatial_mask_{cfg.mesh}.mat"
+            cfg.project_dir / "spatial_mask" / "spatial_mask.mat"
         )
         boundary_mask = build_step2_boundary_mask(
             lh_boundary=lh_b, rh_boundary=rh_b, mode=cfg.mode,

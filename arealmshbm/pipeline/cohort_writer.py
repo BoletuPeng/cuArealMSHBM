@@ -1,8 +1,8 @@
 """cohort_writer.py — cohort.json writer for the unified driver.
 
-Builds + merges ``<project_dir>/cohort.json`` from the artifacts a
-step-1 run produced. The unified pipeline driver calls this at the
-end of its step-1 phase.
+Builds + merges ``<project_dir>/cohort.json`` from the per-subject
+artifacts of a run (step 0's gradients, step 1's profiles). The unified
+pipeline driver calls this at the end of its step-1 phase.
 
 The cohort.json schema + the field-level merge semantics
 (roster-keyed update, artifacts preserved across runs) are owned by
@@ -22,15 +22,10 @@ def write_cohort_manifest(
     project_dir: Path,
     subjects: Sequence[str],
     sessions: Sequence[str],
-    targ_mesh: str,
-    seed_mesh: str,
     n_grad_components: int,
     profile_b2nd_paths: Sequence[Tuple[str, Path]],
-    group_mat_path: Optional[Path],
-    spatial_mask_path: Optional[Path],
-    avg_profile_paths: Optional[Tuple[Path, Path]],
 ) -> Path:
-    """Field-level merge cohort.json from a step-1 run's outputs.
+    """Field-level merge cohort.json from a run's per-subject outputs.
 
     Per-subject ``gradient_lh`` / ``gradient_rh`` are probed from
     ``project_dir/gradients/sub<S>/{lh,rh}_emb_<N>_distance_matrix.{npy,mat}``
@@ -81,31 +76,13 @@ def write_cohort_manifest(
     run_id = compute_run_id(
         subjects=[str(s) for s in subject_ids],
         sessions=[str(s) for s in session_ids],
-        targ_mesh=targ_mesh,
-        seed_mesh=seed_mesh,
         n_grad_components=nc,
     )
-
-    group_mat = (relpath_or_abs(project_dir, group_mat_path)
-                 if group_mat_path is not None else None)
-    spatial_mask = (relpath_or_abs(project_dir, spatial_mask_path)
-                    if spatial_mask_path is not None else None)
-    if avg_profile_paths is not None:
-        lh_avg, rh_avg = avg_profile_paths
-        avg_lh = relpath_or_abs(project_dir, lh_avg)
-        avg_rh = relpath_or_abs(project_dir, rh_avg)
-    else:
-        avg_lh, avg_rh = None, None
 
     write_cohort_partial(
         project_dir,
         subjects=subjects_cohort,
-        mesh={"targ": targ_mesh, "seed": seed_mesh},
         n_grad_components=nc,
         run_id=run_id,
-        group_mat=group_mat,
-        spatial_mask_mat=spatial_mask,
-        avg_profile_lh_npy=avg_lh,
-        avg_profile_rh_npy=avg_rh,
     )
     return cohort_json_path(project_dir)

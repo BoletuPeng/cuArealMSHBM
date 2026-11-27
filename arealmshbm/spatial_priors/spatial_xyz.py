@@ -10,7 +10,7 @@ multiplication and the post-cleanup zeros it).
 Public API:
     XyzSession              — caches the bilateral sphere coords once;
                               recomputes the (N, L) prior each call.
-    compute_unit_sphere_xyz — load + row-normalize bilateral sphere
+    compute_unit_sphere_xyz — row-normalize bilateral sphere
                               coords (shared with the step-3 ``gpu``
                               session, vmf_clustering_gpu).
 

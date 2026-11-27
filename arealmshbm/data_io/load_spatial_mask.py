@@ -1,7 +1,8 @@
 """load_spatial_mask.py
 
-Load ``spatial_mask_<mesh>.mat`` — the per-hemi 30 mm-radius spatial
-masks (``lh_boundary``, ``rh_boundary``) used to build the bilateral
+Load ``spatial_mask.mat`` — the per-hemi radius spatial masks
+(``lh_boundary``, ``rh_boundary``; radius =
+``step1.radius_mask_radius_mm``) used to build the bilateral
 block-diagonal ``boundary_mask``.
 
 Each hemisphere is read by :func:`arealmshbm.data_io.mat5_stream.read_sparse`
@@ -22,11 +23,11 @@ from .mat5_stream import read_sparse
 
 
 def load_spatial_mask(mask_path: str | Path) -> Tuple[np.ndarray, np.ndarray]:
-    """Read ``spatial_mask_<mesh>.mat`` and return ``(lh_boundary, rh_boundary)``.
+    """Read ``spatial_mask.mat`` and return ``(lh_boundary, rh_boundary)``.
 
     Parameters
     ----------
-    mask_path : path to ``spatial_mask_<mesh>.mat``.
+    mask_path : path to ``spatial_mask.mat``.
 
     Returns
     -------

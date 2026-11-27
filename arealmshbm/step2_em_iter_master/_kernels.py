@@ -42,9 +42,9 @@ Reduction-accumulator dtype: mixed, per the per-site policy in
 
 * **fp32 acc**: Phase B col-norm / cosine; Phase D log_vmf
   composition + per-subject cost; Phase E.2 theta-mean.
-* **fp64 acc (MUST stay fp64)**: Phase B kappa_sum and denom; Phase D
-  softmax exp / row_max subtract (β=5000 subnormal); Phase E.1
-  row-normalize ``rs`` (catastrophic on fp32 — see kernel comment).
+* **fp64 acc (MUST stay fp64)**: Phase B kappa_sum / denom; Phase D softmax
+  exp / row_max subtract (β=5000 subnormal); Phase E.1 row-normalize
+  ``rs`` (catastrophic on fp32 — see kernel comment).
 
 The CPU wall is identical either way (memory-bound), but the dtype
 map informs the GPU port: on a 1:64 fp64:fp32 device, every fp32-safe
@@ -69,7 +69,7 @@ from arealmshbm.em_stop_criterion._cdln import _cdln_single
 from arealmshbm.m_step._invad import invad_numba
 
 
-# log(eps_f64^20) ≈ -720.4391 — softmax / cost floor (matches the fused
+# log(eps_f64^20) ≈ -720.8731 — softmax / cost floor (matches the fused
 # E-step kernel's invariant).
 _LOG_EPS20 = float(math.log(np.finfo(np.float64).eps ** 20))
 
@@ -77,15 +77,15 @@ _LOG_EPS20 = float(math.log(np.finfo(np.float64).eps ** 20))
 # ─────────────────────────────────────────────────────────────────────
 # Phase A — Precompute X_dot_sl[s, t] = s_lambda[s].T @ X[s, t].
 #
-# This is the hoisted M-step trick: ``X.T @ s_lambda`` is
+# The hoisted-X_dot_sl M-step trick: ``X.T @ s_lambda`` is
 # independent of s_t_nu, so we hoist it out of the iter_m inner loop.
 # The MATLAB driver recomputes it every iter_m (~2078 GFlops per outer
 # EM iter at production scale); we compute it ONCE per outer EM iter.
 #
 # Output layout (T, L, D) per subject — unit-stride d for the downstream
-# M-step inner loop. BOLD is now (S, N, T, D) (NTD layout); the per-(s,t)
-# slice would be N-strided, so we fold S·T smaller sgemms into ONE big
-# sgemm per subject + a small transpose.
+# M-step inner loop. BOLD is (N, T, D) per subject (NTD layout); the
+# per-t slice would be N-strided, so we fold the T smaller sgemms into
+# ONE big sgemm per subject + a small transpose.
 # ─────────────────────────────────────────────────────────────────────
 @njit(cache=True, fastmath=False, boundscheck=False, inline='always')
 def _compute_X_dot_sl_s_NTD(
@@ -101,7 +101,7 @@ def _compute_X_dot_sl_s_NTD(
     Equivalent FLOPs to ``T`` smaller ``(L, N) × (N, D)`` sgemms,
     but a single BLAS dispatch
     instead of T → marginally better cache reuse of the (L, N) left
-    factor, and — critically — works directly on the (S, N, T, D) NTD
+    factor, and — critically — works directly on the (N, T, D) NTD
     layout without paying for a per-(s, t) C-contig staging copy
     (numba's np.dot does not dispatch strided 2-D slices through
     cblas_sgemm — it falls through to a manual generic loop, ~50-100×
@@ -155,9 +155,9 @@ def _sigma_psi_SLD_compute(sigma_L, s_psi_SLD, sigma_psi_SLD):
 # ─────────────────────────────────────────────────────────────────────
 # Phase B — Multi-subject M-step inner loop.
 #
-# Adapted from the single-subject (T, L, D) prototype
-# ``mstep_inner_loop_master_TLD`` to multi-subject (S, T, L, D). Differences:
-#   * kappa_sum reduces over (S, T, L, D) (was (T, L, D)).
+# The single-subject (T, L, D) M-step extended to multi-subject
+# (S, T, L, D). Differences:
+#   * kappa_sum reduces over (S, T, L, D).
 #   * denominator: T * Σ_{s, n, l} s_lambda — global sum across S.
 #   * s_t_nu update: per (S, T, L) — adds an outer S loop.
 #   * Convergence flag: per (S, T) — flag_ST_acc[s, t] holds the
@@ -211,9 +211,8 @@ def _denom_global_compute(num_session_f64, s_lambda_SNL):
     (``~1/L``), stagnating the running sum well short of the true
     value; the biased denom feeds ``rbar = kappa_sum / denom`` and
     directly corrupts ``κ``. Mode A's same reduction in
-    ``arealmshbm/m_step/_kernels.py`` and the GPU port's
-    ``s_lambda.sum(dtype=cp.float64)`` already accumulate in fp64;
-    this is just bringing the CPU master into line with them.
+    ``arealmshbm/m_step/_kernels.py`` and the step-2 GPU backend's
+    ``mstate[3]`` denom also accumulate in fp64.
 
     Implicit promotion: ``acc = 0.0`` is fp64; ``acc += s_lambda[s, n, l]``
     promotes the fp32 operand to fp64 and accumulates in fp64.
@@ -312,7 +311,7 @@ def _mstep_inner_loop_master_step2(
     X_dot_sl_STLD,        # (S, T, L, D) fp32 C-contig
     sigma_psi_SLD,        # (S, L, D)    fp32 C-contig
     denom_f64,            # fp64 scalar — T * Σ s_lambda
-    dim_f64,              # fp64 scalar — vMF dim (= D)
+    dim_f64,              # fp64 scalar — vMF dim (= D - 1)
     kappa_init_f64,       # fp64 scalar
     ini_val_f64,          # fp64 scalar — lower clamp
     eps_f32,
@@ -489,8 +488,8 @@ def _spatial_connect_per_subject_numba(
         # MATLAB-literal: empty parcels (sum_lambda=0, u_update=0) yield
         # 0/0=NaN, which propagates through u_sq → vmf → log_connect →
         # softmax. The dead-column zero step then drops the all-NaN
-        # columns. Mirroring MATLAB's behavior here (rather than the
-        # earlier "inv=0 if sl==0" guard) is required for bit-for-bit
+        # columns. Mirroring MATLAB's behavior here (not an
+        # "inv=0 if sl==0" guard) is required for bit-for-bit
         # E-step output at empty-parcel cells.
         for l in prange(L):
             sl = scratch_sumlam_L[l]
@@ -534,7 +533,7 @@ def _spatial_connect_per_subject_numba(
 # ─────────────────────────────────────────────────────────────────────
 # Phase D — Per-subject fused E-step (NTD variant).
 #
-# BOLD lives in (S, N, T, D) layout; the per-(s, t) slice would be
+# BOLD lives in (N, T, D) layout per subject; the per-t slice would be
 # N-strided and numba's np.dot would fall through to a generic loop.
 # Instead, fold both ``t`` and ``d`` into a single contraction:
 #
@@ -550,9 +549,9 @@ def _spatial_connect_per_subject_numba(
 #   number of sessions where vertex n carries real BOLD.
 # Step 3: ``log_vmf[n, l] = κ · lv_sum[n, l] + count_alive[n] · cdln_val``.
 #
-# Equivalence to the original per-t per-alive kernel
-# ----------------------------------------------------
-# The original kernel fired the ``not alive`` branch on per-(t, n) rows
+# Equivalence to the per-t per-alive formulation
+# ----------------------------------------------
+# That formulation fires the ``not alive`` branch on per-(t, n) rows
 # where any ``lv[t, n, l] * κ == 0`` in fp32. For non-medial vertices
 # (BOLD row nonzero), ``lv`` is a sum of D=1175 nonzero products and is
 # never exactly zero in fp32 (statistically impossible). For medial
@@ -565,8 +564,8 @@ def _spatial_connect_per_subject_numba(
 @njit(cache=True, fastmath=False, boundscheck=False,
       error_model='numpy', parallel=True, inline='always')
 def _fused_estep_per_subject_NTD(
-    X_NTD,             # (N, T, D) fp32 C-contig  ← was (T, N, D)
-    s_t_nu_TLD,        # (T, L, D) fp32 C-contig — unchanged
+    X_NTD,             # (N, T, D) fp32 C-contig
+    s_t_nu_TLD,        # (T, L, D) fp32 C-contig
     kappa_scalar_f64,
     dim_int,
     theta_NL,          # (N, L) fp32 C-contig
@@ -669,10 +668,10 @@ def _fused_estep_per_subject_NTD(
         # medial vertices this is the normal case (lv_sum=0 because
         # BOLD row is zero; n_alive=0 → cdln_add=0). For non-medial
         # vertices a coincidence ``κ·lv_sum + n_alive·cdln_val == 0``
-        # in fp32 would also flip this row to True and zero it; at
-        # D=1175 with sums of D nonzero products this is vanishingly
-        # rare. If a future regression mysteriously zeros sparse rows,
-        # suspect this site first.
+        # would also flip this row to True and zero it; since
+        # ``|lv_sum| ≤ n_alive`` this cannot happen while
+        # ``κ < |Cdln(κ)|`` (crossover ≈ 2308 at dim = 1174). If a
+        # regression zeros sparse rows, suspect this site first.
         row_has_zero = False
         for l in range(L):
             if log_vmf_NL_buf[n, l] == zero_f32:
@@ -938,7 +937,7 @@ def em_iter_master_kernel_streaming(
     kappa_init_f64, ini_val_f64, beta_f64, eps_f32,
     max_iter_m, n_lh, L_lh,
 ):
-    """Streaming variant of :func:`em_iter_master_kernel`. Returns
+    """One outer EM iter, Phases A → E. Returns
     ``(m_iters_int, kappa_final_f64)``.
 
     Two outer subject loops are lifted to Python so each subject's
@@ -953,7 +952,7 @@ def em_iter_master_kernel_streaming(
     see :func:`_fused_estep_per_subject_NTD`.
 
     At fsa6/S=200/T=6/D=1175/D_grad=100 the per-iter peak scratch is:
-      * BOLD scratch  ~770 MB
+      * BOLD scratch  2.31 GB
       * grad scratch  ~200 MB (gMSHBM only)
     independent of S; ``s_lambda`` storage is 26 GB at S=200.
     """
@@ -974,7 +973,7 @@ def em_iter_master_kernel_streaming(
 
     # Phase B — Multi-subject M-step inner while-loop. Pure compute
     # over X_dot_sl_STLD / sigma_psi_SLD / s_t_nu_A/B_STLD — does NOT
-    # touch BOLD/grad/s_lambda. Unchanged.
+    # touch BOLD/grad (s_lambda only through the denom sum).
     _, m_iters, kappa_new = _mstep_inner_loop_master_step2(
         X_dot_sl_STLD,
         sigma_psi_SLD,

@@ -64,8 +64,7 @@ def profile_to_soft_init_kernel(profile: np.ndarray,
     Parameters
     ----------
     profile       : (N, T, D) fp32 C-contig — per-subject BOLD,
-                    **NTD layout** (matches the unified step-2 SNTD
-                    stack ``bold_SNTD[s]`` slice).
+                    **NTD layout** (one subject's loader scratch slot).
     g_mu_f32      : (D, L)   fp32 C-contig — group centroids
                     (cast from fp64 source by caller).
     boundary_mask : (N, L)   fp32 — bilateral block-diagonal radius mask,

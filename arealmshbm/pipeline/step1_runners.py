@@ -5,11 +5,11 @@ Step 1 produces four artifacts on disk via four subgraphs:
   1. ``generate_profiles`` — per-subject RSFC profile, written as bitpacked
      .b2nd to ``profiles_raw/sub<id>/...``.
   2. ``avg_profiles``      — across-cohort average, written as .npy to
-     ``profiles/avg_profile/{lh,rh}_..._avg_profile.npy``.
+     ``profiles/avg_profile/{lh,rh}_avg_profile.npy``.
   3. ``ini_params``        — initialization prior, written to
      ``group/group.mat``.
   4. ``radius_mask``       — spatial mask, written to
-     ``spatial_mask/spatial_mask_<mesh>.mat``.
+     ``spatial_mask/spatial_mask.mat``.
 
 Each runner returns the artifact (in-memory where reasonable, plus the
 written path) so the caller can thread data through memory between
@@ -19,8 +19,11 @@ the *cache*, not the bus.
 GPU path (``backend='gpu'``)
 ----------------------------
 On the GPU backend the four subgraphs are chained **in memory and on
-device**, and every disk write runs on a background thread that the
-caller joins at the end (:func:`join_step1_writers`):
+device**. The .b2nd, .npy and group.mat writes run on background
+threads; the caller joins them at the end (:func:`join_step1_writers`),
+except a multi-subject cohort's .b2nd writes, which
+``run_generate_profiles`` joins per subject. The spatial-mask write is
+synchronous:
 
     generate_profiles  → per-subject .b2nd (write in flight); every
                          session's packed slab is folded into the
@@ -30,10 +33,11 @@ caller joins at the end (:func:`join_step1_writers`):
                          (``lh_avg_dev`` / ``rh_avg_dev``; .npy write in flight)
     ini_params         ← device means (no host round trip; group.mat
                          write in flight)
-    radius_mask        ← unchanged (mesh geodesics, no cohort input)
+    radius_mask        ← group labels only (mesh geodesics, no cohort
+                         input; spatial_mask.mat written synchronously)
 
-The CPU backend keeps the disk-mediated flow (stage pipeline →
-.b2nd → avg reads it back), unchanged.
+The CPU backend runs the disk-mediated flow (stage pipeline →
+.b2nd → avg reads it back).
 
 Group-labels resolution is shared (``resolve_group_labels``) — both
 ``run_ini_params`` and ``run_radius_mask`` consume the same pair.
@@ -200,11 +204,11 @@ class PendingSubjectWrite(NamedTuple):
     handle: Any
 
 
-def make_avg_accumulator(*, targ_mesh: str, seed_mesh: str, num_sess: int):
+def make_avg_accumulator(*, num_sess: int):
     """The cohort's
     :class:`~arealmshbm.avg_profiles.avg_profiles_gpu.PackedProfileAccumulator`
     (GPU backend): ``(V_lh, D)`` / ``(V_rh, D)`` fp32 device sums sized
-    from the meshes -- ``D`` is the seed count the profile leaf packs
+    from the mesh -- ``D`` is the seed count the profile leaf packs
     along, from the same ``subject_seed_and_mw`` call the leaf makes --
     expecting ``num_sess`` sessions per subject. Hand it to
     ``run_generate_profiles(avg_accumulator=...)``, then to
@@ -216,7 +220,7 @@ def make_avg_accumulator(*, targ_mesh: str, seed_mesh: str, num_sess: int):
     from arealmshbm.generate_profiles.profiles_subject_gpu import (
         subject_seed_and_mw,
     )
-    seed_idx, _mw, n_lh, n_rh = subject_seed_and_mw(seed_mesh, targ_mesh)
+    seed_idx, _mw, n_lh, n_rh = subject_seed_and_mw()
     return PackedProfileAccumulator(n_lh, n_rh, int(seed_idx.size),
                                     int(num_sess))
 
@@ -226,11 +230,7 @@ def run_generate_profiles(
     project_dir: Path,
     subjects: Sequence[str],
     sessions: Sequence[str],
-    seed_mesh: str,
-    targ_mesh: str,
     threshold: float = 0.1,
-    split_flag: str = "0",
-    profile_dtype_reduce=np.float32,
     backend: str = "cpu",
     verbose: bool = True,
     progress: Optional["ProgressEmitter"] = None,
@@ -245,7 +245,8 @@ def run_generate_profiles(
     ``backend='gpu'`` runs the fused whole-subject leaf
     (:func:`~arealmshbm.generate_profiles.profiles_subject_gpu.generate_subject_profiles_gpu`:
     batched nvCOMP ingest → one zscore / sgemm / exact-select / pack
-    per session → one D2H → background .b2nd write); there is nothing
+    per session → per-session D2H → .b2nd streamed out on a background
+    thread); there is nothing
     for this runner to route. Two optional hooks chain the next
     subgraphs in memory instead of re-reading the .b2nd:
 
@@ -277,8 +278,7 @@ def run_generate_profiles(
         sub_id = str(sub)
         if sub_id not in sess_per_sub:
             sess_per_sub[sub_id] = 0
-            out_paths[sub_id] = profile_path(
-                project_dir, sub_id, targ_mesh, seed_mesh)
+            out_paths[sub_id] = profile_path(project_dir, sub_id)
         sess_per_sub[sub_id] = sum(
             1 for s in schedule if s[0] == sub_id)
 
@@ -291,21 +291,10 @@ def run_generate_profiles(
         )
 
     if backend == "gpu":
-        # The fused leaf reduces in fp32 throughout (its zscore, sgemm
-        # and select kernels are fp32). Anything else must fail loudly
-        # rather than be silently ignored.
-        if np.dtype(profile_dtype_reduce) != np.float32:
-            raise ValueError(
-                f"run_generate_profiles: backend='gpu' computes in float32; "
-                f"profile_dtype_reduce={np.dtype(profile_dtype_reduce)} is "
-                f"not supported. Use backend='cpu' for another reduction "
-                f"dtype."
-            )
         return _run_generate_profiles_gpu_fused(
             project_dir=project_dir, subjects=subjects, sessions=sessions,
             bold_paths=bold_paths, out_paths=out_paths,
-            seed_mesh=seed_mesh, targ_mesh=targ_mesh,
-            threshold=threshold, split_flag=split_flag,
+            threshold=threshold,
             verbose=verbose, progress=progress,
             on_packed=(avg_accumulator.add if avg_accumulator is not None
                        else None),
@@ -320,13 +309,6 @@ def run_generate_profiles(
     # → ASSEM (1 thread; submits writes to WRITE pool). Sliding
     # lookahead = 8 sessions; queue maxsize=2 caps each inter-stage
     # buffer.
-    leaf_kwargs = {
-        "seed_mesh": seed_mesh,
-        "targ_mesh": targ_mesh,
-        "split_flag": split_flag,
-        "threshold": threshold,
-        "profile_dtype_reduce": profile_dtype_reduce,
-    }
     # The prefetcher decodes on the CPU (isal_zlib + 8 workers, the
     # saturation plateau for GIFTI gzip decode on the YS reference).
     with Step1BoldPrefetcher(n_workers=8) as prefetcher:
@@ -336,7 +318,7 @@ def run_generate_profiles(
             bold_paths=bold_paths,
             sess_per_sub=sess_per_sub,
             out_paths=out_paths,
-            leaf_kwargs=leaf_kwargs,
+            threshold=threshold,
             prefetcher=prefetcher,
             lookahead=8,
             write_workers=1,
@@ -364,10 +346,7 @@ def _run_generate_profiles_gpu_fused(
     sessions: Sequence[str],
     bold_paths: Dict[Tuple[str, str], Tuple[List[str], List[str]]],
     out_paths: Dict[str, Path],
-    seed_mesh: str,
-    targ_mesh: str,
     threshold: float,
-    split_flag: str,
     verbose: bool,
     progress: Optional["ProgressEmitter"],
     on_packed,
@@ -401,8 +380,7 @@ def _run_generate_profiles_gpu_fused(
                 project_dir, sub_id, sess_ids,
                 bold_paths={s: bold_paths[(sub_id, s)] for s in sess_ids},
                 out_path=out_paths[sub_id],
-                seed_mesh=seed_mesh, targ_mesh=targ_mesh,
-                threshold=threshold, split_flag=split_flag,
+                threshold=threshold,
                 on_packed=on_packed,
             )
             if defer_join:
@@ -479,8 +457,6 @@ def run_avg_profiles(
     project_dir: Path,
     num_sub: int,
     num_sess: int,
-    seed_mesh: str,
-    targ_mesh: str,
     backend: str = "cpu",
     verbose: bool = True,
     accumulator=None,
@@ -523,12 +499,10 @@ def run_avg_profiles(
             avg_profiles_from_accumulator,
         )
         return avg_profiles_from_accumulator(
-            accumulator, targ_mesh, seed_mesh, str(project_dir), save=True,
+            accumulator, str(project_dir), save=True,
         )
     from arealmshbm.avg_profiles import avg_profiles
     return avg_profiles(
-        seed_mesh=seed_mesh,
-        targ_mesh=targ_mesh,
         out_dir=str(project_dir),
         num_sub=num_sub,
         num_sess=num_sess,
@@ -553,12 +527,8 @@ class IniParamsRun(NamedTuple):
 def run_ini_params(
     *,
     project_dir: Path,
-    seed_mesh: str,
-    targ_mesh: str,
     lh_labels: np.ndarray,
     rh_labels: np.ndarray,
-    profile_dtype=np.float64,
-    reduction_dtype=np.float64,
     backend: str = "cpu",
     precomputed_lh_avg: Optional[np.ndarray] = None,
     precomputed_rh_avg: Optional[np.ndarray] = None,
@@ -594,13 +564,9 @@ def run_ini_params(
     # zlib cost just moves to the writer thread.
     kwargs["save_async"] = bool(save_async)
     out = generate_ini_params(
-        seed_mesh=seed_mesh,
-        targ_mesh=targ_mesh,
         lh_labels=lh_labels,
         rh_labels=rh_labels,
         out_dir=str(project_dir),
-        profile_dtype=profile_dtype,
-        reduction_dtype=reduction_dtype,
         save=True,
         backend=backend,
         **kwargs,
@@ -618,7 +584,6 @@ def run_ini_params(
 def run_radius_mask(
     *,
     project_dir: Path,
-    targ_mesh: str,
     lh_labels: np.ndarray,
     rh_labels: np.ndarray,
     radius_mm: float = 30.0,
@@ -640,7 +605,6 @@ def run_radius_mask(
     result = generate_radius_mask(
         lh_labels=lh_labels,
         rh_labels=rh_labels,
-        mesh=targ_mesh,
         radius=radius_mm,
         out_dir=str(project_dir),
         verbose=verbose,
@@ -655,7 +619,6 @@ def run_radius_mask(
 # ─────────────────────────────────────────────────────────────────────
 def resolve_group_labels(
     *,
-    targ_mesh: str,
     schaefer_resolution: Optional[str] = None,
     lh_labels_path: Optional[Path] = None,
     rh_labels_path: Optional[Path] = None,
@@ -671,14 +634,13 @@ def resolve_group_labels(
     """
     if schaefer_resolution is not None:
         from arealmshbm.data_io.annot_io import read_annot_labels
-        from arealmshbm.data_io.load_avg_mesh import _atlas_dir
+        from arealmshbm.data_io.load_avg_mesh import atlas_label_dir
 
-        base = atlas_dir if atlas_dir is not None else _atlas_dir()
         stem = (
             f"Schaefer2018_{schaefer_resolution}Parcels_"
             f"Kong2022_17Networks_order.annot"
         )
-        annot_dir = Path(base) / targ_mesh / "label"
+        annot_dir = atlas_label_dir(atlas_dir)
         lh_p = annot_dir / f"lh.{stem}"
         rh_p = annot_dir / f"rh.{stem}"
         if not (lh_p.exists() and rh_p.exists()):

@@ -23,13 +23,12 @@ offers the same two values.
 | value | what it is | numerical status |
 |---|---|---|
 | `'cpu'` | numba master + host outer-EM leaves | **the reference** |
-| `'gpu'` | P-layout / bit-packed CuPy backend (`Step2SparseSession`) | CPU semantics on device; contract in [`step2_sparse_design.md`](step2_sparse_design.md). Requires `seed_mesh='fsaverage3'` (⌈D/8⌉ ≤ 256), `num_clusters ≤ 512`, `n_grad_components ≤ 11772` |
+| `'gpu'` | P-layout / bit-packed CuPy backend (`Step2SparseSession`) | CPU semantics on device; contract in [`step2_sparse_design.md`](step2_sparse_design.md). Requires `num_clusters ≤ 512`, `n_grad_components ≤ 11772` |
 
-### `Params_Final.mat` format — unchanged, on every backend
+### `Params_Final.mat` format — the same on every backend
 
 `Step2Pipeline._save_params` calls `_save.save_params_final` on both
-backends, so the file keeps the contract it has
-always had: `theta` a dense fp64 `(N, L)` block, container
+backends, so the file has one contract: `theta` a dense fp64 `(N, L)` block, container
 `do_compression=True`, byte-identical to `scipy.io.savemat` of the
 transposed-mu fp64 dict
 (`test_save.py::test_dense_branch_matches_the_reference_saver` compares
@@ -137,7 +136,9 @@ Wall numbers: [`## Wall`](#wall) below.
 (default) picks `'eager_bitpacked'` when packed cache + gradient +
 `(S, T, L, D)` fp32 `s_t_nu` / `X_dot_sl` + `(S, P)` `s_lambda` + the
 iteration-1 scratch + the margin fit in free device memory, otherwise
-`'stream'`; an explicit `'eager_bitpacked'` that does not fit raises.
+`'stream'` with a `RuntimeWarning`; an explicit `'eager_bitpacked'` that
+does not fit raises, and every mode raises when the state without the
+packed cache does not fit.
 `'eager_bitpacked'` fills the device cache straight from the loader's
 per-subject reader through a 2-slot page-locked ring (outside cupy's
 pinned pool) that is released afterwards — no host memory of the
@@ -165,14 +166,14 @@ Step2Pipeline.run(cfg)                                                [arealmshb
 │   │   (gMSHBM only; sniffs .npy / .mat by suffix)
 │   ├── load_group_mtc(group.mat)                                     step2_io/load_group_mtc
 │   ├── load_spatial_mask                                             data_io/load_spatial_mask
-│   ├── build_step2_boundary_mask(mode)                               step2_init/boundary_mask
+│   └── build_step2_boundary_mask(mode)                               step2_init/boundary_mask
+│
+├── initialize_params()                                               inline + initialize_concentration
+│   ├── initialize_concentration(D)                                   initialize_concentration
 │   └── compose_init_state(bold_loader)                               step2_init/compose_init_state
 │       (stock init: per-sub soft masked posterior under the group
 │        centroids + theta_num theta, (S, N, L) fp32 s_lambda;
 │        streams one subject's BOLD at a time)
-│
-├── initialize_params()                                               inline + initialize_concentration
-│   └── initialize_concentration(D)                                   initialize_concentration
 │
 ├── outer EM loop (≤ max_iter_inter, default 10)
 │   ├── reset sigma + s_psi                                           inline
@@ -253,10 +254,10 @@ Indentation in the **Component** column mirrors call depth (`├` / `│`
 |  8 | `│  ├ SubjectGradientLoader` (cohort.subjects[].gradient_*) | leaf | [step2_io/subject_loaders.py](../arealmshbm/step2_io/subject_loaders.py) | S (streamed, gMSHBM) |
 |  9 | `│  ├ load_group_mtc` | leaf | [step2_io/load_group_mtc.py](../arealmshbm/step2_io/load_group_mtc.py) | 1 |
 | 10 | `│  ├ load_spatial_mask` | leaf | [data_io/load_spatial_mask.py](../arealmshbm/data_io/load_spatial_mask.py) | 1 |
-| 11 | `│  ├ build_step2_boundary_mask` | leaf | [step2_init/boundary_mask.py](../arealmshbm/step2_init/boundary_mask.py) | 1 |
-| 12 | `│  └ compose_init_state` (stock init: per-sub soft masked posterior + theta_num theta) | leaf | [step2_init/compose_init_state.py](../arealmshbm/step2_init/compose_init_state.py) | 1 |
+| 11 | `│  └ build_step2_boundary_mask` | leaf | [step2_init/boundary_mask.py](../arealmshbm/step2_init/boundary_mask.py) | 1 |
 | 14 | `├ initialize_params` | phase | pipeline.py | 1 |
-| 15 | `│  └ initialize_concentration` | leaf | [initialize_concentration/](../arealmshbm/initialize_concentration/) | 1 |
+| 15 | `│  ├ initialize_concentration` | leaf | [initialize_concentration/](../arealmshbm/initialize_concentration/) | 1 |
+| 12 | `│  └ compose_init_state` (stock init: per-sub soft masked posterior + theta_num theta) | leaf | [step2_init/compose_init_state.py](../arealmshbm/step2_init/compose_init_state.py) | 1 |
 | 16 | `├ outer-inter loop` (≤ I) | loop | pipeline.py | 1 |
 | 17 | `│  ├ reset σ + s_psi` | inline | pipeline.py | I |
 | 18 | `│  ├ intra-EM loop` (≤ J) | loop | pipeline.py | I |
@@ -276,7 +277,7 @@ Indentation in the **Component** column mirrors call depth (`├` / `│`
 | 32 | `│  │  │           │  └ Phase E.1 — per-sub normalize + fp32 cast | kernel | `_phase_e1_normalize_per_subject_kernel` (numba prange) | I·J·K·S |
 | 34 | `│  │  │           └ Phase E.2 — theta = mean over S | kernel | `_phase_e2_theta_only_kernel` (numba prange) | I·J·K |
 | 43 | `│  │  ├ ⟨B⟩ intra_subject_var_loop` | leaf | [step2_em_outer/intra_subject_var_loop.py](../arealmshbm/step2_em_outer/intra_subject_var_loop.py) | I·J |
-| 44 | `│  │  │  └ intra_subject_var` (step-3 reuse) | kernel | [intra_em/intra_subject_var.py](../arealmshbm/intra_em/intra_subject_var.py) | I·J·~5–20 (inner while-loop) |
+| 44 | `│  │  │  └ _intra_subject_var_loop_kernel` | kernel | [step2_em_outer/_kernels.py](../arealmshbm/step2_em_outer/_kernels.py) | I·J·~5–20 (inner while-loop) |
 | 45 | `│  │  ├ ⟨C⟩ intra_em_cost_step2` | leaf | [step2_em_outer/intra_em_cost.py](../arealmshbm/step2_em_outer/intra_em_cost.py) | I·J |
 | 46 | `│  │  └ intra-EM convergence test` | inline | pipeline.py | I·J |
 | 47 | `│  ├ ⟨D⟩ inter_subject_var` | leaf | [step2_em_outer/inter_subject_var.py](../arealmshbm/step2_em_outer/inter_subject_var.py) | I |
@@ -319,8 +320,8 @@ arealmshbm/
 │   │                                       _fused_estep_per_subject_NTD,
 │   │                                       _phase_e1_normalize_per_subject_kernel,
 │   │                                       _phase_e2_theta_only_kernel,
-│   │                                       invad_numba,
 │   │                                       em_iter_master_kernel_streaming
+│   │                                       (invad_numba imported from m_step/_invad)
 │   │                                       (single fixed precision profile)
 │   ├── session.py                         Step2EmIterSession — scratch +
 │   │                                      loader handles + boundary staging
@@ -333,7 +334,8 @@ arealmshbm/
 │
 ├── step2_io/                              # data I/O leaves
 │   ├── load_group_mtc.py                  group.mat (mtc / epsil / labels)
-│   ├── load_subject_profiles.py           per-subject (N, D, T) BOLD profiles
+│   ├── subject_loaders.py                 SubjectProfileLoader / SubjectGradientLoader ('cpu')
+│   ├── load_subject_profiles.py           bit-packed widen + demean + L2-norm kernel
 │   ├── sparse_layout.py                   Step2Layout — CSR/CSC over P ('gpu')
 │   └── sparse_inputs.py                   Step2SparseInputs + its loader ('gpu')
 │
@@ -344,6 +346,7 @@ arealmshbm/
 │                                          masked posterior + theta_num theta
 │
 └── step2_em_outer/                        # outer-EM closed-form leaves
+    ├── _kernels.py                        numba kernels of L16-L18 + the resets
     ├── intra_subject_var_loop.py          L17 — s_psi + sigma while-loop
     ├── inter_subject_var.py               L18 — mu + epsil closed form
     └── intra_em_cost.py                   L16 — intra-EM convergence cost
@@ -469,8 +472,8 @@ variants runs through an internal profiling harness not shipped here.
 
 The fp32 / fp64 boundary at the softmax seam is implemented inside
 [`arealmshbm/step2_em_iter_master/_kernels.py`](../arealmshbm/step2_em_iter_master/_kernels.py)
-in `_fused_estep_per_subject_NTD` — the kernel reads the fp32
-``log_vmf_NL`` accumulator and immediately promotes to fp64 via
+in `_fused_estep_per_subject_NTD` — the kernel composes `log_lambda`
+in fp32 and promotes to fp64 only at the `exp()` via
 ``np.float64(...)`` (note: numba's ``float(fp32)`` is a no-op
 type-preserving cast; the explicit ``np.float64`` is necessary for
 the fp32→fp64 promotion to actually occur).
@@ -485,7 +488,7 @@ the fp32→fp64 promotion to actually occur).
 | `data_io/load_avg_mesh.py` | mesh | MARS_label |
 | `data_io/load_spatial_mask.py` | boundary_mask build | already returns Tuple |
 | `pipeline_setup/build_boundary_mask` (step 3's) | could be used by L9 | step 2 reimplemented L9 for clarity; the block-diag is identical on bilateral meshes |
-| `intra_em/intra_subject_var.py` (step 3's) | L17 | step 2 wraps the same s_psi closed-form in a multi-subject + sigma while-loop |
+| `intra_em/intra_subject_var.py` (step 3's) | — (not imported) | L17 implements the same s_psi closed form in its own multi-subject + sigma kernel (`step2_em_outer/_kernels.py`) |
 
 ## Open items
 

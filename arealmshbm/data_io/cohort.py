@@ -1,9 +1,13 @@
-"""cohort.py — single source of truth for cohort roster + artifact paths.
+"""cohort.py — single source of truth for cohort roster + per-subject
+artifact paths.
 
 A ``project_dir`` hosting a step1 output carries a single
 ``cohort.json`` at its root. The file lists the cohort roster
-(subjects, sessions, mesh config) and points at every artifact step1
-wrote. Step2 and step3 use it as the sole discovery mechanism.
+(subjects, sessions) and points at each subject's profile and gradient
+files; step2 and step3 find both through it. The cohort-level artifacts
+sit at fixed project-relative paths (``group/group.mat``,
+``spatial_mask/spatial_mask.mat``,
+``profiles/avg_profile/{lh,rh}_avg_profile.npy``) and are not listed.
 
 Concurrency: the writer is single-writer-safe (atomic os.replace),
 but the manifest itself has no file lock. Two concurrent driver runs
@@ -20,8 +24,7 @@ Schema v1
       "schema_version": 1,
       "created_by": "arealmshbm.step1_pipeline",
       "created_at": "<ISO 8601 UTC>",
-      "run_id": "<sha256 of (sorted subjects, sorted sessions, mesh, n_grad)>",
-      "mesh": {"targ": "fsaverage6", "seed": "fsaverage3"},
+      "run_id": "<sha256 of (sorted subjects, sorted sessions, n_grad)>",
       "n_grad_components": 100,
       "subjects": [
         {
@@ -32,11 +35,7 @@ Schema v1
           "gradient_rh":   "<path>" | null
         },
         ...
-      ],
-      "group_mat":          "<path>" | null,
-      "spatial_mask_mat":   "<path>" | null,
-      "avg_profile_lh_npy": "<path>" | null,
-      "avg_profile_rh_npy": "<path>" | null
+      ]
     }
 
 Path conventions
@@ -52,15 +51,15 @@ Merge semantics
 ---------------
 
 ``write_cohort_partial`` reads an existing ``cohort.json`` (if any),
-merges per-field with the new partial manifest, and writes the result.
-Fields set to ``None`` in the partial do NOT overwrite existing
-non-None values — this lets users run step1 incrementally (e.g.
-generate_profiles in one invocation, avg_profiles in another) without
-losing the artifact-path entries from prior runs.
+merges it with the new partial manifest, and writes the result.
 
 Subjects list is replaced on every write (the cohort roster is a
-property of the current step1 invocation), but per-subject artifact
-fields go through the same partial-merge rule keyed on subject id.
+property of the current step1 invocation). While the roster is
+unchanged (same ``run_id``), a per-subject artifact field set to
+``None`` in the partial does NOT overwrite an existing non-None value
+for the same subject id — a write that knows only some of a subject's
+artifacts keeps the entries for the others. A write under a different
+``run_id`` carries nothing over: every path comes from the partial.
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """
@@ -108,23 +107,18 @@ class CohortSubject:
 class CohortManifest:
     """In-memory mirror of ``cohort.json``.
 
-    ``mesh`` is a 2-key dict ``{"targ": ..., "seed": ...}``. ``run_id``
+    ``run_id``
     is a sha256-derived string identifying the cohort definition
-    (subjects + sessions + mesh + n_grad) — does NOT include artifact
+    (subjects + sessions + n_grad) — does NOT include artifact
     paths, so the same logical cohort regenerated on a different disk
     yields the same run_id.
     """
     subjects: List[CohortSubject]
-    mesh: Dict[str, str]
     n_grad_components: int
     run_id: str
     schema_version: int = SCHEMA_VERSION
     created_by: str = DEFAULT_CREATED_BY
     created_at: str = field(default_factory=lambda: _utc_now_iso())
-    group_mat: Optional[str] = None
-    spatial_mask_mat: Optional[str] = None
-    avg_profile_lh_npy: Optional[str] = None
-    avg_profile_rh_npy: Optional[str] = None
 
     # ── convenience ──
     @property
@@ -174,8 +168,6 @@ def cohort_json_path(project_dir: str | Path) -> Path:
 def compute_run_id(
     subjects: Sequence[str | int],
     sessions: Sequence[str | int],
-    targ_mesh: str,
-    seed_mesh: str,
     n_grad_components: int,
 ) -> str:
     """SHA-256 of the canonical cohort definition.
@@ -195,8 +187,6 @@ def compute_run_id(
     payload = {
         "subjects": sorted(str(s) for s in subjects),
         "sessions": sorted(str(s) for s in sessions),
-        "targ": targ_mesh,
-        "seed": seed_mesh,
         "n_grad_components": int(n_grad_components),
     }
     blob = json.dumps(payload, sort_keys=True, separators=(",", ":"))
@@ -306,29 +296,22 @@ def write_cohort_partial(
     project_dir: str | Path,
     *,
     subjects: Sequence[CohortSubject],
-    mesh: Dict[str, str],
     n_grad_components: int,
     run_id: str,
-    group_mat: Optional[str] = None,
-    spatial_mask_mat: Optional[str] = None,
-    avg_profile_lh_npy: Optional[str] = None,
-    avg_profile_rh_npy: Optional[str] = None,
 ) -> CohortManifest:
     """Merge a partial cohort manifest into the existing one (if any).
 
     Merge rule:
-      * Roster fields (``subjects``, ``mesh``, ``n_grad_components``,
+      * Roster fields (``subjects``, ``n_grad_components``,
         ``run_id``) are always REPLACED with the new values. If the
         existing roster doesn't match, the previous artifacts referred
         to a different cohort and don't carry over.
-      * Top-level artifact fields (``group_mat``, ``spatial_mask_mat``,
-        ``avg_profile_*_npy``): kept from the existing manifest when
-        the partial passes ``None``; overwritten when the partial
-        passes a non-None value.
-      * Per-subject artifact fields (``profile_b2nd``, ``gradient_*``):
-        same partial-merge rule, keyed on subject id. If the existing
-        manifest has a subject not in the new roster, that subject's
-        entry is dropped entirely (it's no longer in the cohort).
+      * Per-subject artifact fields (``profile_b2nd``, ``gradient_*``),
+        keyed on subject id: kept from the existing manifest when the
+        partial passes ``None``; overwritten when the partial passes a
+        non-None value. If the existing manifest has a subject not in
+        the new roster, that subject's entry is dropped entirely (it's
+        no longer in the cohort).
 
     The roster-mismatch case (existing cohort differs from new) drops
     all carry-over artifacts so we don't end up with stale paths from
@@ -386,25 +369,10 @@ def write_cohort_partial(
     else:
         merged_subjects = [_copy_subject(s) for s in subjects]
 
-    # Top-level merge — only carry over when roster matches.
-    def _carry(new_val: Optional[str], old_val: Optional[str]) -> Optional[str]:
-        if new_val is not None:
-            return new_val
-        return old_val if roster_match else None
-
     merged = CohortManifest(
         subjects=merged_subjects,
-        mesh=dict(mesh),
         n_grad_components=int(n_grad_components),
         run_id=run_id,
-        group_mat=_carry(group_mat,
-                          existing.group_mat if existing else None),
-        spatial_mask_mat=_carry(spatial_mask_mat,
-                                 existing.spatial_mask_mat if existing else None),
-        avg_profile_lh_npy=_carry(avg_profile_lh_npy,
-                                    existing.avg_profile_lh_npy if existing else None),
-        avg_profile_rh_npy=_carry(avg_profile_rh_npy,
-                                    existing.avg_profile_rh_npy if existing else None),
     )
     write_cohort(project_dir, merged)
     return merged
@@ -419,13 +387,8 @@ def _to_dict(m: CohortManifest) -> Dict[str, Any]:
         "created_by": m.created_by,
         "created_at": m.created_at,
         "run_id": m.run_id,
-        "mesh": dict(m.mesh),
         "n_grad_components": int(m.n_grad_components),
         "subjects": [asdict(s) for s in m.subjects],
-        "group_mat": m.group_mat,
-        "spatial_mask_mat": m.spatial_mask_mat,
-        "avg_profile_lh_npy": m.avg_profile_lh_npy,
-        "avg_profile_rh_npy": m.avg_profile_rh_npy,
     }
 
 
@@ -437,9 +400,6 @@ def _from_dict(data: Dict[str, Any], *, source: str) -> CohortManifest:
             f"this reader only supports v{SCHEMA_VERSION}"
         )
     try:
-        mesh = data["mesh"]
-        if not isinstance(mesh, dict) or "targ" not in mesh or "seed" not in mesh:
-            raise ValueError("missing 'mesh.targ' or 'mesh.seed'")
         subjects_raw = data["subjects"]
         if not isinstance(subjects_raw, list):
             raise ValueError("'subjects' must be a list")
@@ -459,13 +419,8 @@ def _from_dict(data: Dict[str, Any], *, source: str) -> CohortManifest:
             created_by=str(data.get("created_by", DEFAULT_CREATED_BY)),
             created_at=str(data.get("created_at", _utc_now_iso())),
             run_id=str(data["run_id"]),
-            mesh={"targ": str(mesh["targ"]), "seed": str(mesh["seed"])},
             n_grad_components=int(data["n_grad_components"]),
             subjects=subjects,
-            group_mat=data.get("group_mat"),
-            spatial_mask_mat=data.get("spatial_mask_mat"),
-            avg_profile_lh_npy=data.get("avg_profile_lh_npy"),
-            avg_profile_rh_npy=data.get("avg_profile_rh_npy"),
         )
     except (KeyError, ValueError, TypeError) as e:
         raise ValueError(
@@ -491,8 +446,6 @@ def backfill_cohort_json(
     *,
     subjects: Sequence[str | int],
     sessions: Sequence[str | int],
-    targ_mesh: str,
-    seed_mesh: str,
     n_grad_components: int = 100,
 ) -> CohortManifest:
     """One-shot migration: build ``cohort.json`` from an existing
@@ -500,12 +453,9 @@ def backfill_cohort_json(
 
     Probes canonical paths to populate artifact fields:
 
-    * ``profile_b2nd`` ← ``profiles_raw/sub<S>/sub<S>_<targ>_roi<seed>.profile.b2nd``
+    * ``profile_b2nd`` ← ``profiles_raw/sub<S>/sub<S>.profile.b2nd``
     * ``gradient_lh`` / ``gradient_rh`` ← ``gradients/sub<S>/{lh,rh}_emb_<N>_distance_matrix.{npy,mat}``
       (prefer .npy; fall back to .mat if only .mat is present)
-    * ``group_mat`` ← ``group/group.mat``
-    * ``spatial_mask_mat`` ← ``spatial_mask/spatial_mask_<targ>.mat``
-    * ``avg_profile_*_npy`` ← ``profiles/avg_profile/{lh,rh}_<targ>_roi<seed>_avg_profile.npy``
 
     Fields whose probe target doesn't exist are left as ``None``.
     Writes the resulting manifest and returns it.
@@ -524,8 +474,7 @@ def backfill_cohort_json(
 
     cohort_subjects: List[CohortSubject] = []
     for sid in sub_ids:
-        b2nd = (pd / "profiles_raw" / f"sub{sid}" /
-                f"sub{sid}_{targ_mesh}_roi{seed_mesh}.profile.b2nd")
+        b2nd = pd / "profiles_raw" / f"sub{sid}" / f"sub{sid}.profile.b2nd"
         sub_dir = pd / "gradients" / f"sub{sid}"
         lh_npy = sub_dir / f"lh_emb_{nc}_distance_matrix.npy"
         lh_mat = sub_dir / f"lh_emb_{nc}_distance_matrix.mat"
@@ -541,22 +490,10 @@ def backfill_cohort_json(
             gradient_rh=relpath_or_abs(pd, rh_grad) if rh_grad else None,
         ))
 
-    group_mat = _opt(pd / "group" / "group.mat")
-    spatial_mask_mat = _opt(pd / "spatial_mask" / f"spatial_mask_{targ_mesh}.mat")
-    avg_lh = _opt(pd / "profiles" / "avg_profile" /
-                   f"lh_{targ_mesh}_roi{seed_mesh}_avg_profile.npy")
-    avg_rh = _opt(pd / "profiles" / "avg_profile" /
-                   f"rh_{targ_mesh}_roi{seed_mesh}_avg_profile.npy")
-
-    run_id = compute_run_id(sub_ids, sess_ids, targ_mesh, seed_mesh, nc)
+    run_id = compute_run_id(sub_ids, sess_ids, nc)
     return write_cohort_partial(
         pd,
         subjects=cohort_subjects,
-        mesh={"targ": targ_mesh, "seed": seed_mesh},
         n_grad_components=nc,
         run_id=run_id,
-        group_mat=group_mat,
-        spatial_mask_mat=spatial_mask_mat,
-        avg_profile_lh_npy=avg_lh,
-        avg_profile_rh_npy=avg_rh,
     )

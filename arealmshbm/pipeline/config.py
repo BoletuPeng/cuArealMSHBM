@@ -23,7 +23,8 @@ Each mode requires a specific subset of step blocks (matching
 Including a block the mode doesn't run (a ``step2`` block in a Mode A
 config) raises an error that says to remove it. Omitting a required
 block raises with a "missing required block" message that names both
-the block and the mode.
+the block and the mode. ``backend_step2`` follows the ``step2`` block:
+required in Mode B, rejected in Mode A.
 
 Mode A reads the group prior from ``<project>/priors/<variant>/
 beta<beta_scalar>/Params_Final.mat`` (dMSHBM:
@@ -45,10 +46,10 @@ The parser enforces four safety invariants:
      each step block both raise with ``pipeline_config.json: missing
      required key '<block>.<key>'`` (or the bare key for top-level).
 
-  2. **Unknown-key rejection** — a typo like ``"smooth_simga"`` raises
+  2. **Unknown-key rejection** — a typo like ``"watershed_farc"`` raises
      instead of being silently dropped. Applied at both the top level
-     (mode-aware: Mode A configs can't include a step2 block) and
-     inside every step block.
+     (mode-aware: Mode A configs can't include a step2 block or
+     ``backend_step2``) and inside every step block.
 
   3. **Strict bool/int/float type guards** — JSON ``true`` does NOT
      coerce to ``1`` in a numeric field; a stringified ``"false"``
@@ -80,11 +81,7 @@ _VALID_VARIANTS = ("gMSHBM", "cMSHBM", "dMSHBM")
 _VALID_BACKENDS = ("cpu", "gpu")
 _VALID_NUM_CLUSTERS = (100, 200, 300, 400, 500, 600, 700, 800, 900, 1000)
 _VALID_EMB_FORMATS = ("npy", "mat", "both")
-_VALID_DTYPES = ("float32", "float64")
 _VALID_BOLD_CACHE_MODES = ("auto", "eager_bitpacked", "stream")
-# Enum-of-one until the ``split_flag != "0"`` path lands in
-# ``generate_profiles/profiles.py`` (currently raises NotImplementedError).
-_VALID_SPLIT_FLAGS = ("0",)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -102,26 +99,17 @@ _VALID_SPLIT_FLAGS = ("0",)
 # ─────────────────────────────────────────────────────────────────────
 @dataclass(frozen=True)
 class Step0Knobs:
-    """Step 0 internal knobs (mirror Step0Config algorithm fields).
-
-    ``enable_tf32`` is the step-scoped cuBLAS TF32 toggle.
-    Only ``fc_similarity`` dispatches through cuBLAS sgemm inside step0
-    — other GPU leaves are unaffected. Has effect only when
-    ``backend_step0 == 'gpu'``.
-    """
+    """Step 0 internal knobs (mirror Step0Config algorithm fields)."""
     sub_FC: int
     sub_verts: int
     block_a: int
     block_b: int
-    smooth_sigma: float
-    K_hop: int
     watershed_steps: int
     watershed_frac: float
     downsample: float
     emb_output_format: Literal["npy", "mat", "both"]
     save_geodesic_distance: bool
     save_edge_density: bool
-    enable_tf32: bool
     # NB: Literal-typed fields are runtime-checked by ``_enum_in`` at
     # parse time (not by dataclass machinery). Constructing
     # ``Step0Knobs(emb_output_format="invalid", ...)`` directly bypasses
@@ -131,18 +119,12 @@ class Step0Knobs:
 
 @dataclass(frozen=True)
 class Step1Knobs:
-    """Step 1 leaf-default knobs (mirror step1_runners.* kwargs).
+    """Step 1 knobs (mirror step1_runners.* kwargs).
 
-    Inclusion criterion: precision / iteration / radius knobs the user
-    is plausibly tuning between runs. The kernel-internal precision
-    dtype ``run_generate_profiles.profile_dtype_reduce`` (pinned at fp32
-    by validated CBIG convention) is intentionally NOT exposed — the
-    runner's positional default stays authoritative for it.
+    Precision is not a knob: the profile leaf computes in fp32 and
+    ``ini_params`` reduces the fp32 average in fp64, on both backends.
     """
     threshold: float
-    split_flag: Literal["0"]
-    profile_dtype: Literal["float32", "float64"]
-    reduction_dtype: Literal["float32", "float64"]
     radius_mask_radius_mm: float
 
 
@@ -173,9 +155,9 @@ class Step3Knobs:
     dMSHBM (which doesn't read it). Step3Config's ``__post_init__``
     resolves ``None`` to the variant default; the unified-driver path
     reaches that branch ONLY when the project creator wrote ``null``
-    explicitly (the in-tree sample projects are all gMSHBM and ship an
-    explicit 15.0). Per-step API calls that leave ``connect_th`` unset
-    take that branch too.
+    explicitly (the in-tree sample projects are gMSHBM and ship 15.0,
+    so the resolution branch is exercised only by configs that write
+    ``null`` and by per-step API tests).
     """
     connect_th: Optional[float]
     epsilon: float
@@ -190,11 +172,10 @@ class Step3Knobs:
 # ─────────────────────────────────────────────────────────────────────
 # Top-level PipelineConfig
 #
-# Every field is required — no Knobs default_factory, no enable_tf32
-# default. step2 is Optional[Step2Knobs] only because Mode A doesn't
-# run step2; Mode A configs MUST NOT include a step2 block, and the
-# parser sets this to ``None`` in that case. Mode B configs MUST
-# include step2; the parser sets a non-None Step2Knobs there.
+# Every field is required — no Knobs default_factory. ``step2`` and
+# ``backend_step2`` are Optional only because Mode A doesn't run step2:
+# Mode A configs MUST NOT include either, and the parser sets both to
+# ``None``. Mode B configs MUST include both.
 # ─────────────────────────────────────────────────────────────────────
 @dataclass(frozen=True)
 class PipelineConfig:
@@ -208,13 +189,11 @@ class PipelineConfig:
     n_grad_components: int
     backend_step0: str
     backend_step1: str
-    backend_step2: str
+    backend_step2: Optional[str]
     backend_step3: str
     # Per-step internal knob bundles. Required by mode:
     #   Mode A — step0 + step1 + step3 (step2 is None)
     #   Mode B — step0 + step1 + step2 + step3 (all non-None)
-    # The cuBLAS TF32 toggle lives inside the step0 block
-    # (``step0.enable_tf32``).
     step0: Step0Knobs
     step1: Step1Knobs
     step2: Optional[Step2Knobs]
@@ -234,11 +213,12 @@ _STEP2_KEYS = frozenset(Step2Knobs.__dataclass_fields__.keys())
 _STEP3_KEYS = frozenset(Step3Knobs.__dataclass_fields__.keys())
 
 # Campaign-spanning top-level keys, present in every mode. step{N}
-# block names are added per mode via _MODE_REQUIRED_BLOCKS.
+# block names are added per mode via _MODE_REQUIRED_BLOCKS, and
+# ``backend_step2`` alongside the ``step2`` block.
 _TOP_LEVEL_BASE_KEYS = frozenset({
     "schema_version", "mode", "variant", "num_clusters", "beta_scalar",
     "w", "c", "n_grad_components",
-    "backend_step0", "backend_step1", "backend_step2", "backend_step3",
+    "backend_step0", "backend_step1", "backend_step3",
 })
 
 # Mode → required step blocks. Mirrors lib/hyperparameters/modes.json's
@@ -409,8 +389,6 @@ def _parse_step0(raw: Dict[str, Any]) -> Step0Knobs:
         sub_verts=_need_in(raw, "step0", "sub_verts", int),
         block_a=_need_in(raw, "step0", "block_a", int),
         block_b=_need_in(raw, "step0", "block_b", int),
-        smooth_sigma=_need_in(raw, "step0", "smooth_sigma", float),
-        K_hop=_need_in(raw, "step0", "K_hop", int),
         watershed_steps=_need_in(raw, "step0", "watershed_steps", int),
         watershed_frac=_need_in(raw, "step0", "watershed_frac", float),
         downsample=_need_in(raw, "step0", "downsample", float),
@@ -419,7 +397,6 @@ def _parse_step0(raw: Dict[str, Any]) -> Step0Knobs:
         save_geodesic_distance=_need_in(raw, "step0", "save_geodesic_distance",
                                         bool),
         save_edge_density=_need_in(raw, "step0", "save_edge_density", bool),
-        enable_tf32=_need_in(raw, "step0", "enable_tf32", bool),
     )
 
 
@@ -432,9 +409,6 @@ def _parse_step1(raw: Dict[str, Any]) -> Step1Knobs:
     _check_unknown_keys(raw, _STEP1_KEYS, "step1")
     return Step1Knobs(
         threshold=_need_in(raw, "step1", "threshold", float),
-        split_flag=_enum_in(raw, "step1", "split_flag", _VALID_SPLIT_FLAGS),
-        profile_dtype=_enum_in(raw, "step1", "profile_dtype", _VALID_DTYPES),
-        reduction_dtype=_enum_in(raw, "step1", "reduction_dtype", _VALID_DTYPES),
         radius_mask_radius_mm=_need_in(raw, "step1", "radius_mask_radius_mm",
                                        float),
     )
@@ -539,17 +513,15 @@ def _validate_step0(k: Step0Knobs) -> None:
     # Enum check on emb_output_format already fired at parse time via
     # ``_enum_in`` — this validator only handles range / positivity.
     for name in ("sub_FC", "sub_verts", "block_a", "block_b",
-                 "K_hop", "watershed_steps"):
+                 "watershed_steps"):
         if getattr(k, name) <= 0:
             raise ValueError(f"pipeline_config.json: step0.{name} must be positive")
-    for name in ("smooth_sigma", "watershed_frac", "downsample"):
+    for name in ("watershed_frac", "downsample"):
         if getattr(k, name) <= 0.0:
             raise ValueError(f"pipeline_config.json: step0.{name} must be positive")
 
 
 def _validate_step1(k: Step1Knobs) -> None:
-    # Enum checks (split_flag / profile_dtype / reduction_dtype) already
-    # fired at parse time via ``_enum_in``.
     if not (0.0 <= k.threshold <= 1.0):
         raise ValueError(
             f"pipeline_config.json: step1.threshold must be in [0, 1] (got {k.threshold})"
@@ -626,16 +598,20 @@ def read_pipeline_config(path: Path | str) -> PipelineConfig:
     # are part of the allowed top-level key set.
     mode = _enum(raw, "mode", _VALID_MODES)
     required_blocks = _MODE_REQUIRED_BLOCKS[mode]
+    runs_step2 = "step2" in required_blocks
     allowed_top_level = _TOP_LEVEL_BASE_KEYS | required_blocks
+    if runs_step2:
+        allowed_top_level |= {"backend_step2"}
     # Targeted hint for the most likely Mode-A confusion: a user with a
     # Mode B config they're adapting to Mode A may forget to drop the
-    # step2 block. The generic unknown-key error names step2 but doesn't
-    # explain *why* it's unknown — this targeted check beats the user
+    # step2 keys. The generic unknown-key error names them but doesn't
+    # explain *why* they're unknown — this targeted check beats the user
     # to the punch with a Mode-A-specific message.
-    if (mode in ("modeA_single", "modeA_batch")) and ("step2" in raw):
+    step2_keys = [k for k in ("backend_step2", "step2") if k in raw]
+    if not runs_step2 and step2_keys:
         raise ValueError(
             f"pipeline_config.json: mode={mode!r} does not run step2; "
-            f"remove the step2 block. (Mode A reads a pre-staged group "
+            f"remove {step2_keys}. (Mode A reads a pre-staged group "
             f"prior from project-local "
             f"priors/<variant>/beta<X>/Params_Final.mat. See "
             f"projects/sample_modeA_single/pipeline_config.json or "
@@ -666,7 +642,8 @@ def read_pipeline_config(path: Path | str) -> PipelineConfig:
         raise ValueError(f"pipeline_config.json: c must be >= 0 (got {c})")
     backend_step0 = _enum(raw, "backend_step0", _VALID_BACKENDS)
     backend_step1 = _enum(raw, "backend_step1", _VALID_BACKENDS)
-    backend_step2 = _enum(raw, "backend_step2", _VALID_BACKENDS)
+    backend_step2 = (_enum(raw, "backend_step2", _VALID_BACKENDS)
+                     if runs_step2 else None)
     backend_step3 = _enum(raw, "backend_step3", _VALID_BACKENDS)
 
     if variant == "cMSHBM" and mode == "modeB_train_prior":
@@ -675,15 +652,14 @@ def read_pipeline_config(path: Path | str) -> PipelineConfig:
             "Use gMSHBM or dMSHBM for Mode B."
         )
 
-    if backend_step2 == "gpu" and "step2" in required_blocks:
+    if backend_step2 == "gpu":
         # Two static kernel limits, failed here rather than after step 0/1.
         # The literals mirror
         # ``step2_em_iter_master._kernels_gpu``'s MAX_CLUSTERS / MAX_D_GRAD
         # (this parser
         # is stdlib-only; importing the kernel module would pull numba +
         # cupy into ``Pipeline.__init__``). ``test_config.py`` pins the
-        # equality. The parser cannot see ``seed_mesh`` — the driver checks
-        # the third limit, ceil(D/8) <= 256, off bold_inputs.json.
+        # equality.
         _SPARSE_MAX_CLUSTERS = 512      # 32 * INIT_MAXJ
         _SPARSE_MAX_D_GRAD = 11772      # (49152 - connect_u static) // 4
         if num_clusters > _SPARSE_MAX_CLUSTERS:
@@ -708,20 +684,10 @@ def read_pipeline_config(path: Path | str) -> PipelineConfig:
     # the PipelineConfig.
     step0 = _parse_step0(raw["step0"])
     step1 = _parse_step1(raw["step1"])
-    step2 = _parse_step2(raw["step2"]) if "step2" in required_blocks else None
+    step2 = _parse_step2(raw["step2"]) if runs_step2 else None
     step3 = _parse_step3(raw["step3"])
     _validate_step0(step0)
     _validate_step1(step1)
-    if backend_step1 == "gpu" and step1.reduction_dtype != "float64":
-        # The GPU ini_params kernels reduce in fp64 only; step 1 runs
-        # in every mode, so this is failed here rather than in step 1's
-        # third subgraph, after step 0 and the profile pass.
-        raise ValueError(
-            f"pipeline_config.json: backend_step1='gpu' requires "
-            f"step1.reduction_dtype='float64'; got "
-            f"{step1.reduction_dtype!r}. Use backend_step1='cpu' for a "
-            f"float32 reduction."
-        )
     if step2 is not None:
         _validate_step2(step2)
     _validate_step3(step3)

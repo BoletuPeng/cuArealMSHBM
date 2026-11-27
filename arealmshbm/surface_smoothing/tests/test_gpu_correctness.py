@@ -2,20 +2,16 @@
 :func:`cifti_smoothing_gpu`.
 
 Asserts the GPU cupyx fp32 SpMM matches the CPU numpy fp64 SpMV
-reference on the real fsa6 gather (built by the production
-``prepare_smoothing_gather`` at sigma=2.55) to max-abs-diff < 1e-3.
-A silent regression in the fp32 device copy of the gather
-(``prepare_smoothing_gather_gpu``) or the SpMM+scale pass fires on the
-next test run instead of waiting for an end-to-end pipeline run. Both
-arms consume the same CPU-built gather, so the CPU gather build itself
-is not checked here. The fp32 design choice is justified by this drift
-bound — downstream find_minima + watershed compare values without
+reference on the fsa6 gather of the shipped step-0 inputs bundle
+(sigma=2.55) to max-abs-diff < 1e-3. A silent regression in the
+SpMM+scale pass fires on the next test run instead of waiting for an
+end-to-end pipeline run. The fp32 design choice is justified by this
+drift bound — downstream find_minima + watershed compare values without
 accumulation, so the GPU/CPU drift is well inside the value-comparison
 noise floor.
 
-Skipped automatically if cupy is not installed or ``$CBIG_CODE_DIR``
-does not point at a CBIG checkout holding the fsaverage6 midthickness
-atlas.
+Skipped automatically if cupy / a CUDA device is not available, or if
+the step-0 inputs bundle is not staged.
 
 Run::
 
@@ -27,25 +23,12 @@ Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 from __future__ import annotations
 
 import importlib.util
-import os
-from pathlib import Path
 
 import numpy as np
 import pytest
 
 
 _HAS_CUPY = importlib.util.find_spec("cupy") is not None
-
-# Tests that read the CBIG midthickness atlas point at the env-configured
-# CBIG checkout; if ``CBIG_CODE_DIR`` is unset, the atlas-dependent tests
-# are skipped. Both tests in this file are atlas-dependent: the gather
-# they compare is built from the atlas midthickness.
-_CBIG_ENV = os.environ.get("CBIG_CODE_DIR")
-_CBIG = Path(_CBIG_ENV) if _CBIG_ENV else None
-_ATLAS = (_CBIG / "utilities" / "matlab" / "speedup_gradients" /
-          "utilities" / "fs6_surface_template") if _CBIG else None
-_HAS_ATLAS = bool(_ATLAS and _ATLAS.exists())
-_SIGMA = 2.55
 
 
 # fp64-CPU vs fp32-GPU smoothing of Gaussian data: max-abs is bounded
@@ -60,51 +43,30 @@ _MAX_REL = 5e-3
 def _state():
     if not _HAS_CUPY:
         pytest.skip("cupy not installed")
-    if not _HAS_ATLAS:
-        pytest.skip(f"CBIG midthickness atlas not at {_ATLAS}")
 
-    from arealmshbm.data_io import load_avg_mesh
-    from arealmshbm.surface_io import read_surface_mesh
-    from arealmshbm.surface_smoothing import (
-        prepare_smoothing_mesh, prepare_smoothing_gather, cifti_smoothing,
-    )
+    from arealmshbm.step0_pipeline.inputs_bundle import load_inputs_bundle
+    from arealmshbm.surface_smoothing import cifti_smoothing
     from arealmshbm.surface_smoothing.surface_smoothing_gpu import (
         prepare_smoothing_gather_gpu, cifti_smoothing_gpu,
     )
 
     try:
-        lh_avg = load_avg_mesh("lh", "fsaverage6", "sphere")
-        rh_avg = load_avg_mesh("rh", "fsaverage6", "sphere")
+        inputs = load_inputs_bundle()
     except FileNotFoundError as e:
-        pytest.skip(f"fsaverage6 sphere bundle not staged: {e}")
-    n_lh = lh_avg["vertices"].shape[1]
-    medial_mask = np.concatenate([
-        (lh_avg["MARS_label"].ravel() == 1),
-        (rh_avg["MARS_label"].ravel() == 1),
-    ]).astype(bool)
-    cortex = ~medial_mask
-    n_cortex = int(cortex.sum())
-
-    lh_mid = read_surface_mesh(_ATLAS / "fsaverage6.L.midthickness.surf.gii")
-    rh_mid = read_surface_mesh(_ATLAS / "fsaverage6.R.midthickness.surf.gii")
-    lh_prep = prepare_smoothing_mesh(lh_mid["vertices"], lh_mid["faces"])
-    rh_prep = prepare_smoothing_mesh(rh_mid["vertices"], rh_mid["faces"])
-    lh_gather = prepare_smoothing_gather(lh_prep, cortex[:n_lh], _SIGMA)
-    rh_gather = prepare_smoothing_gather(rh_prep, cortex[n_lh:], _SIGMA)
-    lh_gather_gpu = prepare_smoothing_gather_gpu(lh_gather)
-    rh_gather_gpu = prepare_smoothing_gather_gpu(rh_gather)
+        pytest.skip(f"step-0 inputs bundle not staged: {e}")
 
     return dict(
         cifti_smoothing=cifti_smoothing,
         cifti_smoothing_gpu=cifti_smoothing_gpu,
-        lh_gather=lh_gather, rh_gather=rh_gather,
-        lh_gather_gpu=lh_gather_gpu, rh_gather_gpu=rh_gather_gpu,
-        medial_mask=medial_mask, n_cortex=n_cortex,
+        lh_gather=inputs.lh_smooth_gather,
+        rh_gather=inputs.rh_smooth_gather,
+        lh_gather_gpu=prepare_smoothing_gather_gpu(inputs.lh_smooth_gather),
+        rh_gather_gpu=prepare_smoothing_gather_gpu(inputs.rh_smooth_gather),
+        medial_mask=inputs.medial_mask, n_cortex=inputs.n_cortex,
     )
 
 
 @pytest.mark.skipif(not _HAS_CUPY, reason="cupy not installed")
-@pytest.mark.skipif(not _HAS_ATLAS, reason=f"missing atlas {_ATLAS}")
 @pytest.mark.parametrize("K", [108, 150])
 def test_cpu_gpu_smoothing_agree(_state, K):
     """fp32 GPU smoothing must agree with fp64 CPU smoothing within
@@ -143,7 +105,6 @@ def test_cpu_gpu_smoothing_agree(_state, K):
 
 
 @pytest.mark.skipif(not _HAS_CUPY, reason="cupy not installed")
-@pytest.mark.skipif(not _HAS_ATLAS, reason=f"missing atlas {_ATLAS}")
 def test_cifti_smoothing_gpu_device_input_alias(_state):
     """Device-input path: production caller hands a cp.ndarray straight
     from the upstream GPU accumulator. ``cp.asarray(data, dtype=cp.float32)``

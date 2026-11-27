@@ -9,9 +9,6 @@ Pins:
     widen is a pure relocation of the same arithmetic;
   * ``save_async=True`` writes the same ``group.mat`` as the sync path
     and the file loads through ``step2_io.load_group_mtc``;
-  * the CPU backend still accepts ``reduction_dtype=np.float32``, and
-    the GPU backend rejects it with a named error instead of failing
-    deep inside a RawKernel;
   * the device/host hand-off argument pairing is validated.
 
 Run::
@@ -35,7 +32,6 @@ from arealmshbm.ini_params.ini_params import _load_medial_mask
 from arealmshbm.ini_params.ini_params_gpu import generate_ini_params_gpu
 from arealmshbm.step2_io.load_group_mtc import load_group_mtc
 
-TARG, SEED = "fsaverage6", "fsaverage3"
 D = 24
 L_H = 6
 
@@ -44,7 +40,7 @@ L_H = 6
 def fixture_case():
     """Synthetic (labels, lh/rh avg profiles) on the real fsa6 mesh."""
     try:
-        mw = _load_medial_mask(TARG)
+        mw = _load_medial_mask()
     except FileNotFoundError as exc:      # pragma: no cover - env-dependent
         pytest.skip(f"avg_mesh bundle not staged: {exc}")
     n = mw.shape[0] // 2
@@ -75,11 +71,11 @@ def test_device_handoff_matches_host_and_disk(tmp_path, fixture_case):
     lh_labels, rh_labels, lh_avg, rh_avg = fixture_case
 
     host = generate_ini_params_gpu(
-        SEED, TARG, lh_labels, rh_labels, str(tmp_path),
+        lh_labels, rh_labels, str(tmp_path),
         precomputed_lh_avg=lh_avg, precomputed_rh_avg=rh_avg, save=False,
     )
     dev = generate_ini_params_gpu(
-        SEED, TARG, lh_labels, rh_labels, str(tmp_path),
+        lh_labels, rh_labels, str(tmp_path),
         precomputed_lh_avg_dev=_dev(lh_avg), precomputed_rh_avg_dev=_dev(rh_avg),
         save=False,
     )
@@ -87,10 +83,10 @@ def test_device_handoff_matches_host_and_disk(tmp_path, fixture_case):
 
     base = tmp_path / "profiles" / "avg_profile"
     base.mkdir(parents=True, exist_ok=True)
-    np.save(base / f"lh_{TARG}_roi{SEED}_avg_profile.npy", lh_avg)
-    np.save(base / f"rh_{TARG}_roi{SEED}_avg_profile.npy", rh_avg)
+    np.save(base / "lh_avg_profile.npy", lh_avg)
+    np.save(base / "rh_avg_profile.npy", rh_avg)
     disk = generate_ini_params_gpu(
-        SEED, TARG, lh_labels, rh_labels, str(tmp_path), save=False,
+        lh_labels, rh_labels, str(tmp_path), save=False,
     )
     _assert_same(dev, disk, "device vs .npy read")
 
@@ -99,9 +95,9 @@ def test_device_handoff_is_deterministic(tmp_path, fixture_case):
     lh_labels, rh_labels, lh_avg, rh_avg = fixture_case
     kw = dict(precomputed_lh_avg_dev=_dev(lh_avg),
               precomputed_rh_avg_dev=_dev(rh_avg), save=False)
-    a = generate_ini_params_gpu(SEED, TARG, lh_labels, rh_labels,
+    a = generate_ini_params_gpu(lh_labels, rh_labels,
                                 str(tmp_path), **kw)
-    b = generate_ini_params_gpu(SEED, TARG, lh_labels, rh_labels,
+    b = generate_ini_params_gpu(lh_labels, rh_labels,
                                 str(tmp_path), **kw)
     _assert_same(a, b, "run-to-run")
 
@@ -112,13 +108,13 @@ def test_async_save_matches_sync_save(tmp_path, fixture_case):
     sync_dir.mkdir(); async_dir.mkdir()
 
     s = generate_ini_params_gpu(
-        SEED, TARG, lh_labels, rh_labels, str(sync_dir),
+        lh_labels, rh_labels, str(sync_dir),
         precomputed_lh_avg_dev=_dev(lh_avg), precomputed_rh_avg_dev=_dev(rh_avg),
         save=True, save_async=False,
     )
     assert s.writer is None
     a = generate_ini_params_gpu(
-        SEED, TARG, lh_labels, rh_labels, str(async_dir),
+        lh_labels, rh_labels, str(async_dir),
         precomputed_lh_avg_dev=_dev(lh_avg), precomputed_rh_avg_dev=_dev(rh_avg),
         save=True, save_async=True,
     )
@@ -136,29 +132,9 @@ def test_async_save_matches_sync_save(tmp_path, fixture_case):
     assert got["epsil"] == float(a["epsil"].ravel()[0])
 
 
-def test_fp32_reduction_dtype(tmp_path, fixture_case):
-    """CPU backend must still accept an fp32 reduction; GPU must refuse
-    it up front rather than tripping a RawKernel dtype guard."""
-    lh_labels, rh_labels, lh_avg, rh_avg = fixture_case
-    out = generate_ini_params(
-        SEED, TARG, lh_labels, rh_labels, str(tmp_path), backend="cpu",
-        reduction_dtype=np.float32,
-        precomputed_lh_avg=lh_avg, precomputed_rh_avg=rh_avg, save=False,
-    )
-    assert out["mtc"].dtype == np.float64      # cast on the way out
-    assert np.isfinite(float(out["epsil"].ravel()[0]))
-
-    with pytest.raises(ValueError, match="reduction_dtype must be float64"):
-        generate_ini_params(
-            SEED, TARG, lh_labels, rh_labels, str(tmp_path), backend="gpu",
-            reduction_dtype=np.float32,
-            precomputed_lh_avg=lh_avg, precomputed_rh_avg=rh_avg, save=False,
-        )
-
-
 def test_handoff_argument_validation(tmp_path, fixture_case):
     lh_labels, rh_labels, lh_avg, rh_avg = fixture_case
-    common = (SEED, TARG, lh_labels, rh_labels, str(tmp_path))
+    common = (lh_labels, rh_labels, str(tmp_path))
 
     with pytest.raises(ValueError, match="BOTH precomputed_lh_avg_dev"):
         generate_ini_params_gpu(*common, precomputed_lh_avg_dev=_dev(lh_avg),

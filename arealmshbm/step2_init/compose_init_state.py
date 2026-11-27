@@ -70,8 +70,8 @@ def compose_init_state(bold_loader: SubjectProfileLoader,
                     ``(N, T, D)`` fp32 profile from disk on each
                     :meth:`load_into` call. The number of subjects
                     ``S`` is taken from ``bold_loader.num_sub``.
-    group_mtc     : (D+1, L) fp64 — group cluster centroids (from
-                    group.mat).
+    group_mtc     : (D, L) fp64 — group cluster centroids (from
+                    group.mat); D = profile length = vMF dim + 1.
     boundary_mask : (N, L) fp32 — bilateral block-diagonal radius mask
                     from build_step2_boundary_mask.
     num_clusters  : int — must match group_mtc.shape[1] and
@@ -134,8 +134,8 @@ def compose_init_state(bold_loader: SubjectProfileLoader,
     #     cached packed bytes, ~56 ms) plus the init kernel.
     #     Cohort wall: 52s sequential → 8.75s on the S=40 reference cohort (5.8x).
     #
-    #   Path B (cache_mode='stream'): the CPU step-2 backend with
-    #     bold_cache_mode='stream'. No host cache;
+    #   Path B (cache_mode='stream', the CPU backend with
+    #     bold_cache_mode='stream'; the GPU backend inits on device): no host cache;
     #     each load_into goes back to disk. We can't prefetch into a
     #     shared cache, but we CAN parallelize the per-sub
     #     disk-read+widen+normalize across worker scratches and run

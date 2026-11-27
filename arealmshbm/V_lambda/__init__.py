@@ -1,7 +1,7 @@
 """V_lambda
 
-Potts close-form MRF smoothness term (the V_lambda factor in the gMSHBM
-E-step). Potts weights ``V_same=0, V_diff=1`` are baked into the kernel —
+Potts close-form MRF smoothness term (the V_lambda factor in the step-3
+E-step, all variants). Potts weights ``V_same=0, V_diff=1`` are baked into the kernel —
 no edge-weight matrices are taken or stored.
 
 Public API:

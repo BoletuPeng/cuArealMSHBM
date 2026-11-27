@@ -31,12 +31,9 @@ def derive_labels(s_lambda: np.ndarray,
     Parameters
     ----------
     s_lambda : (N, L) — soft posterior probabilities.
-    n_lh     : LH vertex count. Defaults to ``N // 2`` — correct for the
-               equal-hemisphere meshes the pipeline currently supports
-               (fsaverage6: 40962+40962, fs_LR_32k: 32492+32492). Pass
-               explicitly for any future asymmetric-hemisphere mesh, or
-               to assert against the mesh's known LH vertex count when
-               ``s_lambda`` may have come from a different mesh.
+    n_lh     : LH vertex count. Defaults to ``N // 2`` (fsaverage6 is
+               40962 + 40962). Pass it to assert against a known LH
+               vertex count.
 
     Returns
     -------

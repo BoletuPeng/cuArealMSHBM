@@ -30,8 +30,6 @@ def test_compute_profile_arrays_cpu_rejects_cupy_precomputed():
     cupy_runs = [(_DeviceArrayStandIn(), _DeviceArrayStandIn())]
     with pytest.raises(TypeError, match=r"compute_profile_arrays: "):
         compute_profile_arrays(
-            seed_mesh="fsaverage3",
-            targ_mesh="fsaverage6",
             out_dir="/tmp/does-not-matter",
             sub="1", sess="1",
             precomputed_bold_runs=cupy_runs,

@@ -43,7 +43,7 @@ DEFAULT_DELTA_MULT = 3.0
 # Static shared memory per CTA (kernel 2): two NW-word frontier
 # bitmasks, the int32 worklist and 16 B of bookkeeping. The 48 KiB
 # static limit therefore bounds N; MAX_N is that bound at DEFAULT_CAP
-# (188352, above fsaverage7's 163842, so no supported mesh reaches it)
+# (188352; a fsaverage6 hemisphere is 40962)
 # and :func:`get_delta_module` refuses the actual (N, cap) pair.
 _SMEM_STATIC_LIMIT = 48 * 1024
 

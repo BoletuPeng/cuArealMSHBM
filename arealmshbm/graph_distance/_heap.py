@@ -9,8 +9,7 @@ stored in flat caller-owned arrays so every thread keeps its own heap:
     heap_pos  : int32 (N,)  — heap slot of each vertex, -1 when absent
 
 Decrease-key goes through the ``heap_pos`` back-reference. Used by
-:func:`arealmshbm.graph_distance.graph_distance._all_pairs_dijkstra`,
-:func:`arealmshbm.surface_smoothing._geodesic_kernels.bounded_dijkstra_smooth`
+:func:`arealmshbm.graph_distance.graph_distance._all_pairs_dijkstra`
 and :func:`arealmshbm.radius_mask._kernels.add_spatial_constraint_kernel` /
 :func:`arealmshbm.radius_mask._kernels.central_sulcus_kernel`.
 

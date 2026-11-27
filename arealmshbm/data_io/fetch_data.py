@@ -1,8 +1,7 @@
 """fetch_data.py
 
-Step-3 data ingest for one subject (Mode A, fsaverage path). Mode A
-always uses fsaverage6 RSFC profiles + diffusion-embedding gradients;
-the fs_LR_32k branch is not ported.
+Step-3 data ingest for one subject: fsaverage6 RSFC profiles +
+diffusion-embedding gradients.
 
 Discovery contract: every input path comes from ``cohort.json`` at
 ``project_dir/cohort.json`` (written by step1). The ``subid`` argument
@@ -155,7 +154,6 @@ def read_gradient_emb(path: str | Path, n_components: int = 100) -> np.ndarray:
 def fetch_data(project_dir: str | Path,
                num_session: int,
                subid: int,
-               mesh: str,
                lh_mesh: Dict[str, np.ndarray],
                rh_mesh: Dict[str, np.ndarray],
                n_grad_components: int = 100,
@@ -163,7 +161,7 @@ def fetch_data(project_dir: str | Path,
                *,
                precomputed_gradient_mat: Optional[np.ndarray] = None,
                ) -> Dict[str, Any]:
-    """Single-subject fsaverage data ingest.
+    """Single-subject data ingest.
 
     Discovery: reads ``cohort.json`` at ``project_dir/cohort.json`` and
     looks up ``subjects[subid - 1]`` (1-based positional lookup, matching
@@ -182,8 +180,6 @@ def fetch_data(project_dir: str | Path,
                         against the cohort manifest.
     subid             : 1-based positional index into the cohort's
                         ``subjects`` list.
-    mesh              : 'fsaverage6' / 'fsaverage5' / 'fsaverage'.
-                        Validated against ``cohort.mesh.targ``.
     lh_mesh, rh_mesh  : output of :func:`load_avg_mesh.load_avg_mesh`
                         (only ``MARS_label`` and vertex count are read).
     n_grad_components : keep the first N gradient cols. Default 100.
@@ -210,11 +206,6 @@ def fetch_data(project_dir: str | Path,
         ``gradient_mat``  — (N, n_grad_components) fp32, only when
                             ``with_gradient=True``.
     """
-    if not (mesh.startswith("fsaverage")):
-        raise ValueError(
-            f"fetch_data is single-subject fsaverage only; got mesh={mesh!r}. "
-            "fs_LR_32k support is left for a future port."
-        )
     project_dir = Path(project_dir)
     T = int(num_session)
 
@@ -227,11 +218,6 @@ def fetch_data(project_dir: str | Path,
     # Resolve all paths from cohort.json — the single source of truth.
     from arealmshbm.data_io.cohort import read_cohort, resolve_path
     cohort = read_cohort(project_dir)
-    if cohort.mesh.get("targ") != mesh:
-        raise ValueError(
-            f"fetch_data: cohort mesh.targ={cohort.mesh.get('targ')!r} "
-            f"!= caller mesh={mesh!r}"
-        )
     idx = int(subid) - 1
     if idx < 0 or idx >= cohort.num_sub:
         raise IndexError(

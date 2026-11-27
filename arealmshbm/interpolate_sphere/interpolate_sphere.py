@@ -250,10 +250,9 @@ def _score_and_interp_batch(p_arr,           # (M, 3) fp32
 
         # NOTE: ``best_b{0,1,2}`` are unsigned-area weights ``A_k / Σ A_k``
         # with ``A_k = 0.5 * ||cross||`` (non-negative) and Σ = 1 by
-        # construction, so they are ALWAYS in [0, 1]. The clamp/renormalise
-        # branch from the original draft was wired against unsigned weights
-        # and therefore unreachable; the MATLAB MIN_AREA_TOL snap below
-        # remains the sole post-processing.
+        # construction, so they are ALWAYS in [0, 1] and need no
+        # clamp/renormalise; the MATLAB MIN_AREA_TOL snap below is the
+        # sole post-processing.
 
         # MATLAB MIN_AREA_TOL = 0.9999999 — snap a near-1 weight to a hard corner.
         if best_b0 > BARY_TOL:

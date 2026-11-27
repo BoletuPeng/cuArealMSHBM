@@ -68,8 +68,8 @@ def missing_avg_mesh(*surfaces: str) -> Optional[str]:
     from arealmshbm.data_io.load_avg_mesh import load_avg_mesh
     try:
         for surface in surfaces:
-            load_avg_mesh("lh", "fsaverage6", surface)
-            load_avg_mesh("rh", "fsaverage6", surface)
+            load_avg_mesh("lh", surface)
+            load_avg_mesh("rh", surface)
     except FileNotFoundError as exc:
         return f"avg_mesh bundle not staged: {exc}"
     return None
@@ -95,7 +95,7 @@ def load_sub001() -> Optional[Sub001Fixture]:
 
     cfg = Step3Config(
         project_dir=SUB001_DIR, num_session=6, num_clusters=300, subid=1,
-        mesh="fsaverage6", w=50.0, c=10.0, beta_scalar=5.0, backend="cpu",
+        w=50.0, c=10.0, beta_scalar=5.0, backend="cpu",
     )
     pipe = Step3Pipeline(cfg)
     inp = pipe.load_inputs()

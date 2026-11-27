@@ -6,8 +6,8 @@ along the distance path.
 Design rules (all kernels obey):
 
 * **Serial.** No ``parallel=True``, no ``prange``. Per-call latency is
-  sub-millisecond, so cores are reserved for outer subject-level
-  multiprocessing.
+  sub-millisecond; the only concurrency is the LH/RH split onto two
+  threads in ``component_distance.py``.
 * **Out-buffer style.** Every kernel receives pre-allocated output AND
   scratch arrays as parameters. Nothing is allocated inside a kernel;
   nothing is returned except trivial scalars. Caller owns all memory.

@@ -5,7 +5,7 @@ Same algorithm class — alpha-normalized random-walk Lanczos for top-k
 diffusion components — executed on the GPU via ``cupy.linalg`` and
 ``cupyx.scipy.sparse.linalg.eigsh``.
 
-Precision: fp32. The on-disk distance matrix is fp32, the affinity
+Precision: fp32. The geodesic distance matrix is fp32, the affinity
 matrix ``exp(-D/D.max())`` lives in (0, 1] (bounded dynamic range), and
 the alpha-normalised symmetric similar matrix is also bounded.
 Empirically on the fsa6 down-sphere (N=12962, k=101), every one of the
@@ -27,8 +27,6 @@ Downstream the CBIG step-0 caller is robust to all three (psi/psi[:,0]
 absorbs the sign; the parcellation downstream depends on the invariant
 subspace, not on its basis orientation), but anything that consumes
 the raw embedding should not assume byte equality between backends.
-See ``validate_cpu_gpu.py`` for the smoke that asserts the actual
-contract (|cos| per eigvec near 1; final parcellation labels agree).
 
 Public API:
     compute_diffusion_map_gpu(affinity, alpha, n_components) -> emb_f32
@@ -105,7 +103,7 @@ def compute_diffusion_map_gpu(
     vectors = phi * inv_sqrt_d2[:, cp.newaxis]
 
     # 5. Renormalize by the trivial (constant) eigenvector.
-    # Mirrors the CPU guard at diffusion_map.py:160-170 — see there
+    # Mirrors the CPU guard in diffusion_map.py step 5 — see there
     # for why the connectedness invariant makes this double-defense.
     psi0_min = float(cp.min(cp.abs(vectors[:, 0])))
     if psi0_min < 1e-30:

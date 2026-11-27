@@ -9,7 +9,7 @@ What is pinned here:
     face edges through ``np.unique``.
     Checked on a synthetic icosphere and on both shipped fsaverage6
     bundles;
-  * every documented precondition of the new argument raises a named
+  * every documented precondition of the ``vertex_nbors`` argument raises a named
     ``ValueError`` -- including the three graph invariants a raw bundle
     table cannot be assumed to have: no self-loop, no duplicate
     neighbour, symmetry;
@@ -84,7 +84,7 @@ def icosphere_mesh():
 def _load_bundle(hemi):
     from arealmshbm.data_io.load_avg_mesh import load_avg_mesh
     try:
-        return load_avg_mesh(hemi, "fsaverage6", "inflated")
+        return load_avg_mesh(hemi, "inflated")
     except FileNotFoundError as e:  # pragma: no cover - staging dependent
         pytest.skip(f"avg_mesh bundle not staged: {e}")
 

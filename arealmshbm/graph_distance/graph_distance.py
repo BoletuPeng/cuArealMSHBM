@@ -182,9 +182,10 @@ def gradient_geodesic_distance(verts: np.ndarray,
     Returns
     -------
     dist : (N, N) fp32
-        Normalised geodesic distance, symmetric (up to fp tolerance),
-        zero diagonal, ``dist.max() == 1`` after normalisation by the
-        global maximum.
+        Normalised geodesic distance ``dist[source, dest]`` (the GPU
+        entry point publishes the transpose orientation), symmetric up
+        to fp32 path-sum order, zero diagonal, ``dist.max() == 1``
+        after normalisation by the global maximum.
     """
     if vertex_nbors.ndim != 2:
         raise ValueError(

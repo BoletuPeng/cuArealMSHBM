@@ -27,7 +27,9 @@ one orchestrator folder per step. New steps follow the same shape:
 - **Pipeline orchestrator** — `<stepN>_pipeline/` per step, layout:
   `config.py` (dataclass with all knobs, validation in `__post_init__`)
   + `pipeline.py` (single-subject load → run → save lifecycle).
-  Multi-subject batch runs go through the unified
+  Step 1 has no config / pipeline class (`step1_pipeline/` holds only
+  a profiling script); it is driven from
+  `arealmshbm/pipeline/step1_runners.py`. Multi-subject batch runs go through the unified
   `arealmshbm/pipeline/` driver (mode dispatch). Step 3 also has a
   step-specific `variant.py` for the three Areal-MSHBM variants —
   that is unlikely to recur, don't add a `variant.py` to other steps

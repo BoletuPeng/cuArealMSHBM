@@ -50,7 +50,7 @@
       "default": 300,
       "source": "arealmshbm/pipeline/config.py (PipelineConfig.num_clusters)",
       "description": "L = number of cortical parcels (ROIs). Drives step1 schaefer_resolution, step2/step3 EM.",
-      "notes": "Quantized to the Schaefer-2018 Kong2022 17-network annot resolutions staged at $MSHBM_ATLAS_DIR/<targ_mesh>/label/{lh,rh}.Schaefer2018_<N>Parcels_Kong2022_17Networks_order.annot (N in {100, 200, ..., 1000}). step1_runners.resolve_group_labels raises FileNotFoundError on any other N. backend_step2='gpu' caps L at 512 (init_soft keeps 16 per-lane accumulators over a 32-lane warp), so only 100-500 of these values are usable there; the parser rejects the rest."
+      "notes": "Quantized to the Schaefer-2018 Kong2022 17-network annot resolutions staged at $MSHBM_ATLAS_DIR/fsaverage6/label/{lh,rh}.Schaefer2018_<N>Parcels_Kong2022_17Networks_order.annot (N in {100, 200, ..., 1000}). step1_runners.resolve_group_labels raises FileNotFoundError on any other N. backend_step2='gpu' caps L at 512 (init_soft keeps 16 per-lane accumulators over a 32-lane warp), so only 100-500 of these values are usable there; the parser rejects the rest."
     },
     {
       "key": "beta_scalar",
@@ -106,36 +106,12 @@
       "notes": "Free string; no algorithmic effect."
     },
     {
-      "key": "bold_inputs.targ_mesh",
-      "type": "enum",
-      "values": [
-        "fsaverage6"
-      ],
-      "default": "fsaverage6",
-      "source": "arealmshbm/pipeline/inputs.py (BoldInputs.targ_mesh)",
-      "description": "Target mesh (vertex space for BOLD).",
-      "notes": "Step0 hard-restricts to fsaverage6 (Step0Config._SUPPORTED_MESHES). Other meshes work for step1/2/3 standalone but not via the unified driver."
-    },
-    {
-      "key": "bold_inputs.seed_mesh",
-      "type": "enum",
-      "values": [
-        "fsaverage3",
-        "fsaverage4",
-        "fsaverage5"
-      ],
-      "default": "fsaverage3",
-      "source": "arealmshbm/pipeline/inputs.py (BoldInputs.seed_mesh)",
-      "description": "Seed mesh for step1 RSFC profile.",
-      "notes": "Drives D = 1175 / 4690 / 18741 verts respectively."
-    },
-    {
       "key": "bold_inputs.subjects",
       "type": "array",
       "default": [],
       "source": "arealmshbm/pipeline/inputs.py (BoldInputs.subjects)",
       "description": "List of subjects, each with sessions and BOLD path pairs (lh, rh).",
-      "notes": "Subject count constraint depends on mode (see modes.json constraints.num_subjects)."
+      "notes": "Every BOLD file is a fsaverage6 surface .func.gii (40962 vertices per hemisphere); the surface is fixed, not a manifest key. Subject count constraint depends on mode (see modes.json constraints.num_subjects)."
     }
   ]
 }

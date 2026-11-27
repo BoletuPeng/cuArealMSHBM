@@ -1,10 +1,9 @@
 """local_minima_gpu.py
 
-CuPy RawKernel port of :func:`.local_minima.find_minima`. Replaces the
-CPU numba prange leaf so the step-0 subgraph-A device-stay chain
-(``cifti_smoothing_gpu`` → minima → ``watershed_edge_count_gpu``) does
-not have to D2H+H2D the (N_cortex, K) fp32 smoothed buffer around the
-former CPU call.
+CuPy RawKernel port of :func:`.local_minima.find_minima`, the gpu
+backend's minima leaf, so the step-0 subgraph-A device-stay chain
+(``cifti_smoothing_gpu`` → minima → ``watershed_edge_count_gpu``) never
+moves the (N_cortex, K) fp32 smoothed buffer to host.
 
 Algorithm
 ---------

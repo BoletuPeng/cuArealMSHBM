@@ -2,16 +2,15 @@
 
 ``bold_inputs.json`` is the user-provided contract: a list of subjects,
 each with a list of sessions, each with explicit ``lh``/``rh`` BOLD
-``.func.gii`` paths. The pipeline driver consumes this list and emits
-a :class:`BoldInputs` object — read once, validated, then handed off.
+``.func.gii`` paths on the fsaverage6 surface. The pipeline driver
+consumes this list and emits a :class:`BoldInputs` object — read once,
+validated, then handed off.
 
 Schema v1::
 
     {
       "schema_version": "1",
       "dataset_name": "<str>",
-      "targ_mesh":    "fsaverage6",      # surface BOLD lives on
-      "seed_mesh":    "fsaverage3",      # step1 RSFC seed mesh
       "subjects": [
         {
           "id": "1",                     # 1-based positional integer-string
@@ -32,14 +31,17 @@ outside this manifest.
 
 Validation rules:
 
-  * ``schema_version`` must equal ``"1"``.
+  * ``schema_version`` must equal ``"1"``; no other top-level key
+    than the three above is accepted.
   * ``subjects[*].id`` must be a positive integer-string, **sequential**
     starting at 1 — matches step1's 1-based positional indexing into
     cohort.json.
   * Per-subject session counts must match (uniform N across subjects).
   * Within a subject, ``sessions[*].id`` must be a positive integer-string
     sequential from 1.
-  * Every ``lh`` / ``rh`` path must exist on disk at read time.
+  * Every ``lh`` / ``rh`` path must end in ``.gii``. Existence on disk
+    is checked separately by :func:`check_bold_files_exist` (the
+    driver's min-input check at the start of ``run()``).
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """
@@ -68,8 +70,6 @@ class BoldInputSubject:
 class BoldInputs:
     schema_version: str
     dataset_name: str
-    targ_mesh: str
-    seed_mesh: str
     subjects: Tuple[BoldInputSubject, ...]
 
     @property
@@ -101,9 +101,12 @@ def read_bold_inputs(path: Path | str) -> BoldInputs:
         raise ValueError(
             f"bold_inputs.json: schema_version must be '1' (got {sv!r})"
         )
-    for k in ("dataset_name", "targ_mesh", "seed_mesh", "subjects"):
+    for k in ("dataset_name", "subjects"):
         if k not in raw:
             raise ValueError(f"bold_inputs.json: missing required key {k!r}")
+    unknown = sorted(set(raw) - {"schema_version", "dataset_name", "subjects"})
+    if unknown:
+        raise ValueError(f"bold_inputs.json: unknown key(s) {unknown}")
 
     raw_subjects = raw["subjects"]
     if not isinstance(raw_subjects, list) or len(raw_subjects) == 0:
@@ -160,7 +163,7 @@ def read_bold_inputs(path: Path | str) -> BoldInputs:
                 # the actual file extension is just ``.gii`` —
                 # ``.surf.gii`` (geometry) / ``.shape.gii`` (single-frame)
                 # also pass the suffix check; they fail the content
-                # contract instead at :func:`_scan_gifti_spans`
+                # contract instead at :func:`gifti_io._scan_gifti_spans`
                 # because their DataArray shape isn't a per-vertex time
                 # series.
                 if p.suffix.lower() != ".gii":
@@ -179,8 +182,6 @@ def read_bold_inputs(path: Path | str) -> BoldInputs:
     return BoldInputs(
         schema_version=sv,
         dataset_name=str(raw["dataset_name"]),
-        targ_mesh=str(raw["targ_mesh"]),
-        seed_mesh=str(raw["seed_mesh"]),
         subjects=tuple(parsed_subjects),
     )
 

@@ -12,7 +12,7 @@ Reproduces ``MARS_convertFaces2VertNbors`` and
 ``MARS_convertFaces2FacesOfVert``. The other ``sbjMesh`` fields the
 MATLAB struct exposes (faceAreas, metricVerts, vertexDistSq2Nbors,
 surface_scaling_factor) are not consumed by the Python step-0
-pipeline and have been dropped.
+pipeline and are not computed.
 
 Neighbor ordering: matches ``AddNeighbors`` in the C source — for
 every face (v0, v1, v2) processed in face-array order, the pairs
@@ -23,9 +23,9 @@ order-independent.
 
 Closed-mesh assumption: ``max_cap`` is sized from the per-vertex
 incident-face count, which equals the 1-ring degree only on a closed
-mesh (every edge shared by exactly two triangles). All meshes step 0
-consumes (fsaverage6 sphere/midthickness, downsampled icospheres) are
-closed, so the allocation is exact. On an open mesh a boundary vertex
+mesh (every edge shared by exactly two triangles). The only mesh step 0
+passes here, the downsampled icosphere, is closed, so the allocation
+is exact. On an open mesh a boundary vertex
 has ``n_neigh = n_faces + 1`` and would overflow ``vertex_nbors``.
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>

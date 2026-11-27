@@ -84,9 +84,9 @@ A `Params_Final.mat` contains a `Params` struct with fields:
 | `kappa` | 1 × L | Inter-region vMF concentration |
 | `s_psi`, `s_t_nu`, `s_lambda` | (training-only state) | Empty in CBIG's HCP priors |
 
-For fsaverage6 with 100 ROIs: `mu = 1175×100`, `theta = 81924×100`. D
-depends on the seed mesh (fsaverage3 cortex vertex count); N = 2 hemis
-× 40962 vertices.
+With 100 ROIs: `mu = 1175×100`, `theta = 81924×100`. D is the number
+of fsaverage3 seed vertices off the medial wall; N = 2 hemis × 40962
+fsaverage6 vertices.
 
 In Mode A, only `mu`, `theta`, `epsil`, `sigma` (and `kappa` reset to a
 default) are loaded — they enter step 3 as fixed parameters. The
@@ -110,13 +110,13 @@ Sources a creator can copy from (toolkits, never read at run time):
 
 | Source | What | Coverage |
 |---|---|---|
-| `arealmshbm/data/group_priors/HCP_{fsaverage6,fs_LR_32k}_40sub/<K>/...` | optional local staging of CBIG's priors — not shipped here (see `arealmshbm/data/README.md`) | whatever was staged |
+| `arealmshbm/data/group_priors/HCP_40sub/<K>/...` | optional local staging of CBIG's fsaverage6 priors — not shipped here (see `arealmshbm/data/README.md`) | whatever was staged |
 | `$CBIG_CODE_DIR/.../Kong2022_ArealMSHBM/lib/group_priors/` | CBIG checkout (creator-side; not read at runtime) | full K=100…1000 |
 | another project's `priors/<variant>/beta<X>/Params_Final.mat` | a prior `modeB_train_prior` run | whatever it trained |
 
 `cp` the chosen `Params_Final.mat` into the project slot above before
-running Mode A. The spatial mask needs no staging: step 1 writes it to
-`<project>/spatial_mask/spatial_mask_<mesh>.mat`.
+running Mode A. The spatial mask is not staged: step 1 builds it
+(`spatial_mask/spatial_mask.mat`) in both modes.
 
 ## Decision matrix
 

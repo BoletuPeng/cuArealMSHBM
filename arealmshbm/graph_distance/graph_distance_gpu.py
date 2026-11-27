@@ -12,7 +12,9 @@ its bit-identity with pull Bellman-Ford is pinned by the oracle in
 
 Every entry point returns ``D[dest, source]``; a per-source SSSP fills
 ``D[source, dest]`` and fp32 addition is not reassociative, so the
-transpose pass is not optional.
+transpose pass is not optional. The CPU function returns
+``D[source, dest]``, so the two backends' matrices are transposes of
+each other up to fp32 path-sum order.
 
 Each precondition raises ``ValueError``: valence ``M <= EDGE_SLOTS``,
 ``N <= MAX_N`` (the kernel's static shared-memory budget), neighbour

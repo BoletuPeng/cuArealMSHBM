@@ -19,9 +19,10 @@ kernels in :mod:`._kernels`.
         thread-block per column, shared-mem fp64 reduction for
         sum / sumsq, then a write-back pass that uses
         ``post_sumsq = sumsq - T * mean²`` to recover the centered L2
-        norm without a separate centered-array pass. Matches the CPU
-        ``_zscore_unit_norm_columns_kernel``'s fp64 reductions and fp32
-        storage; a column with no usable variance is written as exact
+        norm without a separate centered-array pass. fp64 reductions
+        and fp32 storage like the CPU
+        ``_zscore_unit_norm_columns_kernel``, whose two-pass centered
+        sum it does not reproduce bit for bit; a column with no usable variance is written as exact
         ``0.0f`` rather than leaking ``NaN`` / ``+-inf``, so no
         ``cp.nan_to_num`` sweep is needed downstream.
 
@@ -118,8 +119,7 @@ def binarize_mwzero_pack_cupy(corr_KxV: cp.ndarray,
     ----------
     corr_KxV : cp.ndarray
         ``(K, V) fp32`` C-contig device array — the per-session
-        correlation accumulator after ``*= 1/n_runs`` (i.e. the input
-        the current ``(corr_sum_dev >= t).astype(fp32)`` consumes).
+        correlation accumulator after ``*= 1/n_runs``.
     mw_v : cp.ndarray
         ``(V,) uint8`` device array — 1 at medial-wall vertices,
         0 at cortex. Matches ``MARS_label == 1`` on the target mesh.
@@ -327,9 +327,9 @@ def zscore_unit_norm_columns_zerovar_cupy(x_TxN: cp.ndarray,
 # ---------------------------------------------------------------------
 # Exact k-th smallest fp32 by three radix-histogram passes
 # ---------------------------------------------------------------------
-# Replaces ``cp.partition(flat, kth)[kth]`` (GPU introselect, which
-# also materialises a second full-size buffer to permute). This returns
-# the SAME value -- exactly ``np.partition(flat, kth)[kth]`` -- in
+# Computes ``cp.partition(flat, kth)[kth]`` without its GPU
+# introselect, which materialises a second full-size buffer to permute.
+# This returns the SAME value -- exactly ``np.partition(flat, kth)[kth]`` -- in
 # three streaming passes over the array with no temporary bigger than
 # 16 KB.
 #

@@ -126,7 +126,6 @@ def _run_once(out: Path, args) -> Dict[str, float]:
         nonlocal group_labels
         if group_labels is None:
             group_labels = resolve_group_labels(
-                targ_mesh=args.targ_mesh,
                 schaefer_resolution=args.schaefer_resolution,
             )
         return group_labels
@@ -140,9 +139,7 @@ def _run_once(out: Path, args) -> Dict[str, float]:
 
     # The avg sums are built on device while the leaf packs, so the
     # accumulator only exists when both subgraphs run this call.
-    avg_acc = (make_avg_accumulator(targ_mesh=args.targ_mesh,
-                                    seed_mesh=args.seed_mesh,
-                                    num_sess=len(args.sessions))
+    avg_acc = (make_avg_accumulator(num_sess=len(args.sessions))
                if (is_gpu and run_avg and run_gen) else None)
     write_handles: Optional[list] = [] if is_gpu else None
     if run_gen:
@@ -151,8 +148,6 @@ def _run_once(out: Path, args) -> Dict[str, float]:
             project_dir=out,
             subjects=args.subjects,
             sessions=args.sessions,
-            seed_mesh=args.seed_mesh,
-            targ_mesh=args.targ_mesh,
             backend=args.backend,
             verbose=False,
             avg_accumulator=avg_acc,
@@ -178,8 +173,6 @@ def _run_once(out: Path, args) -> Dict[str, float]:
                 project_dir=out,
                 num_sub=num_sub,
                 num_sess=len(args.sessions),
-                seed_mesh=args.seed_mesh,
-                targ_mesh=args.targ_mesh,
                 backend=args.backend,
                 verbose=False,
                 accumulator=avg_acc,
@@ -191,8 +184,6 @@ def _run_once(out: Path, args) -> Dict[str, float]:
             lh_labels, rh_labels = _group_labels()
             ini_res = run_ini_params(
                 project_dir=out,
-                seed_mesh=args.seed_mesh,
-                targ_mesh=args.targ_mesh,
                 lh_labels=lh_labels,
                 rh_labels=rh_labels,
                 backend=args.backend,
@@ -209,7 +200,6 @@ def _run_once(out: Path, args) -> Dict[str, float]:
             lh_labels, rh_labels = _group_labels()
             run_radius_mask(
                 project_dir=out,
-                targ_mesh=args.targ_mesh,
                 lh_labels=lh_labels,
                 rh_labels=rh_labels,
                 backend=args.backend,
@@ -307,8 +297,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--subjects", nargs="*", default=["1"])
     p.add_argument("--sessions", nargs="*",
                    default=["1", "2", "3", "4", "5", "6"])
-    p.add_argument("--targ-mesh", default="fsaverage6")
-    p.add_argument("--seed-mesh", default="fsaverage3")
     p.add_argument("--schaefer-resolution", default="300")
     p.add_argument("--skip", nargs="*", default=[],
                    choices=["generate_profiles", "avg_profiles",

@@ -5,12 +5,8 @@ Working spec for the candidate-set (P-layout) step-3 GPU backend
 contract shared by the kernel modules; the numerical reference is always
 the **CPU backend** (`backend='cpu'`, numba kernels under
 `arealmshbm/{vmf_clustering,V_lambda,m_step,spatial_priors,
-em_stop_criterion,check_connectedness}`). `gpu` requires seed_mesh
-fsaverage3 (`ceil(D/8) ≤ 256`); the driver rejects any other seed mesh
-by name — select `backend_step3='cpu'` for it — and the per-step API
-rejects `ceil(D/8) > 256` when it reads the packed BOLD.
-Every backend requires w > 0 (`w·log θ` is NaN outside supp(θ) at
-w = 0).
+em_stop_criterion,check_connectedness}`). Every backend requires
+w > 0 (`w·log θ` is NaN outside supp(θ) at w = 0).
 
 ## 0. Why
 
@@ -45,7 +41,8 @@ Layout arrays: see `arealmshbm/vmf_clustering/sparse_layout.py`
 | `row_inv` | `(T, N)` fp32 | `fp32(1 / sqrt(pop - D·mean²))` computed in fp64 (the CPU `_normalize_session_bitpacked_numba`, `data_io/bitpacked_norm.py`, instead sums fp32 `(bit − mean)²` in fp64 and takes the fp32 reciprocal of the fp32 norm, so the two scales differ by ≤ 2 ulp on some rows); **0 when `pop ∈ {0, D}`** (the `has_zero` gate ⇒ the row is identically zero) |
 | `grad` | `(N, Dg)` fp32, `grad_sq (N,)` fp32 | gMSHBM |
 | `sphere_unit` | `(N, 3)` fp32 | `compute_unit_sphere_xyz` |
-| `lh_nbors`, `rh_nbors` | `(M1, n_hemi)` int32 | 1-indexed, 0 = absent (mesh `vertexNbors`) |
+| layout `neighborhood` | `(M, M1)` int32 | E-step Potts stencil in active-row space, 1-indexed, 0 = absent |
+| `ConnectednessGPU._nbors` | `(M1, N)` int32 | mesh `vertexNbors` of both hemis packed bilateral: 0-based global, −1 = absent |
 | `log_theta` | `(P,)` fp32 | `log(θ)` |
 | `log_theta_cost` | same values (θ > 0 on P) | |
 
@@ -60,7 +57,7 @@ materialised.
 
 The group prior (`Params_Final.mat` → mu / epsil / sigma / CSR θ) and
 the `CandidateLayout` built from it and the two spatial masks depend
-only on `cfg.mesh`, `cfg.group_prior_path`, `cfg.spatial_mask_path` and
+only on `cfg.group_prior_path`, `cfg.spatial_mask_path` and
 `cfg.num_clusters` — they are identical for every subject of one
 cohort. `Step3SparseCohort` (`step3_pipeline/sparse_inputs.py`) bundles
 them with that identity; `load_step3_sparse_cohort` builds one and

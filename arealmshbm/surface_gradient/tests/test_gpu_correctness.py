@@ -1,14 +1,16 @@
 """test_gpu_correctness.py — CI-collectable correctness gate for
 :func:`cifti_gradient_gpu`.
 
-Asserts the GPU RawKernel matches the CPU @njit reference on the real
-fsa6 mesh against a synthetic FC_simi_block-shaped input. A silent
-regression in the RawKernel — wrong indexing, dropped sync,
-normal-equations bug — fires on the next test run instead of waiting
-for an end-to-end pipeline run. The fp32 / one-block-per-vertex
-kernel design is justified by this drift bound (sub-1e-4 vs CPU fp64).
+Asserts the GPU RawKernel matches the CPU @njit reference on the fsa6
+midthickness mesh of the shipped step-0 inputs bundle against a
+synthetic FC_simi_block-shaped input. A silent regression in the
+RawKernel — wrong indexing, dropped sync, normal-equations bug — fires
+on the next test run instead of waiting for an end-to-end pipeline run.
+The fp32 / one-block-per-vertex kernel design is justified by this
+drift bound (sub-1e-4 vs CPU fp64).
 
-Skipped automatically if cupy / a CUDA device is not available.
+Skipped automatically if cupy / a CUDA device is not available, or if
+the step-0 inputs bundle is not staged.
 
 Run::
 
@@ -20,24 +22,12 @@ Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 from __future__ import annotations
 
 import importlib.util
-import os
-from pathlib import Path
 
 import numpy as np
 import pytest
 
 
 _HAS_CUPY = importlib.util.find_spec("cupy") is not None
-
-# Tests that read the CBIG midthickness atlas point at the env-configured
-# CBIG checkout; if ``CBIG_CODE_DIR`` is unset, the atlas-dependent tests
-# are skipped (both tests in this file read the fs6 midthickness from
-# this atlas).
-_CBIG_ENV = os.environ.get("CBIG_CODE_DIR")
-_CBIG = Path(_CBIG_ENV) if _CBIG_ENV else None
-_ATLAS = (_CBIG / "utilities" / "matlab" / "speedup_gradients" /
-          "utilities" / "fs6_surface_template") if _CBIG else None
-_HAS_ATLAS = bool(_ATLAS and _ATLAS.exists())
 
 
 # Loose-but-meaningful tolerances. Tight rel for the cohort, with a
@@ -48,59 +38,38 @@ _MAX_REL = 1e-3
 
 @pytest.fixture(scope="module")
 def _state():
-    """Build the (mesh, prep, gpu prep, medial mask, n_cortex) tuple
-    once per pytest session. Heavy enough that we don't want to repeat
-    it across the K-parameterized tests below.
+    """Load the (mesh tables, gpu mirrors, medial mask, n_cortex) tuple
+    once per pytest session.
     """
     if not _HAS_CUPY:
         pytest.skip("cupy not installed")
-    if not _HAS_ATLAS:
-        pytest.skip(f"CBIG midthickness atlas not at {_ATLAS}")
 
     import cupy as cp
-    from arealmshbm.data_io import load_avg_mesh
-    from arealmshbm.surface_io import read_surface_mesh
-    from arealmshbm.surface_gradient import (
-        cifti_gradient, prepare_gradient_mesh,
-    )
+    from arealmshbm.step0_pipeline.inputs_bundle import load_inputs_bundle
+    from arealmshbm.surface_gradient import cifti_gradient
     from arealmshbm.surface_gradient.surface_gradient_gpu import (
         prepare_gradient_mesh_gpu, cifti_gradient_gpu,
     )
 
     try:
-        lh_avg = load_avg_mesh("lh", "fsaverage6", "sphere")
-        rh_avg = load_avg_mesh("rh", "fsaverage6", "sphere")
+        inputs = load_inputs_bundle()
     except FileNotFoundError as e:
-        pytest.skip(f"fsaverage6 sphere bundle not staged: {e}")
-    medial_mask = np.concatenate([
-        (lh_avg["MARS_label"].ravel() == 1),
-        (rh_avg["MARS_label"].ravel() == 1),
-    ]).astype(bool)
-    n_cortex = int((~medial_mask).sum())
-
-    lh_mid = read_surface_mesh(_ATLAS / "fsaverage6.L.midthickness.surf.gii")
-    rh_mid = read_surface_mesh(_ATLAS / "fsaverage6.R.midthickness.surf.gii")
-    lh_prep = prepare_gradient_mesh(lh_mid["vertices"], lh_mid["faces"])
-    rh_prep = prepare_gradient_mesh(rh_mid["vertices"], rh_mid["faces"])
-
-    lh_verts_d = cp.asarray(lh_mid["vertices"], dtype=cp.float32)
-    rh_verts_d = cp.asarray(rh_mid["vertices"], dtype=cp.float32)
-    lh_mesh_gpu = prepare_gradient_mesh_gpu(lh_prep)
-    rh_mesh_gpu = prepare_gradient_mesh_gpu(rh_prep)
+        pytest.skip(f"step-0 inputs bundle not staged: {e}")
 
     return dict(
         cifti_gradient=cifti_gradient,
         cifti_gradient_gpu=cifti_gradient_gpu,
-        lh_mid_verts=lh_mid["vertices"], rh_mid_verts=rh_mid["vertices"],
-        lh_prep=lh_prep, rh_prep=rh_prep,
-        lh_verts_d=lh_verts_d, rh_verts_d=rh_verts_d,
-        lh_mesh_gpu=lh_mesh_gpu, rh_mesh_gpu=rh_mesh_gpu,
-        medial_mask=medial_mask, n_cortex=n_cortex,
+        lh_mid_verts=inputs.lh_mid_verts, rh_mid_verts=inputs.rh_mid_verts,
+        lh_prep=inputs.lh_grad_prep, rh_prep=inputs.rh_grad_prep,
+        lh_verts_d=cp.asarray(inputs.lh_mid_verts, dtype=cp.float32),
+        rh_verts_d=cp.asarray(inputs.rh_mid_verts, dtype=cp.float32),
+        lh_mesh_gpu=prepare_gradient_mesh_gpu(inputs.lh_grad_prep),
+        rh_mesh_gpu=prepare_gradient_mesh_gpu(inputs.rh_grad_prep),
+        medial_mask=inputs.medial_mask, n_cortex=inputs.n_cortex,
     )
 
 
 @pytest.mark.skipif(not _HAS_CUPY, reason="cupy not installed")
-@pytest.mark.skipif(not _HAS_ATLAS, reason=f"missing atlas {_ATLAS}")
 @pytest.mark.parametrize("K", [108, 150])
 def test_cpu_gpu_gradient_agree(_state, K):
     """fp32 GPU gradient must agree with fp64 CPU gradient within tight
@@ -141,7 +110,6 @@ def test_cpu_gpu_gradient_agree(_state, K):
 
 
 @pytest.mark.skipif(not _HAS_CUPY, reason="cupy not installed")
-@pytest.mark.skipif(not _HAS_ATLAS, reason=f"missing atlas {_ATLAS}")
 def test_cifti_gradient_gpu_device_input_alias(_state):
     """Device-input path: production caller hands the cp.ndarray
     ``FC_simi_block`` straight from ``compute_FC_simi_block_gpu``.

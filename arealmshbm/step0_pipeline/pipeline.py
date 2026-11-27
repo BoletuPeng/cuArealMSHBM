@@ -20,8 +20,10 @@ Composes the four subgraphs of CBIG step 0 (see
   Subgraph D — upsample (per hemi)
       interpolate_sphere, source/target swapped.
 
-Hot-path kernels are ``@njit`` numba CPU; tech-stack exceptions
-delegate to BLAS sgemm (``numpy @``) and Lanczos partial eigh
+On ``backend='cpu'`` hot-path kernels are ``@njit`` numba; on
+``backend='gpu'`` subgraphs A–C run CuPy RawKernels / cuBLAS /
+cuSPARSE. Tech-stack exceptions delegate to BLAS sgemm (``numpy @`` /
+cuBLAS) and Lanczos partial eigh
 (``scipy.sparse.linalg.eigsh`` or ``cupyx.scipy.sparse.linalg.eigsh``).
 
 Public API:
@@ -46,9 +48,6 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
 import numpy as np
 
-# All mesh / neighbor / smoothing-prep imports moved to
-# ``arealmshbm.precompute.step0_inputs_builder`` (it owns the heavy
-# precomputation; the production path here reads its output from disk).
 from arealmshbm.icosphere import make_icosphere
 
 from arealmshbm.bold_io import (
@@ -73,6 +72,7 @@ from arealmshbm.diffusion_map import (
 )
 
 from .config import Step0Config
+from .inputs_bundle import load_inputs_bundle
 
 
 # MATLAB parity (``CBIG_SPGrad_RSFC_gradients.m:436``):
@@ -84,32 +84,20 @@ _POS_GRAD_THRESHOLD = 1e-10
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Process-wide cache for the subject-invariant ``load_inputs`` output.
-# Keyed on the fields of cfg that actually determine the result:
-# mesh + cbig_code_dir + smooth_sigma + K_hop. A batch driver running
-# K subjects with the same cfg.mesh pays the ~3 s load_inputs cost
-# exactly once instead of K times. The cached value is the CPU portion
-# of Step0Inputs (GPU gathers are NOT cached — ``Step0Pipeline.close()``
-# calls ``cp.get_default_memory_pool().free_all_blocks()`` on the GPU
+# Process-wide memo of the subject-invariant ``load_inputs`` output: a
+# batch driver running K subjects pays the bundle read exactly once
+# instead of K times.
+# The memo is the CPU portion of Step0Inputs (GPU gathers are
+# NOT cached — ``Step0Pipeline.close()`` calls
+# ``cp.get_default_memory_pool().free_all_blocks()`` on the GPU
 # backend, which would invalidate any device-resident cache anyway,
 # and the GPU gather H2D itself is ~10 ms — cheap to rebuild).
-#
-# The cache is unbounded and grows linearly in the number of distinct
-# (mesh, cbig_code_dir, smooth_sigma, K_hop) tuples seen by the
-# process. The current single-mesh batch usage keeps it at one entry.
-_INPUTS_CACHE: Dict[Tuple, "Step0Inputs"] = {}
-
-
-def _inputs_cache_key(cfg) -> Tuple:
-    """Cache key for the subject-invariant portion of load_inputs."""
-    cbig = str(cfg.cbig_code_dir) if cfg.cbig_code_dir is not None else None
-    return (str(cfg.mesh), cbig, float(cfg.smooth_sigma), int(cfg.K_hop))
+_INPUTS_CPU: Optional["Step0Inputs"] = None
 
 
 # ─────────────────────────────────────────────────────────────────────
-# GPU-mirror builder. Called twice (once on cache-hit, once on
-# fresh-load) — factored out so the two paths share one source of truth
-# for what the GPU mirrors are and how to build them.
+# GPU-mirror builder: the device copies ``load_inputs`` adds to the
+# memoised CPU blob on the gpu backend.
 # ─────────────────────────────────────────────────────────────────────
 def _build_gpu_mirrors(cpu: "Step0Inputs", backend: str) -> Dict[str, Any]:
     """Build the 6 GPU-mirror fields from a CPU-only :class:`Step0Inputs`.
@@ -153,12 +141,8 @@ def _build_gpu_mirrors(cpu: "Step0Inputs", backend: str) -> Dict[str, Any]:
 class Step0Inputs:
     """Subject-independent loaded inputs for a step-0 run.
 
-    Keyed by ``(cfg.mesh, cfg.smooth_sigma, cfg.K_hop)``, so a
-    multi-subject driver can hoist the load once. Cached load reads
-    raw ``.npy`` files and needs no atlas; cold rebuild via
-    :mod:`arealmshbm.precompute.step0_inputs_builder` reads a CBIG
-    checkout (``cfg.cbig_code_dir`` / ``$CBIG_CODE_DIR``) for the
-    midthickness atlas + FreeSurfer source meshes.
+    A multi-subject driver loads it once. Read from the shipped
+    bundle (:mod:`.inputs_bundle`) — raw ``.npy`` files, no atlas dir.
     """
     medial_mask: np.ndarray             # (N_full,) bool — lh first, rh second
     n_lh: int
@@ -177,21 +161,22 @@ class Step0Inputs:
     lh_mid_faces: np.ndarray            # (Flh, 3) int32
     rh_mid_verts: np.ndarray
     rh_mid_faces: np.ndarray
-    # surface_smoothing mesh-only precomputation (per hemi). Each is a
-    # 7-tuple (va, n1_indptr, n1_idx, n1_dist, n2_indptr, n2_idx,
-    # n2_dist) — built once at load_inputs by prepare_smoothing_mesh.
+    # surface_smoothing mesh-only tables (per hemi). Each is a 7-tuple
+    # (va, n1_indptr, n1_idx, n1_dist, n2_indptr, n2_idx, n2_dist):
+    # vertex areas + the 1-ring and across-face neighbor CSRs with
+    # their distances.
     lh_smooth_prep: Tuple[np.ndarray, ...]
     rh_smooth_prep: Tuple[np.ndarray, ...]
-    # surface_smoothing gather cache (per hemi). The pair
+    # surface_smoothing gather (per hemi). The pair
     # (gather_W: csr_matrix, inv_weight_sum: ndarray) depends only on
-    # mesh + roi + cfg.smooth_sigma — all subject-invariant on a fixed
-    # mesh — so we run the per-source Dijkstra exactly once at
-    # load_inputs and reuse the CSR across every iter_a call.
+    # the mesh, the roi and the 2.55 mm smoothing sigma — all
+    # subject-invariant — so the per-source Dijkstra result ships in
+    # the bundle and
+    # the CSR is reused across every iter_a call.
     lh_smooth_gather: Any
     rh_smooth_gather: Any
-    # surface_gradient mesh-only precomputation (per hemi). Each is a
-    # 4-tuple (deg, nbors, vn, va) from prepare_gradient_mesh — also
-    # subject-independent.
+    # surface_gradient mesh-only tables (per hemi). Each is a 4-tuple
+    # (deg, nbors, vn, va) — also subject-independent.
     lh_grad_prep: Tuple[np.ndarray, ...]
     rh_grad_prep: Tuple[np.ndarray, ...]
     # neighbor tables on the cortex-only space
@@ -272,10 +257,8 @@ def _prefetch_session_bold(
 ) -> np.ndarray:
     """Worker body for the internal BOLD pool.
 
-    Lifted to module scope (vs. the prior closure in ``run()``) so the
-    same body can be reached from both the in-pipeline pool and (via
-    ``_step0_bold_prefetcher._load_session_bold_cpu``) the driver
-    pool — one source of truth for "what a session load is".
+    Same read → concat → medial-drop sequence as the driver pool's
+    ``_step0_bold_prefetcher._load_session_bold_cpu``.
 
     Always CPU IO regardless of ``cfg.backend`` — same as the unified
     driver's Step0BoldPrefetcher: parallel CPU decode hides fully
@@ -299,8 +282,7 @@ def _bold_session_getter(
 
     If ``cfg.bold_provider`` is non-None, yield it directly (driver
     owns the worker pool). Otherwise spin up a per-subject pool with
-    the same bounded sliding-window semantics as the prior in-line
-    code, and shut it down on exit.
+    bounded sliding-window semantics, and shut it down on exit.
     """
     if cfg.bold_provider is not None:
         yield cfg.bold_provider
@@ -367,7 +349,7 @@ class Step0Pipeline:
       * ``load_inputs() -> Step0Inputs``         — read fsaverage6 meshes + neighbors.
       * ``run(inputs=None) -> Step0Result``      — execute subgraphs A→B→C→D.
       * ``save(result) -> dict[str, Path]``      — write .mat / .npy artifacts.
-      * ``close()``                              — drop refs (no GPU pool here).
+      * ``close()``                              — drop refs; on gpu, free the CuPy pools.
 
     Pipeline is also a context manager.
     """
@@ -411,63 +393,25 @@ class Step0Pipeline:
     # Stage 1: load inputs (subject-independent)
     # =================================================================
     def load_inputs(self) -> Step0Inputs:
-        """Resolve the subject-invariant inputs in three tiers, fastest first.
+        """Load the subject-invariant inputs.
 
-        1. **Process cache** (``_INPUTS_CACHE``) — ~36 ms for batch hits.
-        2. **On-disk .npy cache** — ~30-100 ms cold-start vs ~3.0 s for
-           the live rebuild path. Keyed on
-           ``(mesh, smooth_sigma, K_hop)``. Built by
-           :mod:`arealmshbm.precompute.step0_inputs_builder`.
-        3. **Live rebuild** (``build_step0_inputs``) — only on first
-           cold start, after which the on-disk cache is written so
-           subsequent processes hit tier 2.
+        The CPU-side blob comes from the process memo
+        (``_INPUTS_CPU``) when this process has already read it, else
+        from the shipped bundle (:mod:`.inputs_bundle`, ~30-100 ms).
+        The bundle is an asset: none staged raises
+        ``FileNotFoundError``.
 
-        GPU mirrors are populated via :func:`_build_gpu_mirrors`
-        regardless of which tier resolves the CPU-side blob.
+        GPU mirrors are populated via :func:`_build_gpu_mirrors`.
         """
         cfg = self.cfg
         t0 = time.perf_counter()
 
-        # ── Tier 1: process cache ──────────────────────────────────────
-        key = _inputs_cache_key(cfg)
-        cached = _INPUTS_CACHE.get(key)
-        if cached is not None:
-            inputs = replace(cached, **_build_gpu_mirrors(cached, cfg.backend))
-            self.timings["load_inputs"] = time.perf_counter() - t0
-            self._inputs = inputs
-            return inputs
+        global _INPUTS_CPU
+        if _INPUTS_CPU is None:
+            _INPUTS_CPU = load_inputs_bundle()
+        cpu = _INPUTS_CPU
 
-        # ── Tier 2: on-disk .npy cache ─────────────────────────────────
-        from .inputs_cache import (
-            cache_dir_for, cache_exists, load_cached_inputs, save_inputs,
-        )
-        cache_dir = cache_dir_for(cfg)
-        if cache_exists(cache_dir):
-            cached_cpu = load_cached_inputs(cache_dir)
-        else:
-            # ── Tier 3: live rebuild (only on first cold start) ────────
-            # All heavy precomputation lives in
-            # arealmshbm/precompute/step0_inputs_builder.py, shared with
-            # the cache-builder CLI. We call it here once on first run
-            # and write the result to disk so tier 2 wins next time.
-            from arealmshbm.precompute.step0_inputs_builder import (
-                build_step0_inputs,
-            )
-            cached_cpu = build_step0_inputs(cfg)
-            try:
-                save_inputs(cached_cpu, cache_dir, cfg)
-            except OSError as e:
-                warnings.warn(
-                    f"step0 inputs cache write failed at {cache_dir} "
-                    f"({type(e).__name__}: {e}); will rebuild next process.",
-                    RuntimeWarning, stacklevel=2)
-
-        # Stash in process cache so any further Step0Pipeline in this
-        # process hits tier 1.
-        _INPUTS_CACHE[key] = cached_cpu
-
-        self._inputs = replace(
-            cached_cpu, **_build_gpu_mirrors(cached_cpu, cfg.backend))
+        self._inputs = replace(cpu, **_build_gpu_mirrors(cpu, cfg.backend))
         self.timings["load_inputs"] = time.perf_counter() - t0
         return self._inputs
 
@@ -536,8 +480,9 @@ class Step0Pipeline:
 
         Per-session: fc_similarity (cuBLAS-heavy) → surface_gradient
         (RawKernel) → per-iter_a accumulator. Per-block: average →
-        smoothing (cuSPARSE SpMM) → find_minima (CPU numba) →
-        watershed (RawKernel) → edge count.
+        smoothing (cuSPARSE SpMM) → find_minima (RawKernel) →
+        watershed (RawKernel) → edge count. That is the gpu backend;
+        the cpu backend runs the numba / BLAS / scipy twins.
 
         Returns dict with: edge_density (N_cortex,) fp32, iter_a,
         num_sample_S, block_size_a.
@@ -636,8 +581,7 @@ class Step0Pipeline:
                     )
                 per_stage["surface_gradient"] += time.perf_counter() - t_g
 
-                # Device-stay accumulator (PR #56-pattern refactor for
-                # subgraph A): on GPU ``grads`` is cp.ndarray, so the
+                # Device-stay accumulator: on GPU ``grads`` is cp.ndarray, so the
                 # comparison + add stay on device. block_sums/counts
                 # slots are cp.ndarray throughout the iter_a × num_sess
                 # loop — no per-iter D2H/H2D ping-pong.
@@ -670,7 +614,7 @@ class Step0Pipeline:
         for i in range(iter_a):
             if cfg.backend == "gpu":
                 # ``cp`` already in local scope from the gpu-branch
-                # import at function head (line ~567).
+                # import at function head.
                 # Device-stay avg: block_counts/sums are cp.ndarray
                 # already (see device-stay accumulator above). cp.where
                 # produces a cp.ndarray; no NEP-18 dispatch ambiguity,
@@ -838,7 +782,7 @@ class Step0Pipeline:
         """Diffusion embedding (per hemi) — wraps mapalign's Lanczos.
 
         On GPU, ``lh_dist`` / ``rh_dist`` arrive as cupy ndarrays;
-        diffmap runs eigsh on cuSOLVER. The embeddings are always
+        diffmap runs cupyx eigsh (cuBLAS matvecs). The embeddings are always
         materialised to host (consumed by subgraph D); the distance
         matrices are D2H'd **only when ``cfg.save_geodesic_distance``
         is True**. No production downstream step reads the on-disk
@@ -957,17 +901,15 @@ class Step0Pipeline:
             {lh,rh}_emb_<num_comp>_distance_matrix.mat       (N_full, num_comp) fp32 — key 'emb'
 
         Which emb format(s) are written is controlled by
-        ``cfg.emb_output_format`` (``'npy'`` default, ``'mat'`` legacy,
-        ``'both'`` for validation).
+        ``cfg.emb_output_format`` (``'npy'`` default, ``'mat'`` the CBIG
+        MATLAB format, ``'both'`` for validation).
 
         The ``gradient_distance_matrix.npy`` pair is gated by
         ``cfg.save_geodesic_distance`` (default False) — these are
         step0 intermediate outputs (~672 MB per hemi per subject) that
         no production downstream step reads. Skipping the dump removes
-        ~53.6 GB of writes on a 40-subject fsa6 run and cuts step0
-        wall noticeably (the writes were physically flushing for tens
-        of seconds after step0 finished, on top of the actual step0
-        compute). Toggle on for ad-hoc cohort-comparison archaeology
+        ~53.6 GB of writes on a 40-subject fsa6 run. Toggle on for
+        ad-hoc cohort-comparison archaeology
         (via the internal step-0 CPU/GPU diff harness).
         """
         out_dir = Path(out_dir) if out_dir is not None else self.cfg.gradients_out_dir

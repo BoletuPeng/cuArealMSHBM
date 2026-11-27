@@ -16,7 +16,7 @@ What is pinned
 --------------
 1. **Bit-exact packed output** vs that oracle, for single-run and
    multi-run sessions, with and without a censor vector.
-2. **The ``cp.nan_to_num`` removal is a no-op on the result** --
+2. **Skipping ``cp.nan_to_num`` is a no-op on the result** --
    including the three cases it exists for: an exactly constant
    column, a near-constant column whose ``post_sumsq`` cancels to
    ``<= 0``, and a column carrying a genuine ``NaN`` / ``+-inf`` in the

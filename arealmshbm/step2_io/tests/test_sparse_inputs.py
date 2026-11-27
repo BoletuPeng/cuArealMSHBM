@@ -35,8 +35,6 @@ from arealmshbm.step2_io.tests._layout_oracle import (
     layouts_equal,
 )
 from arealmshbm.step2_io.tests._synthetic_project import (
-    SEED,
-    TARG,
     load_project,
     make_project,
 )
@@ -106,7 +104,7 @@ def test_a_second_subject_with_another_D_unpacked_raises(
     raw2 = (rng.random((T, N, 12)) < 0.4).astype(np.float32)
     raw2[:, refs["mw"], :] = 0.0
     raw2[:, refs["n_h"] + refs["mw"], :] = 0.0
-    write_subject_profile_tnd(profile_path(tmp_path, "2", TARG, SEED),
+    write_subject_profile_tnd(profile_path(tmp_path, "2"),
                               np.ascontiguousarray(raw2))
     assert (11 + 7) // 8 == (12 + 7) // 8      # the shapes really do agree
 
@@ -127,7 +125,7 @@ def test_a_second_subject_with_fewer_sessions_raises(tmp_path: Path) -> None:
     raw2 = (rng.random((1, refs["N"], refs["D"])) < 0.4).astype(np.float32)
     raw2[:, refs["mw"], :] = 0.0
     raw2[:, refs["n_h"] + refs["mw"], :] = 0.0
-    write_subject_profile_tnd(profile_path(tmp_path, "2", TARG, SEED),
+    write_subject_profile_tnd(profile_path(tmp_path, "2"),
                               np.ascontiguousarray(raw2))
 
     inp = load_project(cfg, refs)
@@ -156,7 +154,7 @@ def test_mixed_gradient_suffix_raises(tmp_path: Path) -> None:
     sio.savemat(rh.with_suffix(".mat"), {"emb": np.load(rh)})
     rh.unlink()
     backfill_cohort_json(tmp_path, subjects=["1", "2"], sessions=["1", "2"],
-                         targ_mesh=TARG, seed_mesh=SEED, n_grad_components=4)
+                         n_grad_components=4)
     with pytest.raises(ValueError, match="mixed gradient suffix"):
         load_project(cfg, refs)
 
@@ -169,10 +167,6 @@ def test_cohort_disagreement_raises(tmp_path: Path) -> None:
     cfg.num_sub = 2
     cfg.num_session = 5
     with pytest.raises(ValueError, match="num_session"):
-        load_project(cfg, refs)
-    cfg.num_session = 2
-    cfg.seed_mesh = "fsaverage4"
-    with pytest.raises(ValueError, match="seed_mesh"):
         load_project(cfg, refs)
 
 
@@ -228,7 +222,7 @@ def test_bench_inputs_match_the_dense_path() -> None:
     assert inp.layout.L == 300 and inp.layout.P == 586522
 
     lh_b, rh_b = load_spatial_mask(
-        _BENCH_PROJ / "spatial_mask" / "spatial_mask_fsaverage6.mat")
+        _BENCH_PROJ / "spatial_mask" / "spatial_mask.mat")
     bm = build_step2_boundary_mask(lh_boundary=lh_b, rh_boundary=rh_b,
                                    mode="gMSHBM")
     assert layouts_equal(inp.layout, build_step2_layout_dense(bm))

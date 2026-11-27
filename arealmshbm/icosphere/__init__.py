@@ -11,8 +11,7 @@ For a frequency-T subdivision of the regular icosahedron:
     E = 30·T²
 
 Workbench's ``-surface-create-sphere N`` chooses the minimum T such
-that V(T) ≥ N. For N = 12801 this is T = 36 → V = 12962, matching the
-on-disk ``lh_down_sphere_verts.npy``.
+that V(T) ≥ N. For N = 12801 this is T = 36 → V = 12962.
 
 This module implements **frequency-T (class I) geodesic
 subdivision**, not power-of-2 recursive subdivision — recursive can

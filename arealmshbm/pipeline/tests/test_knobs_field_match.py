@@ -20,10 +20,6 @@ referencing phantom ones. We catch both at PR time.
 The one explicit-exception name divergence is documented in
 ``test_step1_radius_mask_radius_mm_maps_to_run_radius_mask`` (catalog
 uses the longer name; runner uses ``radius_mm``).
-
-The ``enable_tf32`` knob in Step0Knobs is consumed by the driver's
-tf32_scope wrapper (NOT by Step0Config), so it is excluded from the
-Knobs↔leaf-Config comparison via ``_NON_LEAF_CONFIG_FIELDS`` below.
 """
 from __future__ import annotations
 
@@ -41,12 +37,6 @@ from arealmshbm.pipeline import step1_runners
 from arealmshbm.step0_pipeline.config import Step0Config
 from arealmshbm.step2_pipeline.config import Step2Config
 from arealmshbm.step3_pipeline.config import Step3Config
-
-
-# Knobs fields that the driver consumes directly (e.g. wrapping the
-# leaf pipeline in a context manager) rather than splatting through
-# to the leaf Config. Excluded from the Knobs ↔ leaf-Config name match.
-_NON_LEAF_CONFIG_FIELDS = frozenset({"enable_tf32"})
 
 
 def _find_repo_root() -> Path:
@@ -87,11 +77,9 @@ def _catalog_step_keys(section: str) -> set[str]:
 # Step 0 — Knobs ↔ leaf Config name match
 # ─────────────────────────────────────────────────────────────────────
 def test_step0_knobs_field_names_match_step0config() -> None:
-    """Every Step0Knobs algorithm field (excluding driver-only fields
-    like enable_tf32) must exist as a Step0Config field, so the
-    driver's `**asdict(k0)` splat is safe after popping the driver-
-    only fields."""
-    knobs = set(Step0Knobs.__dataclass_fields__) - _NON_LEAF_CONFIG_FIELDS
+    """Every Step0Knobs field must exist as a Step0Config field, so
+    the driver's `**asdict(k0)` splat is safe."""
+    knobs = set(Step0Knobs.__dataclass_fields__)
     cfg = set(Step0Config.__dataclass_fields__)
     missing = knobs - cfg
     assert not missing, (
@@ -109,21 +97,6 @@ def test_step1_threshold_param_exists_on_runner() -> None:
         step1_runners.run_generate_profiles).parameters
 
 
-def test_step1_split_flag_param_exists_on_runner() -> None:
-    assert "split_flag" in inspect.signature(
-        step1_runners.run_generate_profiles).parameters
-
-
-def test_step1_profile_dtype_param_exists_on_runner() -> None:
-    assert "profile_dtype" in inspect.signature(
-        step1_runners.run_ini_params).parameters
-
-
-def test_step1_reduction_dtype_param_exists_on_runner() -> None:
-    assert "reduction_dtype" in inspect.signature(
-        step1_runners.run_ini_params).parameters
-
-
 def test_step1_radius_mask_radius_mm_maps_to_run_radius_mask() -> None:
     """The runner parameter is named ``radius_mm`` (not
     ``radius_mask_radius_mm``); the driver maps explicitly. This test
@@ -138,7 +111,7 @@ def test_step1_radius_mask_radius_mm_maps_to_run_radius_mask() -> None:
 # Step 2 — Knobs ↔ leaf Config name match
 # ─────────────────────────────────────────────────────────────────────
 def test_step2_knobs_field_names_match_step2config() -> None:
-    knobs = set(Step2Knobs.__dataclass_fields__) - _NON_LEAF_CONFIG_FIELDS
+    knobs = set(Step2Knobs.__dataclass_fields__)
     cfg = set(Step2Config.__dataclass_fields__)
     missing = knobs - cfg
     assert not missing, (
@@ -152,7 +125,7 @@ def test_step2_knobs_field_names_match_step2config() -> None:
 # Step 3 — Knobs ↔ leaf Config name match
 # ─────────────────────────────────────────────────────────────────────
 def test_step3_knobs_field_names_match_step3config() -> None:
-    knobs = set(Step3Knobs.__dataclass_fields__) - _NON_LEAF_CONFIG_FIELDS
+    knobs = set(Step3Knobs.__dataclass_fields__)
     cfg = set(Step3Config.__dataclass_fields__)
     missing = knobs - cfg
     assert not missing, (
@@ -167,7 +140,7 @@ def test_step3_knobs_field_names_match_step3config() -> None:
 #
 # The catalog is docs-only (correct call: pipeline doesn't read it at
 # runtime), so these tests pin catalog entry keys to Knobs field names:
-# renaming `smooth_sigma` in Step0Knobs must not leave step0.json
+# renaming `watershed_frac` in Step0Knobs must not leave step0.json
 # referencing a phantom field.
 # ─────────────────────────────────────────────────────────────────────
 def test_catalog_step0_keys_match_step0knobs() -> None:

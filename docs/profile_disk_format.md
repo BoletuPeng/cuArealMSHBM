@@ -1,6 +1,6 @@
 # Per-subject RSFC profile on-disk format
 
-`profiles_raw/sub<S>/sub<S>_<targ>_roi<seed>.profile.b2nd` is the
+`profiles_raw/sub<S>/sub<S>.profile.b2nd` is the
 production format for the binary 0/1 RSFC profile that step1 emits and
 step1's avg_profiles / step2's BOLD loader / step3's `fetch_data` (`cpu`)
 and `fetch_packed_bold_TND` (`gpu`) consume. One on-disk format:
@@ -29,11 +29,10 @@ takes the whole unpacked binary `(T, N, D)` subject and packs it
 T=, N=, D_unpacked=)` takes already-packed `(N, ⌈D/8⌉)` slabs a
 **session** at a time — `write_session(t, slab)` compresses exactly
 chunk `t`, `close()` finalises (the GPU leaf's writer, and the way
-to write packed bytes verbatim). Because the chunk shape has always been
-one session, the two produce the same payload: same `chunks`, same
-auto-computed `blocks`, same LZ4-5 + bitshuffle `cparams`, same three
-vlmeta keys. Readers cannot tell them apart, and there is no
-`format_version` bump — nothing the tag pins has changed.
+to write packed bytes verbatim). Both chunk by one session, so the two
+produce the same payload: same `chunks`, same auto-computed `blocks`,
+same LZ4-5 + bitshuffle `cparams`, same three vlmeta keys. Readers
+cannot tell them apart.
 
 `format_version` is stamped **last**, by `close()`, after every session
 chunk has been written (`D_unpacked` / `bit_order` are stamped up

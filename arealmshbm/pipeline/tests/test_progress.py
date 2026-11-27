@@ -410,8 +410,6 @@ def _write_minimal_mode_a_project(root: Path) -> Path:
     (project / "bold_inputs.json").write_text(json.dumps({
         "schema_version": "1",
         "dataset_name": "test_progress_fixture",
-        "targ_mesh": "fsaverage6",
-        "seed_mesh": "fsaverage3",
         "subjects": [{"id": "1", "sessions": [
             {"id": "1",
              "lh": str(project / "lh.dummy.func.gii"),

@@ -83,10 +83,10 @@ from it:
    (`gpu`, `vmf_clustering/vmf_clustering_gpu.py`)** — both read the
    spec at construction and gate which sub-Sessions get built and which
    calls fire per iter; no per-variant Session subclass.
-3. **`Step3Pipeline.save`** — applies the cMSHBM final
-   `RemoveIsolatedSurfaceComponents(5)` cleanup; passes `beta=None`
-   for dMSHBM, so `save_parcellation` writes `...` instead of
-   `..._beta<B>`.
+3. **`Step3Pipeline.save` → `save_parcellation`** — `save` applies the
+   cMSHBM final `RemoveIsolatedSurfaceComponents(5)` cleanup and hands
+   the labels over; `save_parcellation` picks the `..._beta<B>` vs `...`
+   filename based on whether `beta` is set.
 
 The "no spatial prior" cases (dMSHBM both, cMSHBM connect) are
 implemented by feeding the existing fused E-step kernel zero `(N, L)`

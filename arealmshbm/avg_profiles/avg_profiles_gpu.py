@@ -272,15 +272,13 @@ class PackedProfileAccumulator:
 
 def avg_profiles_from_accumulator(
     acc: PackedProfileAccumulator,
-    targ_mesh: str,
-    seed_mesh: str,
     out_dir,
     *,
     save: bool = True,
 ) -> AvgProfilesResult:
     """Turn the device sums into the cohort mean and start the ``.npy`` write.
 
-    ``acc`` must have been built for ``targ_mesh`` (its hemi sizes are
+    ``acc`` must have been built for the mesh (its hemi sizes are
     checked) and fed complete subjects only: at least one, the last one
     with all ``num_sess`` sessions. The mean is taken IN PLACE on
     ``acc.lh`` / ``acc.rh`` -- they become the result's ``lh_avg_dev``
@@ -304,10 +302,6 @@ def avg_profiles_from_accumulator(
         raise RuntimeError(
             "avg_profiles_from_accumulator: the mean was already taken from "
             "this accumulator; build a new one for another cohort")
-    if "fsaverage" not in targ_mesh:
-        raise ValueError(
-            f"avg_profiles_from_accumulator: only fsaverage* targ_mesh "
-            f"supported, got {targ_mesh!r}.")
     if acc.n_pairs <= 0:
         raise ValueError(
             "avg_profiles_from_accumulator: no session was accumulated")
@@ -316,11 +310,11 @@ def avg_profiles_from_accumulator(
             f"avg_profiles_from_accumulator: the last subject is incomplete "
             f"({acc.n_pairs % acc.num_sess} of num_sess={acc.num_sess} "
             f"sessions were folded in)")
-    V_lh, V_rh = _hemi_vert_counts(targ_mesh)
+    V_lh, V_rh = _hemi_vert_counts()
     if (V_lh, V_rh) != (acc.V_lh, acc.V_rh):
         raise ValueError(
             f"avg_profiles_from_accumulator: accumulator hemi sizes "
-            f"({acc.V_lh}, {acc.V_rh}) != {targ_mesh!r} ({V_lh}, {V_rh})")
+            f"({acc.V_lh}, {acc.V_rh}) != the mesh's ({V_lh}, {V_rh})")
     out_dir = Path(out_dir)
     if save:
         (out_dir / "profiles" / "avg_profile").mkdir(parents=True, exist_ok=True)
@@ -340,12 +334,10 @@ def avg_profiles_from_accumulator(
     acc.lh.get(out=lh_acc)
     acc.rh.get(out=rh_acc)
 
-    lh_out, rh_out = _avg_paths(out_dir, targ_mesh, seed_mesh)
+    lh_out, rh_out = _avg_paths(out_dir)
     writer: Optional[BackgroundWriteHandle] = None
     if save:
-        writer = _start_avg_npy_pair_async(
-            out_dir, targ_mesh, seed_mesh, lh_acc, rh_acc,
-        )
+        writer = _start_avg_npy_pair_async(out_dir, lh_acc, rh_acc)
 
     return AvgProfilesResult(
         lh_path=lh_out, rh_path=rh_out,
@@ -356,8 +348,6 @@ def avg_profiles_from_accumulator(
 
 
 def avg_profiles_gpu(
-    seed_mesh: str,
-    targ_mesh: str,
     out_dir,
     num_sub,
     num_sess,
@@ -395,20 +385,15 @@ def avg_profiles_gpu(
       host copy of each hemi. It is released to cupy's pinned pool when
       the caller drops the result.
     """
-    if "fsaverage" not in targ_mesh:
-        raise ValueError(
-            f"avg_profiles_gpu: only fsaverage* targ_mesh supported, "
-            f"got {targ_mesh!r}."
-        )
     num_sub = int(num_sub)
     num_sess = int(num_sess)
     out_dir = Path(out_dir)
     (out_dir / "profiles" / "avg_profile").mkdir(parents=True, exist_ok=True)
 
-    V_lh, V_rh = _hemi_vert_counts(targ_mesh)
+    V_lh, V_rh = _hemi_vert_counts()
 
     sub_paths, packed_arrs, T0, _N0, _D0_bytes, D0 = _discover_and_decode_subjects(
-        out_dir, targ_mesh, seed_mesh, num_sub, num_sess, V_lh, V_rh, verbose,
+        out_dir, num_sub, num_sess, V_lh, V_rh, verbose,
     )
 
     acc = PackedProfileAccumulator(V_lh, V_rh, D0, T0)
@@ -420,9 +405,7 @@ def avg_profiles_gpu(
         if verbose:
             print(f"current subject:{sub}")
 
-    res = avg_profiles_from_accumulator(
-        acc, targ_mesh, seed_mesh, out_dir, save=True,
-    )
+    res = avg_profiles_from_accumulator(acc, out_dir, save=True)
     res.writer.wait()
     # Drop the device accumulators: no consumer on this path, and the
     # frozen dataclass cannot be mutated in place. ``del res`` / ``del

@@ -74,7 +74,6 @@ def profile_backend(sub: str, backend: str, *,
         num_session=int(args.num_session),
         num_clusters=int(args.num_clusters),
         subid=1,
-        mesh=args.mesh,
         w=float(args.w),
         c=float(args.c),
         beta_scalar=float(args.beta),
@@ -168,7 +167,6 @@ def main(argv: Optional[List[str]] = None) -> int:
                    default=["cpu", "gpu"],
                    choices=["cpu", "gpu"])
     p.add_argument("--project-root", default=str(_DEFAULT_PROJECT_ROOT))
-    p.add_argument("--mesh", default="fsaverage6")
     p.add_argument("--w", type=float, default=50.0)
     p.add_argument("--c", type=float, default=10.0)
     p.add_argument("--beta", type=float, default=5.0)

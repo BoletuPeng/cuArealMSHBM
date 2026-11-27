@@ -2,7 +2,7 @@
 
 ``make_project`` writes everything ``load_step2_sparse_inputs`` reads —
 per-subject bit-packed ``.b2nd`` BOLD, per-subject gradient embeddings,
-``group/group.mat``, ``spatial_mask/spatial_mask_<mesh>.mat`` and
+``group/group.mat``, ``spatial_mask/spatial_mask.mat`` and
 ``cohort.json`` — for a cohort small enough to drive the CPU master in a
 second; ``load_project`` loads it back with ``load_avg_mesh`` standing
 in as the tiny fake mesh the project was written for (only
@@ -28,8 +28,6 @@ from arealmshbm.data_io.cohort import backfill_cohort_json
 from arealmshbm.data_io.profile_io import profile_path, write_subject_profile_tnd
 from arealmshbm.step2_io import load_step2_sparse_inputs
 from arealmshbm.step2_pipeline.config import Step2Config
-
-TARG, SEED = "fsaverage6", "fsaverage3"
 
 
 def make_project(root: Path, *, S: int = 2, T: int = 2, n_h: int = 9,
@@ -64,7 +62,7 @@ def make_project(root: Path, *, S: int = 2, T: int = 2, n_h: int = 9,
                 raw[:, n_h + mw_idx, :] = 0.0       # RH medial wall
         else:
             raw = np.ascontiguousarray(bold[s - 1])
-        write_subject_profile_tnd(profile_path(root, str(s), TARG, SEED),
+        write_subject_profile_tnd(profile_path(root, str(s)),
                                   np.ascontiguousarray(raw))
         raws.append(raw)
 
@@ -108,7 +106,7 @@ def make_project(root: Path, *, S: int = 2, T: int = 2, n_h: int = 9,
             m[3, 0] = 1.0                            # no empty column
     else:
         lh_b, rh_b = (np.asarray(m, dtype=np.float64) for m in boundary)
-    sio.savemat(root / "spatial_mask" / f"spatial_mask_{TARG}.mat",
+    sio.savemat(root / "spatial_mask" / "spatial_mask.mat",
                 {"lh_boundary": sp.csc_matrix(lh_b),
                  "rh_boundary": sp.csc_matrix(rh_b)},
                 do_compression=True, format="5")
@@ -116,11 +114,10 @@ def make_project(root: Path, *, S: int = 2, T: int = 2, n_h: int = 9,
     backfill_cohort_json(root,
                          subjects=[str(s) for s in range(1, S + 1)],
                          sessions=[str(t) for t in range(1, T + 1)],
-                         targ_mesh=TARG, seed_mesh=SEED,
                          n_grad_components=n_grad)
 
     cfg = Step2Config(project_dir=root, num_sub=S, num_session=T,
-                      num_clusters=L, mesh=TARG, seed_mesh=SEED,
+                      num_clusters=L,
                       n_grad_components=n_grad)
     refs = {"raws": raws, "grads": grads, "mtc": mtc,
             "lh_b": lh_b, "rh_b": rh_b, "n_h": n_h, "N": N, "L": L, "D": D,
@@ -141,5 +138,5 @@ def load_project(cfg, refs, *, overlap: bool = True):
     mod = importlib.import_module("arealmshbm.data_io.load_avg_mesh")
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(mod, "load_avg_mesh",
-                   lambda hemi, mesh, surf: {"MARS_label": lab})
+                   lambda hemi, surf: {"MARS_label": lab})
         return load_step2_sparse_inputs(cfg, overlap=overlap)

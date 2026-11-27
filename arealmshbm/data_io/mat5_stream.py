@@ -6,7 +6,7 @@ expensive:
 
 * ``group/group.mat`` holds a 22 MB ``lambda`` next to the 2.7 MB ``mtc``
   the pipeline actually wants;
-* ``spatial_mask/spatial_mask_<mesh>.mat`` holds two MATLAB-*sparse*
+* ``spatial_mask/spatial_mask.mat`` holds two MATLAB-*sparse*
   arrays that ``loadmat`` hands back as scipy sparse, which the dense
   step-2 path then densifies to 98 MB of fp64 only for the sparse
   layout builder to scan the nonzeros back out.

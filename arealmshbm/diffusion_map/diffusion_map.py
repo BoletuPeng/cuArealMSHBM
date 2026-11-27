@@ -59,7 +59,8 @@ Connectedness precondition:
     silently produce ``inf`` / ``nan`` on a disconnected input (zero
     in ``d2`` or a non-trivial unit eigenvalue). The CBIG step-0
     caller satisfies this — the gradient distance matrix comes from a
-    single icosphere component — so we don't guard at runtime.
+    single icosphere component — so the only runtime guard is the
+    near-zero stationary-entry check before step 5.
 
 Memory note:
     For N=12962 the dense fp64 affinity is ~1.35 GB. With

@@ -91,17 +91,16 @@ def _run_hemi(hemi: str, mesh_d: dict, labels: np.ndarray,
 
 def generate_radius_mask(lh_labels: np.ndarray,
                          rh_labels: np.ndarray,
-                         mesh: str,
                          radius,
                          out_dir,
                          verbose: bool = True,
                          backend: str = "cpu",
                          atlas_dir: Optional[str] = None,
                          ) -> dict:
-    """Per-parcel radius mask + central-sulcus truncation on a
-    fsaverage* mesh.
+    """Per-parcel radius mask + central-sulcus truncation on the
+    fsaverage6 mesh.
 
-    Pipeline (per hemi, fully numba-jit'd):
+    Pipeline (per hemi; numba kernels after the numpy mesh-CSR build):
 
       build_mesh_csr → classify_central_relevance → central_sulcus
       → add_spatial_constraint → truncate.
@@ -112,18 +111,12 @@ def generate_radius_mask(lh_labels: np.ndarray,
     ----------
     lh_labels, rh_labels : (V,) int — per-hemi parcel labels, 1..L
                            with 0 = medial wall.
-    mesh    : 'fsaverage6' / 'fsaverage5' / 'fsaverage'. ``backend='gpu'``
-              additionally requires V <= 90080 (the SSSP frontier
-              bitmask is static shared memory — see
-              :func:`_kernels_gpu._sssp_module`), so **fsaverage
-              (V=163842) is CPU-only**; fsaverage6 / fsaverage5 are
-              fine on both.
     radius  : float or string mm (e.g. 30 or '30').
     out_dir : path; output written to
-              ``<out_dir>/spatial_mask/spatial_mask_<mesh>.mat``.
+              ``<out_dir>/spatial_mask/spatial_mask.mat``.
     verbose : print per-stage banners.
     atlas_dir : atlas-dir override for the
-                ``<mesh>/label/<hemi>.aparc.annot`` lookup; ``None`` ⇒
+                ``fsaverage6/label/<hemi>.aparc.annot`` lookup; ``None`` ⇒
                 ``MSHBM_ATLAS_DIR``. Mesh geometry comes from the
                     shipped avg_mesh bundles, not from here.
 
@@ -133,7 +126,7 @@ def generate_radius_mask(lh_labels: np.ndarray,
     if backend == "gpu":
         from .radius_mask_gpu import generate_radius_mask_gpu
         return generate_radius_mask_gpu(
-            lh_labels=lh_labels, rh_labels=rh_labels, mesh=mesh,
+            lh_labels=lh_labels, rh_labels=rh_labels,
             radius=radius, out_dir=out_dir, verbose=verbose,
             atlas_dir=atlas_dir,
         )
@@ -142,10 +135,10 @@ def generate_radius_mask(lh_labels: np.ndarray,
     radius_f = float(radius)
     timings: dict = {}
 
-    lh_mesh = load_avg_mesh("lh", mesh, "inflated")
-    rh_mesh = load_avg_mesh("rh", mesh, "inflated")
-    lh_aparc = _read_aparc("lh", mesh, atlas_dir=atlas_dir)
-    rh_aparc = _read_aparc("rh", mesh, atlas_dir=atlas_dir)
+    lh_mesh = load_avg_mesh("lh", "inflated")
+    rh_mesh = load_avg_mesh("rh", "inflated")
+    lh_aparc = _read_aparc("lh", atlas_dir=atlas_dir)
+    rh_aparc = _read_aparc("rh", atlas_dir=atlas_dir)
 
     lh_labels = _coerce_labels(lh_labels)
     rh_labels = _coerce_labels(rh_labels)
@@ -164,7 +157,7 @@ def generate_radius_mask(lh_labels: np.ndarray,
     out_dir = Path(out_dir)
     out_subdir = out_dir / "spatial_mask"
     out_subdir.mkdir(parents=True, exist_ok=True)
-    mat_path = out_subdir / f"spatial_mask_{mesh}.mat"
+    mat_path = out_subdir / "spatial_mask.mat"
     sio.savemat(str(mat_path),
                 {"lh_boundary": lh_sparse, "rh_boundary": rh_sparse},
                 do_compression=True)

@@ -2,9 +2,9 @@
 
 The per-step pipelines (Step0/1/2/3) use the path conventions below.
 :class:`ProjectLayout` names part of them (the user inputs,
-``cohort.json``, ``group.mat``, the spatial mask, the group-prior slot
-and the run logs), and the driver takes its input, prior and log paths
-from it. Other paths are built where they are used, e.g.
+``cohort.json``, ``group.mat``, the group-prior slot and the run
+logs), and the driver takes its input, prior and log paths from it.
+Other paths are built where they are used, e.g.
 ``Step0Config.gradients_out_dir`` for ``gradients/`` and
 ``data_io.profile_io.profile_path`` for ``profiles_raw/``.
 
@@ -16,12 +16,12 @@ Path conventions::
       cohort.json                     # driver-maintained cache record
       data_list/fMRI_list/{lh,rh}_sub<id>_sess<id>.txt
       gradients/sub<id>/{lh,rh}_emb_<N>_distance_matrix.npy
-      profiles_raw/sub<id>/sub<id>_<targ>_roi<seed>.profile.b2nd
-      profiles/avg_profile/{lh,rh}_<targ>_roi<seed>_avg_profile.npy
+      profiles_raw/sub<id>/sub<id>.profile.b2nd
+      profiles/avg_profile/{lh,rh}_avg_profile.npy
       group/group.mat
-      spatial_mask/spatial_mask_<mesh>.mat
-      priors/<variant>/beta<X>/Params_Final.mat
-      ind_parcellation_<variant>/<T>_sess/beta<B>/sub<id>/Ind_parcellation_*.mat
+      spatial_mask/spatial_mask.mat
+      priors/<variant>/beta<X>/Params_Final.mat           # no beta<X>/ for dMSHBM
+      ind_parcellation_<variant>/<T>_sess/beta<B>/Ind_parcellation_MSHBM_sub<id>_*.mat
       logs/pipeline_run_<timestamp>.json
 
 (The ``ind_parcellation_*`` segment is owned by ``Step3Config`` —
@@ -67,9 +67,6 @@ class ProjectLayout:
     @property
     def group_mat_path(self) -> Path:
         return self.project_dir / "group" / "group.mat"
-
-    def spatial_mask_path(self, targ_mesh: str) -> Path:
-        return self.project_dir / "spatial_mask" / f"spatial_mask_{targ_mesh}.mat"
 
     # ── group prior (step2 output for Mode B; creator-staged for Mode A) ──
     # ``include_beta`` mirrors the step3 VariantSpec.prior_path_includes_beta

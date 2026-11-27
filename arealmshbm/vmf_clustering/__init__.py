@@ -16,7 +16,7 @@ Composes:
     m_step              — M-step inner-while loop body.
     spatial_priors      — spatial_xyz_prior + spatial_connect_prior.
     V_lambda            — Potts close-form MRF smoothness term.
-    check_connectedness — connectedness BFS + component distance.
+    check_connectedness — connectedness union-find + component distance.
     em_stop_criterion   — EM stop criterion.
     e_step_lambda       — local E-step λ-loop body (in this package).
 

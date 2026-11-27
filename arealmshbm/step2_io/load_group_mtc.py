@@ -1,8 +1,8 @@
 """load_group_mtc.py — step-2 L6 leaf.
 
 Read the step-1 ``group.mat`` written by
-:func:`arealmshbm.ini_params.ini_params.generate_ini_params_xxx`
-(see ``ini_params.py`` lines 202-213). Used by step-2 group-prior
+:func:`arealmshbm.ini_params.ini_params.generate_ini_params` (or its
+GPU twin) through ``ini_params/_group_mat_writer.py``. Used by step-2 group-prior
 estimation to seed the EM (``setting_params.dim = size(mtc, 1) - 1``;
 the loader returns mtc verbatim, downstream code slices as needed).
 

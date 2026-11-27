@@ -64,11 +64,6 @@ scratch buffer once per Phase D call (`_kernels.py`, `session.py`), and
 `s_t_nu` itself stays in `(S, T, L, D)` — the M-step's preferred
 unit-stride-`d` layout — for the whole EM-iter loop.
 
-(An earlier design slotted `s_t_nu_TLD[t].T` straight into a per-session
-strided sgemm and therefore claimed "zero per-iter transpose copies".
-That is not what the code does; the fused `T·D` sgemm was the faster
-trade and it needs the explicit repack.)
-
 ### Contiguity contract for the master kernel
 
 If callers bypass `Step2EmIterSession` and call
@@ -134,22 +129,20 @@ on a dense CuPy port that ran both in fp32; CuPy's
 `-ftz=true` puts the `exp` cliff at −87.3 where fp64 reaches −745): on
 the S=1 bench it killed 5 528 alive vertices vs 1 303 on the CPU, moved
 cost −5 % and `kappa` 954 vs 922, and flipped 4 744 `theta` argmaxes.
-The `gpu` backend's static limits (seed mesh fsaverage3, L ≤ 512,
-n_grad_components ≤ 11772) are its contract: any other configuration
-is rejected at config / driver validation — select `backend_step2='cpu'`
-for it.
+The `gpu` backend's static limits (L ≤ 512, n_grad_components ≤ 11772)
+are its contract: any other configuration is rejected at config
+validation — select `backend_step2='cpu'` for it.
 
 ### Two constants worth stating exactly
 
 * `_LOG_EPS20 = log(eps_f64 ** 20)` = **-720.8730677823431**
-  (fp32: `-720.87305`). The in-code comment's "≈ -720.4391" is stale —
-  the runtime value has always been correct.
-* The E-step's `tmp_idx` (dead-row) test is `log_vmf == 0`, and the
-  in-code warning frames a false positive at a non-medial vertex as
-  unlikely. It is not merely unlikely: at `dim = 1174` it is
+  (fp32: `-720.87305`).
+* The E-step's `tmp_idx` (dead-row) test is `log_vmf == 0`. A false
+  positive at a non-medial vertex is, at `dim = 1174`,
   **impossible for `κ < Cdln(κ) ≈ 2308`**, because an alive row's
   `|lv_sum| ≤ n_alive` bounds `|κ·lv| < n_alive·Cdln`. Production κ sits
-  in [400, 1200]. Restate it as that bound, not as a probability.
+  in [400, 1200]. The `gpu` backend replaces the scan with
+  `n_alive == 0` and warns (`RuntimeWarning`) once κ reaches 2308.
 
 
 ## 3. spatial_connect 0/0 rule

@@ -1,9 +1,10 @@
 """load_group_prior.py
 
-Load the gMSHBM group prior ``Params_Final.mat`` (Mode A).
+Load the group prior ``Params_Final.mat`` for step 3 (every variant,
+both modes).
 
 The group prior holds the trained ``mu``, ``theta``, ``epsil``, ``sigma``
-arrays. In Mode A these are fixed throughout step 3; the EM only updates
+arrays. These are fixed throughout step 3; the EM only updates
 subject-level state.
 
 Reads typical v7 ``.mat`` via :func:`scipy.io.loadmat`; falls back to

@@ -7,9 +7,9 @@ P-layout path (a different ``load_inputs`` / ``initialize_params`` /
 ``run_em`` triple), ``'cpu'`` the numba reference. These tests pin the
 enum membership, the rejection message and the catalog's own copy of the
 enum, so a future rename cannot silently demote a GPU run to CPU, and
-the three static kernel limits of the GPU backend (seed mesh,
-``num_clusters``, ``n_grad_components``) are refused at config time
-rather than in the Session ctor.
+the two static kernel limits of the GPU backend (``num_clusters``,
+``n_grad_components``) are refused at config time rather than after
+step 0/1.
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """
@@ -50,15 +50,6 @@ def test_unknown_backend_rejected() -> None:
     back to a working backend."""
     with pytest.raises(ValueError, match="backend must be one of"):
         _cfg(backend="cuda")
-
-
-def test_gpu_requires_the_fsaverage3_seed_mesh() -> None:
-    """The GPU kernels need ceil(D/8) <= 256, i.e. fsaverage3."""
-    with pytest.raises(ValueError, match="seed_mesh='fsaverage3'"):
-        _cfg(backend="gpu", seed_mesh="fsaverage4")
-    assert _cfg(backend="gpu").seed_mesh == "fsaverage3"
-    # The guard is scoped to the GPU backend only.
-    assert _cfg(backend="cpu", seed_mesh="fsaverage4").backend == "cpu"
 
 
 _SPARSE_MAX_CLUSTERS = 512

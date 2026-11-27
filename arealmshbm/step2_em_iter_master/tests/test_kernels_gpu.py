@@ -935,9 +935,8 @@ def test_e1_store_keeps_subnormals():
 def test_check_dims_limits():
     """The four static limits of the backend (design §3 / §9)."""
     K.check_dims(1175, 147, 300, 1174, 100)                # the production shape
-    with pytest.raises(ValueError, match="fsaverage3"):
-        # Db = 321 > 256 (a fsaverage4 seed gives D=4690)
-        K.check_dims(2563, 321, 300, 2562, 100)
+    with pytest.raises(ValueError, match=r"ceil\(D/8\)"):
+        K.check_dims(2563, 321, 300, 2562, 100)            # a row wider than 256 bytes
     with pytest.raises(ValueError, match="num_clusters"):
         K.check_dims(1175, 147, 1024, 1174, 100)
     with pytest.raises(ValueError, match="n_grad_components"):

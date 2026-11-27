@@ -1,8 +1,6 @@
 """test_step1_gpu_routing.py — the guards on ``backend=`` in
 :func:`arealmshbm.pipeline.step1_runners.run_generate_profiles`.
 
-  * ``profile_dtype_reduce`` other than float32 is REJECTED, not
-    silently ignored — the fused leaf is fp32 throughout.
   * An unknown backend name is rejected.
   * ``backend='gpu'`` routes to the fused whole-subject leaf, full
     stop: the stage pipeline is the CPU backend's and must not be
@@ -19,7 +17,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import numpy as np
 import pytest
 
 from arealmshbm.pipeline import step1_runners
@@ -37,7 +34,6 @@ def _project(tmp_path: Path) -> Path:
 def _call(project: Path, **over):
     kwargs = dict(
         project_dir=project, subjects=["1"], sessions=["1"],
-        seed_mesh="fsaverage3", targ_mesh="fsaverage6",
         backend="gpu", verbose=False,
     )
     kwargs.update(over)
@@ -61,11 +57,6 @@ def test_gpu_prewarm_fails_fast_without_nvcomp(monkeypatch):
     finally:
         nb._CACHE.clear()
         nb._CACHE.update(saved)
-
-
-def test_gpu_backend_rejects_a_non_fp32_reduction_dtype(tmp_path):
-    with pytest.raises(ValueError, match="computes in float32"):
-        _call(_project(tmp_path), profile_dtype_reduce=np.float64)
 
 
 def test_unknown_backend_rejected(tmp_path):

@@ -1,7 +1,8 @@
 """_background_write.py
 
-The one join handle behind every step-1 artifact that is written on a
-background thread: the avg-profile ``.npy`` pair
+The join handle behind the step-1 cohort artifacts written on a
+background thread (the per-subject ``.b2nd`` writes have their own):
+the avg-profile ``.npy`` pair
 (:mod:`arealmshbm.avg_profiles`) and ``group.mat``
 (:mod:`arealmshbm.ini_params`). Both writes are pure disk I/O with the
 GIL released, so taking them off the caller's critical path is free;

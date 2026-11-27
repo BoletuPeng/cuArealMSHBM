@@ -34,7 +34,7 @@ def validate_variant_requirements(
     * ``use_connect_prior`` → ``grad_data`` must not be None.
     * ``use_check_connectedness`` → all three of (sphere_xyz, LH sphere
       mesh, RH sphere mesh) must not be None; the variant needs them
-      for both the connectedness BFS and the spatial xyz prior.
+      for both the connectedness check and the spatial xyz prior.
     """
     if variant_spec.use_connect_prior and grad_data is None:
         raise ValueError(

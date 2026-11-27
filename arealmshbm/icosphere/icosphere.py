@@ -11,12 +11,12 @@ icosahedron, then for each face: place T-1 points on each edge and
 into T^2 small triangles. Project all non-corner verts to the unit
 sphere, then scale to radius. Yields V = 10*T^2 + 2, F = 20*T^2.
 
-The two dict lookups in the original Python code are replaced with
-flat ndarrays for numba compatibility:
+Edge and grid-point lookups are flat ndarrays (numba has no dicts of
+tuples):
 
     edge_lookup : (12, 12) int32, init -1, written by sorted-pair on
-                  first encounter. Edge IDs assigned in the same
-                  face-major order as the original dict-insertion code.
+                  first encounter. Edge IDs assigned in face-major
+                  first-encounter order.
     gid         : (T+1, T+1) int64, init -1, recomputed inside each
                   face. Indexed by (i, j) with k = T - i - j.
 

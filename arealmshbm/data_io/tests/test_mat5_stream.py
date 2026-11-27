@@ -15,7 +15,7 @@ against a hand-built container, since ``savemat`` never narrows.
 An optional bench-backed test (``MSHBM_STEP2_BENCH_DIR``, default
 ``testdata/step2_bench``) checks the two real step-2 inputs — the
 ``group.mat`` whose 22 MB ``lambda`` the walker skips, and the
-MATLAB-sparse ``spatial_mask_fsaverage6.mat``.
+MATLAB-sparse ``spatial_mask.mat``.
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """
@@ -345,10 +345,10 @@ def test_bench_group_mtc_equals_scipy() -> None:
 
 @pytest.mark.skipif(
     not (BENCH_DIR / "proj" / "spatial_mask"
-         / "spatial_mask_fsaverage6.mat").exists(),
+         / "spatial_mask.mat").exists(),
     reason="step-2 bench project not present")
 def test_bench_spatial_mask_equals_scipy() -> None:
-    p = BENCH_DIR / "proj" / "spatial_mask" / "spatial_mask_fsaverage6.mat"
+    p = BENCH_DIR / "proj" / "spatial_mask" / "spatial_mask.mat"
     ref = sio.loadmat(str(p), squeeze_me=False)
     for nm in ("lh_boundary", "rh_boundary"):
         got = ms.read_sparse(p, nm)

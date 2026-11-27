@@ -1,15 +1,15 @@
 """data_io
 
-Step-3 file I/O leaves (Mode A).
+File I/O leaves shared across the steps.
 
 Public API:
     fetch_data        — load per-subject bitpacked profile (``.b2nd``
                         via blosc2) + diffusion-embedding gradient
-                        (``.npy`` canonical / ``.mat`` legacy) for one
-                        subject.
+                        (``.npy`` or ``.mat``, per step 0's
+                        ``emb_output_format``) for one subject (step 3).
     load_group_prior  — read Params_Final.mat (mu, theta, epsil, sigma).
-    load_spatial_mask — read spatial_mask_<mesh>.mat → (lh, rh) boundary.
-    load_avg_mesh     — fsaverage* mesh loader (vertices, vertexNbors,
+    load_spatial_mask — read spatial_mask.mat → (lh, rh) boundary.
+    load_avg_mesh     — fsaverage6 mesh loader (vertices, vertexNbors,
                         MARS_label) for either inflated or sphere surface.
     read_surface_gifti — ``.func.gii`` BOLD reader (see ``gifti_io``).
     save_parcellation — argmax labels + save Ind_parcellation_*.mat.

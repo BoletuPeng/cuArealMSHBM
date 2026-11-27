@@ -5,7 +5,7 @@ Reads per-subject bitpacked ``.b2nd`` profiles ``(T, N, ⌈D/8⌉)`` uint8
 written by step-1's generate_profiles, splits the N axis into lh/rh,
 accumulates set bits into a fp32 buffer, divides by
 ``num_sub × num_sess``, and writes the canonical
-``profiles/avg_profile/{lh,rh}_<…>_avg_profile.npy`` pair.
+``profiles/avg_profile/{lh,rh}_avg_profile.npy`` pair.
 
 Output format: raw ``.npy`` ``(V_h, D)`` fp32 C-contig. A project-level
 single-shot output (~192 MB / hemi at fsa6 schaefer-400) consumed only
@@ -74,22 +74,18 @@ from ._kernels import (
 )
 
 
-def _hemi_vert_counts(targ_mesh: str) -> Tuple[int, int]:
-    """``(V_lh, V_rh)`` for the given fsaverage* mesh. The b2nd writer
-    stacks lh + rh along the N axis, so we need both counts up front
-    to slice each per-session chunk back into hemis."""
-    lh = load_avg_mesh("lh", targ_mesh, "inflated")
-    rh = load_avg_mesh("rh", targ_mesh, "inflated")
+def _hemi_vert_counts() -> Tuple[int, int]:
+    """``(V_lh, V_rh)`` of the mesh. The b2nd writer stacks lh + rh
+    along the N axis, so we need both counts up front to slice each
+    per-session chunk back into hemis."""
+    lh = load_avg_mesh("lh", "inflated")
+    rh = load_avg_mesh("rh", "inflated")
     return int(lh["MARS_label"].shape[0]), int(rh["MARS_label"].shape[0])
 
 
-def _avg_paths(out_dir: Path,
-               targ_mesh: str, seed_mesh: str) -> Tuple[Path, Path]:
+def _avg_paths(out_dir: Path) -> Tuple[Path, Path]:
     base = Path(out_dir) / "profiles" / "avg_profile"
-    return (
-        base / f"lh_{targ_mesh}_roi{seed_mesh}_avg_profile.npy",
-        base / f"rh_{targ_mesh}_roi{seed_mesh}_avg_profile.npy",
-    )
+    return base / "lh_avg_profile.npy", base / "rh_avg_profile.npy"
 
 
 def _load_subject_packed_TND(b2nd_p: Path) -> Tuple[np.ndarray, int]:
@@ -105,8 +101,6 @@ def _load_subject_packed_TND(b2nd_p: Path) -> Tuple[np.ndarray, int]:
 
 def _discover_and_decode_subjects(
     out_dir: Path,
-    targ_mesh: str,
-    seed_mesh: str,
     num_sub: int,
     num_sess: int,
     V_lh: int,
@@ -122,7 +116,7 @@ def _discover_and_decode_subjects(
     """
     sub_paths: List[Tuple[int, Path]] = []
     for sub in range(1, num_sub + 1):
-        p = profile_path(out_dir, str(sub), targ_mesh, seed_mesh)
+        p = profile_path(out_dir, str(sub))
         if p.exists():
             sub_paths.append((sub, p))
         elif verbose:
@@ -145,8 +139,8 @@ def _discover_and_decode_subjects(
     D0 = int(D_vals[0])
     if N0 != V_lh + V_rh:
         raise ValueError(
-            f"avg_profiles: per-subject .b2nd has N={N0} but mesh "
-            f"{targ_mesh!r} yields V_lh+V_rh={V_lh + V_rh}."
+            f"avg_profiles: per-subject .b2nd has N={N0} but the mesh "
+            f"has V_lh+V_rh={V_lh + V_rh}."
         )
     if T0 != num_sess:
         raise ValueError(
@@ -163,14 +157,13 @@ def _discover_and_decode_subjects(
 
 
 def _save_avg_npy_pair(
-    out_dir: Path, targ_mesh: str, seed_mesh: str,
-    lh_acc: np.ndarray, rh_acc: np.ndarray,
+    out_dir: Path, lh_acc: np.ndarray, rh_acc: np.ndarray,
 ) -> Tuple[Path, Path]:
     """Write the ``(V_h, D)`` fp32 ``.npy`` pair in parallel. Reader
     (:mod:`arealmshbm.ini_params`) reads the same layout back via
     ``np.load``.
     """
-    lh_out, rh_out = _avg_paths(out_dir, targ_mesh, seed_mesh)
+    lh_out, rh_out = _avg_paths(out_dir)
     with ThreadPoolExecutor(max_workers=2) as pool:
         f_lh = pool.submit(np.save, lh_out, lh_acc, allow_pickle=False)
         f_rh = pool.submit(np.save, rh_out, rh_acc, allow_pickle=False)
@@ -180,8 +173,7 @@ def _save_avg_npy_pair(
 
 
 def _start_avg_npy_pair_async(
-    out_dir: Path, targ_mesh: str, seed_mesh: str,
-    lh_acc: np.ndarray, rh_acc: np.ndarray,
+    out_dir: Path, lh_acc: np.ndarray, rh_acc: np.ndarray,
 ) -> BackgroundWriteHandle:
     """Kick off the ``.npy`` pair write on two background threads and
     return immediately with a join handle (``wait()`` -> the pair).
@@ -192,7 +184,7 @@ def _start_avg_npy_pair_async(
     caller must not mutate ``lh_acc`` / ``rh_acc`` until ``wait()``
     returns.
     """
-    lh_out, rh_out = _avg_paths(out_dir, targ_mesh, seed_mesh)
+    lh_out, rh_out = _avg_paths(out_dir)
     return submit_background_write(
         (lh_out, rh_out),
         f"avg_profiles .npy pair ({lh_out.name} / {rh_out.name})",
@@ -202,8 +194,6 @@ def _start_avg_npy_pair_async(
 
 
 def avg_profiles(
-    seed_mesh: str,
-    targ_mesh: str,
     out_dir,
     num_sub,
     num_sess,
@@ -226,28 +216,24 @@ def avg_profiles(
     if backend == "gpu":
         from .avg_profiles_gpu import avg_profiles_gpu
         return avg_profiles_gpu(
-            seed_mesh=seed_mesh, targ_mesh=targ_mesh, out_dir=out_dir,
-            num_sub=num_sub, num_sess=num_sess, verbose=verbose,
+            out_dir=out_dir, num_sub=num_sub, num_sess=num_sess,
+            verbose=verbose,
         )
     if backend != "cpu":
         raise ValueError(f"avg_profiles: unknown backend {backend!r}")
-    if "fsaverage" not in targ_mesh:
-        raise ValueError(
-            f"avg_profiles: only fsaverage* targ_mesh supported, got {targ_mesh!r}."
-        )
     num_sub = int(num_sub)
     num_sess = int(num_sess)
     out_dir = Path(out_dir)
     (out_dir / "profiles" / "avg_profile").mkdir(parents=True, exist_ok=True)
 
-    V_lh, V_rh = _hemi_vert_counts(targ_mesh)
+    V_lh, V_rh = _hemi_vert_counts()
 
     # Bitpacked path:
     #   * Loader returns (T, N, ⌈D/8⌉) uint8 (~8× smaller than fp32) + D.
     #   * Accumulator is a flat (V_h * D,) fp32 buffer; the fused
     #     popcount-accumulate kernel adds 1.0 for each set bit.
     sub_paths, packed_arrs, T0, _N0, _D0_bytes, D0 = _discover_and_decode_subjects(
-        out_dir, targ_mesh, seed_mesh, num_sub, num_sess, V_lh, V_rh, verbose,
+        out_dir, num_sub, num_sess, V_lh, V_rh, verbose,
     )
 
     lh_acc_flat = np.zeros(V_lh * D0, dtype=np.float32)
@@ -271,9 +257,7 @@ def avg_profiles(
 
     lh_acc = lh_acc_flat.reshape(V_lh, D0)
     rh_acc = rh_acc_flat.reshape(V_rh, D0)
-    lh_out, rh_out = _save_avg_npy_pair(
-        out_dir, targ_mesh, seed_mesh, lh_acc, rh_acc,
-    )
+    lh_out, rh_out = _save_avg_npy_pair(out_dir, lh_acc, rh_acc)
     return AvgProfilesResult(
         lh_path=lh_out, rh_path=rh_out,
         lh_avg=lh_acc, rh_avg=rh_acc,

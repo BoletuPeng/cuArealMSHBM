@@ -18,9 +18,8 @@ Numerical notes:
       ``ive(D/2, k) / ive(D/2-1, k)`` so the ``exp(-x)`` factors cancel.
       ``ive`` underflows to 0 for small ``kappa``, where ``_ad`` does
       not return A_d, so a root below that edge is not found: the edge
-      is about 173 at the fsaverage3 seed (D = 1174; ``rbar`` about
-      0.10-0.14, up to ~44 % off) and lies above every root the brentq
-      branch looks for at the fsaverage4/5 seeds.
+      is about 173 at the fsaverage3 seeds (D = 1174; ``rbar`` about
+      0.10-0.14, up to ~44 % off).
     * The "is besseli pathological?" probe before fzero in MATLAB is
       reproduced via the unscaled ``iv`` (it overflows to ``Inf`` —
       that's the same trigger MATLAB uses) so this port takes the

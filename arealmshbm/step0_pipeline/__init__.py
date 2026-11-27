@@ -1,6 +1,6 @@
 """step0_pipeline
 
-End-to-end Python step-0 super-call (Mode A, fsaverage6).
+End-to-end Python step-0 super-call (fsaverage6; Mode A and Mode B).
 
 Public API:
     Step0Config         — pipeline-config dataclass (every knob).
@@ -31,7 +31,7 @@ Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 
 # Lazy public re-exports (PEP 562): ``.pipeline`` pulls the whole step-0
 # leaf set (numba, scipy.sparse, ~0.74 s cold) and ``.config`` imports
-# cupy, so deferring both keeps importing this package cheap for a
+# ``arealmshbm.pipeline.config`` (and cupy on a gpu config), so deferring both keeps importing this package cheap for a
 # caller that only wants a submodule. Other submodules resolve via
 # ``__getattr__``'s find_spec.
 

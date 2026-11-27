@@ -64,7 +64,7 @@ def _e2e_skip_reason() -> str:
     fail these tests, not skip them."""
     try:
         from arealmshbm.data_io.load_avg_mesh import load_avg_mesh
-        load_avg_mesh("lh", "fsaverage6", "inflated")
+        load_avg_mesh("lh", "inflated")
     except Exception as e:      # noqa: BLE001 — absent, stale or corrupt
         return f"fsaverage6 mesh bundle not loadable ({e})"
     if not _nvcomp_installed():
@@ -103,8 +103,7 @@ def test_end_to_end_matches_the_compute_leaf_and_writes_the_b2nd(
         tmp_path: Path):
     from arealmshbm.data_io.profile_io import read_subject_profile_packed_tnd
 
-    seed_idx, mw, n_lh, n_rh = M.subject_seed_and_mw("fsaverage3",
-                                                      "fsaverage6")
+    seed_idx, mw, n_lh, n_rh = M.subject_seed_and_mw()
     n_full = n_lh + n_rh
     assert mw.shape == (n_full,)
     # A seed vertex is never a medial-wall vertex (MARS_label 2 vs 1).
@@ -129,7 +128,7 @@ def test_end_to_end_matches_the_compute_leaf_and_writes_the_b2nd(
     out = tmp_path / "p.b2nd"
     res = M.generate_subject_profiles_gpu(
         tmp_path, "1", [str(i) for i in range(1, n_sess + 1)],
-        out_path=out, seed_mesh="fsaverage3", targ_mesh="fsaverage6",
+        out_path=out,
         threshold=0.1)
     packed = np.array(res.packed, copy=True)
     assert res.wait() == out
@@ -222,8 +221,7 @@ def test_a_compute_side_error_propagates_without_hanging(tmp_path: Path):
     import gc
     import threading
 
-    seed_idx, mw, n_lh, n_rh = M.subject_seed_and_mw("fsaverage3",
-                                                     "fsaverage6")
+    seed_idx, mw, n_lh, n_rh = M.subject_seed_and_mw()
     T, n_sess = 4, 3
     rng = np.random.default_rng(3)
     fl = tmp_path / "data_list" / "fMRI_list"
@@ -246,8 +244,8 @@ def test_a_compute_side_error_propagates_without_hanging(tmp_path: Path):
     with pytest.raises(ValueError, match="censor length"):
         M.generate_subject_profiles_gpu(
             tmp_path, "1", [str(i) for i in range(1, n_sess + 1)],
-            out_path=tmp_path / "p.b2nd", seed_mesh="fsaverage3",
-            targ_mesh="fsaverage6", threshold=0.1)
+            out_path=tmp_path / "p.b2nd",
+            threshold=0.1)
     done = []
     th = threading.Thread(target=lambda: (gc.collect(), done.append(True)))
     th.start()
@@ -295,8 +293,7 @@ def test_sessions_may_differ_in_T_and_run_count(tmp_path: Path, layout):
     read back from disk must equal the in-memory slab."""
     from arealmshbm.data_io.profile_io import read_subject_profile_packed_tnd
 
-    seed_idx, mw, n_lh, n_rh = M.subject_seed_and_mw("fsaverage3",
-                                                     "fsaverage6")
+    seed_idx, mw, n_lh, n_rh = M.subject_seed_and_mw()
     n_full = n_lh + n_rh
     rng = np.random.default_rng(11)
     fl = tmp_path / "data_list" / "fMRI_list"
@@ -321,8 +318,8 @@ def test_sessions_may_differ_in_T_and_run_count(tmp_path: Path, layout):
 
     out = tmp_path / "p.b2nd"
     with M.generate_subject_profiles_gpu(
-            tmp_path, "1", sess, out_path=out, seed_mesh="fsaverage3",
-            targ_mesh="fsaverage6", threshold=0.1) as res:
+            tmp_path, "1", sess, out_path=out,
+            threshold=0.1) as res:
         got = np.array(res.packed, copy=True)
         K = res.K
     want, K2 = M.compute_subject_profiles_gpu(
@@ -355,8 +352,7 @@ def test_a_reader_error_on_the_producer_thread_reaches_the_caller(
     this pins the hand-off through the leaf."""
     import threading
 
-    _seed_idx, _mw, n_lh, n_rh = M.subject_seed_and_mw("fsaverage3",
-                                                        "fsaverage6")
+    _seed_idx, _mw, n_lh, n_rh = M.subject_seed_and_mw()
     rng = np.random.default_rng(77)
     lh_p = tmp_path / "w_L.func.gii"
     rh_p = tmp_path / "w_R.func.gii"
@@ -368,7 +364,7 @@ def test_a_reader_error_on_the_producer_thread_reaches_the_caller(
         M.generate_subject_profiles_gpu(
             tmp_path, "1", ["1"],
             bold_paths={"1": ([str(lh_p)], [str(rh_p)])},
-            out_path=out, seed_mesh="fsaverage3", targ_mesh="fsaverage6",
+            out_path=out,
             threshold=0.1)
     assert not out.exists()
     assert not any(t.name == "profile-ingest" for t in threading.enumerate())
@@ -541,8 +537,7 @@ def test_on_packed_fires_per_session_with_the_device_slab():
 def _write_subject(tmp_path: Path, n_sess: int = 3, T: int = 4,
                    seed: int = 21):
     """Stage a synthetic fsaverage6 subject; return its session ids."""
-    seed_idx, mw, n_lh, n_rh = M.subject_seed_and_mw("fsaverage3",
-                                                     "fsaverage6")
+    seed_idx, mw, n_lh, n_rh = M.subject_seed_and_mw()
     rng = np.random.default_rng(seed)
     fl = tmp_path / "data_list" / "fMRI_list"
     fl.mkdir(parents=True, exist_ok=True)
@@ -567,15 +562,14 @@ def test_write_false_fills_packed_and_writes_nothing(tmp_path: Path):
     sess = _write_subject(tmp_path)
     out = tmp_path / "skipped.b2nd"
     with M.generate_subject_profiles_gpu(
-            tmp_path, "1", sess, out_path=out, seed_mesh="fsaverage3",
-            targ_mesh="fsaverage6", threshold=0.1, write=False) as res:
+            tmp_path, "1", sess, out_path=out,
+            threshold=0.1, write=False) as res:
         assert res.out_path == out
         no_write = np.array(res.packed, copy=True)
     assert not out.exists()
 
     with M.generate_subject_profiles_gpu(
             tmp_path, "1", sess, out_path=tmp_path / "written.b2nd",
-            seed_mesh="fsaverage3", targ_mesh="fsaverage6",
             threshold=0.1) as res:
         written = np.array(res.packed, copy=True)
     assert np.array_equal(no_write, written)
@@ -604,8 +598,8 @@ def test_a_compute_side_error_leaves_no_partial_b2nd(tmp_path: Path):
     out = tmp_path / "partial.b2nd"
     with pytest.raises(ValueError, match="censor length"):
         M.generate_subject_profiles_gpu(
-            tmp_path, "1", sess, out_path=out, seed_mesh="fsaverage3",
-            targ_mesh="fsaverage6", threshold=0.1)
+            tmp_path, "1", sess, out_path=out,
+            threshold=0.1)
     assert not out.exists()
     cp.get_default_memory_pool().free_all_blocks()
 
@@ -625,8 +619,8 @@ def test_a_write_side_error_reaches_wait_and_warns(tmp_path: Path):
     with _w.catch_warnings(record=True) as caught:
         _w.simplefilter("always")
         res = M.generate_subject_profiles_gpu(
-            tmp_path, "1", sess, out_path=blocked, seed_mesh="fsaverage3",
-            targ_mesh="fsaverage6", threshold=0.1)
+            tmp_path, "1", sess, out_path=blocked,
+            threshold=0.1)
         packed = np.array(res.packed, copy=True)
         with pytest.raises(OSError):
             res.wait()
@@ -666,8 +660,8 @@ def test_a_failed_submit_still_terminates_the_writer(tmp_path: Path,
     out = tmp_path / "racing.b2nd"
     with pytest.raises(KeyboardInterrupt):
         M.generate_subject_profiles_gpu(
-            tmp_path, "1", sess, out_path=out, seed_mesh="fsaverage3",
-            targ_mesh="fsaverage6", threshold=0.1)
+            tmp_path, "1", sess, out_path=out,
+            threshold=0.1)
     assert done.wait(20), "the writer never saw a sentinel"
     assert not out.exists()
     cp.get_default_memory_pool().free_all_blocks()

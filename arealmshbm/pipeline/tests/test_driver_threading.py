@@ -75,8 +75,8 @@ def test_step0_stage_pipeline_threads_step0_knobs() -> None:
 
 
 def test_driver_threads_step1_knobs() -> None:
-    """``_run_step1_all_subjects`` distributes Step1Knobs across three
-    runners (generate_profiles, ini_params, radius_mask)."""
+    """``_run_step1_all_subjects`` distributes Step1Knobs across two
+    runners (generate_profiles, radius_mask)."""
     src = inspect.getsource(Pipeline._run_step1_all_subjects)
     _assert_knobs_threaded(src, Step1Knobs, "k1")
 

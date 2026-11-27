@@ -39,9 +39,9 @@ Kernels:
         Limits: vertex valence <= 8 (packed edge table), V < 2^31
         (int32 ids), and — the binding one — **V <= 90080**, because
         the frontier bitmask is RING x ceil(V/32) words of *static*
-        shared memory against a 48 KB cap. fsaverage6 and fsaverage5
-        fit; fsaverage (V=163842) does not and raises a named
-        ValueError from :func:`_sssp_module` (use ``backend='cpu'``).
+        shared memory against a 48 KB cap. fsaverage6 (V=40962)
+        fits; a larger graph raises a named ValueError from
+        :func:`_sssp_module`.
 
 Equivalent to the CPU's "every parcel vert is in mask + Dijkstra from
 boundary outward" formulation: setting dist=0 at every parcel vert is
@@ -469,9 +469,8 @@ def _sssp_module(V: int, cap: int, tpb: int):
 
     That bitmask is O(V) **static shared memory**, which caps the mesh
     this solver can take at V <= 90080 (48 KB / RING / 4 B x 32):
-    fsaverage6 (40962 -> 24.6 KB) and fsaverage5 (10242 -> 6.3 KB) fit,
-    fsaverage (163842 -> 82 KB) does not and is refused here rather
-    than at ptxas. Use ``backend='cpu'`` for such a mesh.
+    fsaverage6 (40962 -> 24.6 KB) fits; a larger graph is refused here
+    rather than at ptxas.
     """
     need = _sssp_smem_bytes(V, cap)
     if need > _SMEM_LIMIT:
@@ -479,8 +478,7 @@ def _sssp_module(V: int, cap: int, tpb: int):
         raise ValueError(
             f"sssp_batch32: mesh too large for the shared-memory frontier "
             f"(V={V} needs {need} B of static shared memory per CTA, limit "
-            f"{_SMEM_LIMIT} B; the ceiling at cap={cap} is V<={v_max}). "
-            f"Use backend='cpu' for this mesh.")
+            f"{_SMEM_LIMIT} B; the ceiling at cap={cap} is V<={v_max}).")
     key = (V, cap, tpb, _EDGE_SLOTS, _SSSP_RING)
     mod = _sssp_module_cache.get(key)
     if mod is None:
