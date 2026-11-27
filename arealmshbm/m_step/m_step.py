@@ -156,8 +156,8 @@ class MStepSession:
     external shapes.
 
     The Session contract assumes ``data_series`` does NOT change between
-    calls within a parcellation — it's the BOLD time series, which is
-    fixed. The per-call inputs ``s_t_nu``, ``s_lambda``, ``s_psi``,
+    calls within a parcellation — it's the subject's RSFC profiles, which
+    are fixed. The per-call inputs ``s_t_nu``, ``s_lambda``, ``s_psi``,
     ``sigma``, ``kappa_init`` are all re-read each call.
     """
 

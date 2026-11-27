@@ -16,9 +16,7 @@ each appears exactly once.
 
     _threshold_kernel(corr_KxV, threshold, out_KxV)
         Binarize ``(corr >= threshold).astype(fp32)`` with output in
-        (K, V) C-contig layout — bit-identical to NIFTI's natural
-        on-disk byte order, so the writer dumps the bytes directly
-        without a transpose.
+        (K, V) C-contig layout; the writer transposes and packs it.
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """

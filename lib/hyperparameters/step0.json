@@ -17,22 +17,13 @@
       "description": "step0 backend (cpu=numba; gpu=CuPy eigsh + RawKernel)."
     },
     {
-      "key": "step0.enable_tf32",
-      "type": "boolean",
-      "default": false,
-      "source": "arealmshbm/pipeline/config.py (Step0Knobs.enable_tf32)",
-      "conditional": "backend_step0 == 'gpu'",
-      "description": "Opt-in TF32 cuBLAS sgemm math mode for step0 (affects fc_similarity only).",
-      "notes": "~15% step0 speedup with minor fp32 precision drift."
-    },
-    {
       "key": "step0.sub_FC",
       "type": "integer",
       "min": 50,
       "max": 300,
       "default": 100,
       "source": "arealmshbm/step0_pipeline/config.py (Step0Config.sub_FC)",
-      "description": "FC sub-sampling block (CBIG canonical=100)."
+      "description": "FC seed sub-sampling divisor: round(N_cortex / sub_FC) seeds (CBIG canonical=100)."
     },
     {
       "key": "step0.sub_verts",
@@ -62,32 +53,13 @@
       "description": "Inner block iteration count (CBIG canonical=10)."
     },
     {
-      "key": "step0.smooth_sigma",
-      "type": "continuous",
-      "min": 0.5,
-      "max": 10.0,
-      "unit": "mm",
-      "default": 2.55,
-      "source": "arealmshbm/step0_pipeline/config.py (Step0Config.smooth_sigma)",
-      "description": "Surface smoothing sigma (CBIG canonical=2.55 mm)."
-    },
-    {
-      "key": "step0.K_hop",
-      "type": "integer",
-      "min": 1,
-      "max": 5,
-      "default": 3,
-      "source": "arealmshbm/step0_pipeline/config.py (Step0Config.K_hop)",
-      "description": "Neighbor adjacency hop count (CBIG canonical=3)."
-    },
-    {
       "key": "step0.watershed_steps",
       "type": "integer",
       "min": 5,
       "max": 200,
       "default": 50,
       "source": "arealmshbm/step0_pipeline/config.py (Step0Config.watershed_steps)",
-      "description": "Watershed iteration count (CBIG canonical=50)."
+      "description": "Watershed threshold-sweep step count (CBIG canonical=50)."
     },
     {
       "key": "step0.watershed_frac",
@@ -96,7 +68,7 @@
       "max": 1.0,
       "default": 1.0,
       "source": "arealmshbm/step0_pipeline/config.py (Step0Config.watershed_frac)",
-      "description": "Watershed local-minima fraction."
+      "description": "Watershed sweep stop as a fraction of the max metric value (stop height = max * watershed_frac)."
     },
     {
       "key": "step0.downsample",
@@ -125,7 +97,7 @@
       "default": false,
       "source": "arealmshbm/step0_pipeline/config.py (Step0Config.save_geodesic_distance)",
       "description": "Persist (N_down, N_down) geodesic distance matrices to disk.",
-      "notes": "~672 MB/hemi/subject. Only needed for diffusion_map microbenchmarks."
+      "notes": "~672 MB/hemi/subject. No production downstream reader; read by the internal step-0 CPU/GPU diff harness."
     },
     {
       "key": "step0.save_edge_density",

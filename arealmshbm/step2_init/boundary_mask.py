@@ -19,10 +19,10 @@ both forms produce numerically identical block-diagonal matrices.
 The dispatch is preserved for forward-compat with asymmetric meshes
 should they ever arise.
 
-The block-diagonal layout reuses the construction in
-:mod:`arealmshbm.pipeline_setup.pipeline_setup`. Output is fp32
-(step-2 init precision); the existing step-3 helper returns fp64 so we
-cast at the boundary.
+The block-diagonal layout is the one step 3's
+:func:`arealmshbm.pipeline_setup.build_boundary_mask` builds (in
+fp64); this leaf builds it directly in fp32 (step-2 init precision)
+and does not import that helper.
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """

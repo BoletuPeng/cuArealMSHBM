@@ -14,16 +14,13 @@ profile pattern, leaf module shape, backend dispatch), see
 Step0Pipeline.run(cfg)                                         [arealmshbm/step0_pipeline]
 │
 ├── load_inputs()
-│   ├── load_avg_mesh(lh/rh, sphere)                          data_io/load_avg_mesh
-│   ├── read_surface_mesh(lh/rh midthickness)                 surface_io
-│   ├── compute_topology(lh/rh sphere)                        mesh_topology
-│   ├── prepare_smoothing_mesh(lh/rh midthickness)            surface_smoothing/_geodesic_kernels
-│   │     (vertex areas + Layer 1/2 polyhedral-geodesic CSR)
-│   ├── prepare_smoothing_gather(prep, roi, sigma)            surface_smoothing
-│   │     (74k per-source Dijkstra → gather CSR + inv weight-sum;
-│   │      depends only on mesh + roi + cfg.smooth_sigma, so it's
-│   │      hoisted here and reused for every iter_a smoothing call)
-│   └── neighbors_exclude_medial + find_K_neighbors            step0_neighbors
+│   └── load_inputs_bundle()                                  step0_pipeline/inputs_bundle
+│         (shipped asset, read as-is — no runtime computation:
+│          sphere + midthickness meshes, medial mask, smoothing /
+│          gradient mesh prep, the 74k-source Dijkstra gather CSR
+│          (sigma 2.55 mm) + inv weight-sum reused by every iter_a
+│          smoothing call, neighbor table + 3-hop neighbors;
+│          missing bundle = hard error)
 │
 ├── subgraph A — RSFC gradients
 │   ├── for each scan:
@@ -31,14 +28,14 @@ Step0Pipeline.run(cfg)                                         [arealmshbm/step0
 │   │   ├── concat_hemis_drop_medial                          bold_io
 │   │   ├── set_downsample_params(scan_idx)                   subsampling
 │   │   ├── compute_t_series(curr_data, randinds_FC)          fc_similarity
-│   │   └── for each block-a (~3 iters):
+│   │   └── for each block-a (iter_a iters):
 │   │       ├── compute_FC_simi_block(...)                    fc_similarity
 │   │       ├── cifti_gradient(FC_simi_block, midthickness)   surface_gradient
 │   │       └── accumulate per-block (sum, count)
 │   └── for each block-a:
 │       ├── avg_grads = sum / count                           inline
 │       ├── cifti_smoothing(avg_grads, lh/rh_smooth_gather)   surface_smoothing
-│       │     (SpMV + per-row normalize on the cached gather)
+│       │     (SpMV + per-row normalize on the bundle's gather)
 │       ├── find_minima(smoothed, K_neighbors)                local_minima
 │       └── watershed_algorithm_repaired(smoothed, ...)       watershed
 │           (per-column threshold sweep; processes all K cols)
@@ -48,6 +45,7 @@ Step0Pipeline.run(cfg)                                         [arealmshbm/step0
 │   ├── compute_topology(down_sphere)                         mesh_topology
 │   ├── linear_interpolate_sphere(downsample edge_density)    interpolate_sphere
 │   └── gradient_geodesic_distance(down_mesh, grad_edge_down) graph_distance
+│         (cpu: prange all-pairs Dijkstra; gpu: Δ-stepping SSSP)
 │
 ├── subgraph C — diffusion embedding (per hemi)
 │   └── compute_diffusion_map_repaired(dist, alpha=0.5, n_components)  diffusion_map
@@ -63,7 +61,7 @@ Step0Pipeline.run(cfg)                                         [arealmshbm/step0
     └── {lh,rh}_emb_<num_comp>_distance_matrix.npy   (default; .mat via cfg.emb_output_format)
 ```
 
-For `mesh = 'fsaverage6'`, `sub_FC=100`, `sub_verts=200`, `downsample=3.2`:
+For `sub_FC=100`, `sub_verts=200`, `downsample=3.2`:
 
 | Quantity | Value |
 |---|---|
@@ -83,26 +81,21 @@ For `mesh = 'fsaverage6'`, `sub_FC=100`, `sub_verts=200`, `downsample=3.2`:
 arealmshbm/
 ├── step0_pipeline/                         # top-level Python entry
 │   ├── config.py                           Step0Config dataclass
+│   ├── inputs_bundle.py                    shipped step-0 inputs bundle reader
 │   ├── pipeline.py                         Step0Pipeline lifecycle (single subject)
 │   └── profile.py                          per-stage wall-time report
 │       # Multi-subject batch runs go through arealmshbm/pipeline/
 │       # (unified driver, mode='modeA_batch').
 │
-├── data_io/                                # shared with step 3
-│   └── load_avg_mesh.py                    fsaverage* mesh
-│
-├── surface_io/                             FreeSurfer .sphere + GIFTI .surf.gii
 ├── bold_io/                                FreeSurfer surface .func.gii BOLD (GIFTI only)
 ├── mesh_topology/                          vertex_nbors / vertex_faces
-├── step0_neighbors/                        neighbors_exclude_medial + K-hop
-├── subsampling/                            FC speed-up randinds (np.random.seed global RNG)
+├── subsampling/                            FC speed-up randinds (numba np.random.seed per scan)
 ├── fc_similarity/                          block-wise FC-similarity matrix
 │                                           (BLAS sgemm + fused numba kernels)
 ├── surface_gradient/                       per-vertex tangent-plane LS
 │                                           (replaces wb -cifti-gradient)
-├── surface_smoothing/                      geodesic Gaussian (numba prange)
-│   └── _geodesic_kernels.py                polyhedral-geodesic Dijkstra +
-│                                           mesh-only precomputation
+├── surface_smoothing/                      geodesic Gaussian, applied from the
+│                                           bundle's gather
 │                                           (replaces wb -cifti-smoothing)
 ├── local_minima/                           K-hop local-min mask
 ├── watershed/                              watershed_algorithm_all_par_cifti
@@ -115,7 +108,7 @@ arealmshbm/
 ├── graph_distance/                         numba prange all-pairs Dijkstra (cpu)
 │   ├── graph_distance_gpu.py               Δ-stepping SSSP (gpu)
 │   └── _heap.py                            indexed min-heap (also used by
-│                                           surface_smoothing's Dijkstra)
+│                                           radius_mask's Dijkstra)
 └── diffusion_map/                          distance → affinity + mapalign Lanczos top-k
     ├── diffusion_map_repaired.py           CPU production wrapper: D → A then delegate
     ├── diffusion_map_gpu_repaired.py       GPU production wrapper: D → A then delegate
@@ -141,7 +134,8 @@ Backend selection happens at `Step0Config.backend ∈ {'cpu', 'gpu'}`.
   * **`graph_distance`** (`gradient_geodesic_distance_gpu_device`,
     Δ-stepping SSSP) — subgraph B.
   * **`diffusion_map`** (`diffusion_map_gpu_repaired.py`) — partial
-    Lanczos eigsh on the (N_down × N_down) affinity via cuSPARSE.
+    Lanczos eigsh (`cupyx.scipy.sparse.linalg.eigsh`) on the dense
+    (N_down × N_down) affinity, matvecs on cuBLAS.
 
 ## Wall
 
@@ -174,14 +168,14 @@ sequence (no per-subject parallelism wrapping the driver yet).
 |---|---:|---:|---|
 | load_inputs            |  0.00 |  0.06 | mesh + smoothing-gather one-shot |
 | A — RSFC gradients     |  6.29 |  2.33 | fc_similarity (cuBLAS sgemm + fused demean+norm) |
-| B — gradient distance  |  1.69 |  0.93 | Gauss-Seidel pull BF on (N, N) (CuPy RawKernel) |
+| B — gradient distance  |  1.69 |  0.93 | Δ-stepping SSSP (CuPy RawKernel); the 0.93 s was measured on the 2026-05 pull Bellman-Ford (§ Subgraph B GPU port) |
 | C — diffusion embedding | 17.17 |  0.96 | scipy.eigsh → cupyx.scipy eigsh; dist consumed device-resident |
 | D — upsample emb       |  0.06 |  0.07 | trivial |
 | **WALL (sub-002)**     | **25.27** | **4.43** | — |
 
 Subgraph C alone is **68 % of the CPU per-subject wall** (Lanczos partial
 eigh on the N_down × N_down affinity); the GPU port routes it through
-cuSPARSE eigsh and recovers ~17× on that leaf. Subgraph A's GPU win
+cupyx eigsh and recovers ~17× on that leaf. Subgraph A's GPU win
 (~2.7×) is from `fc_similarity` (curr_data + t_series device-resident
 across iter_a/iter_b, sgemm via cuBLAS, fused demean+norm RawKernel
 replacing the prior fp64-cast-and-reduce chain — see
@@ -206,8 +200,8 @@ this section).
   `graph_distance_gpu.py`: valence
   `M <= EDGE_SLOTS` (8, the packed edge table's slot count),
   `N <= MAX_N` (188352: the two frontier bitmasks must fit the 48 KiB
-  static shared-memory budget — above fsaverage7, so no supported mesh
-  reaches it), and a symmetric neighbour table (the kernel pushes
+  static shared-memory budget; a fsaverage6 hemisphere is 40962), and a
+  symmetric neighbour table (the kernel pushes
   `v -> nbors[v]`, so an asymmetric one would solve the transposed
   graph). Slots outside the 1-indexed range `[0, N]` and negative / NaN
   weights are refused up front too: the kernel orders distances by
@@ -251,7 +245,10 @@ The CPU/GPU sub-B output comparison on real upstream-A inputs lands
 at ``max-abs-diff ≈ 1e-2`` — that delta is the well-known step-0
 RNG / Lanczos algorithm-class drift in subgraph A's gradient
 production, propagated through into sub-B's input ``grad_data``,
-not a regression in the GPU solver. On synthetic inputs (same
+not a regression in the GPU solver. The two backends also publish
+opposite orientations: the CPU Dijkstra fills ``D[source, dest]``, the
+GPU ``D[dest, source]``, so on this undirected graph each is the
+other's transpose up to fp32 path-sum order. On synthetic inputs (same
 grad_data fed to both backends) sub-B's CPU/GPU max-abs-diff is
 **7.7e-7** — bit-equivalent to fp32 ULP. The final ``emb_up``
 top-7 ``|cos|`` between Python CPU and Python GPU stays at **1.0000**
@@ -308,7 +305,7 @@ scan. Called 576× per subject across the iter_a × iter_b loop,
 totalling ~570 ms per subject — about a quarter of sub-A's GPU wall
 and 7× the cost of all sgemms combined.
 
-Replaced in this fork with a [**fused RawKernel**](../arealmshbm/fc_similarity/_kernels_fused_gpu.py)
+The GPU path runs a [**fused RawKernel**](../arealmshbm/fc_similarity/_kernels_fused_gpu.py)
 that does both passes through the fp32 buffer with fp64 accumulators
 **in registers** (no global-memory fp64 staging):
 
@@ -319,8 +316,8 @@ that does both passes through the fp32 buffer with fp64 accumulators
 Layout-specific kernels for the two callers — same algorithm, flipped
 coalescing pattern:
 
-* `axis0` ((T, K) row-major, reduce over T): 256 threads per block;
-  each thread owns one column j. Warp loads `x[t, j..j+31]` = 32
+* `axis0` ((T, K) row-major, reduce over T): block (256, 1); each
+  thread owns one column j. Warp loads `x[t, j..j+31]` = 32
   consecutive fp32 → one coalesced 128 B transaction. No shared
   memory, except in the divide-fused variant used on FC_A / FC_B
   (`fused_div_demean_norm_columns_cupy`), which stages its per-row
@@ -392,11 +389,10 @@ jitter — the blockers are structural:
 
 * **Assets are not caches.** The rewrite needs an inputs-cache v2 plus
   a `step0_down` bundle written at runtime under
-  `arealmshbm/data/precomputed/`. In this tree, `avg_mesh/` under that
-  path is asset-only (`load_avg_mesh` has no runtime rebuild) and
-  `step0_inputs/` is a downloadable release asset (its rebuild needs raw
-  CBIG sources; see `arealmshbm/data/README.md`), so the rewrite would
-  have to ship both new bundles as downloadable assets first.
+  `arealmshbm/data/precomputed/`. This tree's rule is that everything
+  under that path is a shipped asset, never a cache the pipeline fills
+  in (see `arealmshbm/data/README.md`), so the rewrite would have to
+  ship both bundles as assets first.
 * **Subgraph A is not bit-exact.** Its fused stage-A path and the
   block-Krylov subgraph-C solver both move values at the ULP level
   (about 90 % of FC cells), so no per-kernel oracle against the
@@ -407,7 +403,7 @@ jitter — the blockers are structural:
 
 On `backend='cpu'` every hot-path kernel is `@njit` numba; the
 tech-stack exceptions delegate to BLAS sgemm (numpy `@`), a
-scipy.sparse SpMV (the cached smoothing gather) and Lanczos partial
+scipy.sparse SpMV (the shipped smoothing gather) and Lanczos partial
 eigh (`scipy.sparse.linalg.eigsh`). `backend='gpu'` runs the leaves in
 the dispatch list above on CuPy (subgraph C through
 `cupyx.scipy.sparse.linalg.eigsh`); BOLD reads, subsampling, the
@@ -427,7 +423,7 @@ semantics:
   statistically stable, which is what the downstream `edge_density`
   accumulator consumes.
 * **L11 `icosphere`** orientation depends on the subdivision-
-  traversal order; our pure-numpy builder produces the canonical
+  traversal order; our numba builder produces the canonical
   V/F counts and a valid sphere triangulation, rotated by an
   implementation-defined transform.
 

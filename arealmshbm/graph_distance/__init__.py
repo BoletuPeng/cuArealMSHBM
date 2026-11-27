@@ -17,7 +17,10 @@ External shapes:
                     for shape consistency / future graph debugging).
     vertex_nbors : (N, max_neigh) int32 1-indexed (``0`` = absent).
     grad_data    : (N,) fp32 — gradient density at each vertex.
-    output       : (N, N) fp32 — symmetric, zero diagonal, normalised
+    output       : (N, N) fp32 — ``[source, dest]`` (the GPU
+                    ``gradient_geodesic_distance_gpu_device`` returns
+                    ``[dest, source]``), symmetric up to fp32 path-sum
+                    order, zero diagonal, normalised
                     so ``output.max() == 1`` (matches MATLAB
                     ``lh_dist = single(lh_dist / max(max(abs(lh_dist))))``).
 

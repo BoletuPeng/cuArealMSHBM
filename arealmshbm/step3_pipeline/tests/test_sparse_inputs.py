@@ -287,7 +287,7 @@ def _cfg():
     from arealmshbm.step3_pipeline import Step3Config
     return Step3Config(
         project_dir=SUB001_DIR, num_session=6, num_clusters=300, subid=1,
-        mesh="fsaverage6", w=50.0, c=10.0, beta_scalar=5.0, backend="cpu",
+        w=50.0, c=10.0, beta_scalar=5.0, backend="cpu",
     )
 
 
@@ -340,15 +340,15 @@ def test_sub001_packed_bold_and_gradient():
     from arealmshbm.data_io import fetch_data, load_avg_mesh
 
     cfg = _cfg()
-    lh_inf = load_avg_mesh("lh", cfg.mesh, "inflated")
-    rh_inf = load_avg_mesh("rh", cfg.mesh, "inflated")
+    lh_inf = load_avg_mesh("lh", "inflated")
+    rh_inf = load_avg_mesh("rh", "inflated")
     ref = fetch_data(project_dir=cfg.project_dir, num_session=cfg.num_session,
-                     subid=cfg.subid, mesh=cfg.mesh,
+                     subid=cfg.subid,
                      lh_mesh=lh_inf, rh_mesh=rh_inf,
                      n_grad_components=cfg.n_grad_components,
                      with_gradient=True)
     packed, D, mw_lh, mw_rh = si.fetch_packed_bold_TND(
-        cfg.project_dir, cfg.num_session, cfg.subid, cfg.mesh, lh_inf, rh_inf)
+        cfg.project_dir, cfg.num_session, cfg.subid, lh_inf, rh_inf)
     assert D == int(ref["D_unpacked"])
     assert packed.flags.c_contiguous
     # ``fetch_data`` zeroes the MW rows on the host; the sparse path
@@ -363,12 +363,12 @@ def test_sub001_packed_bold_and_gradient():
     assert np.array_equal(mw_lh, np.flatnonzero(lh_inf["MARS_label"] == 1))
     assert np.array_equal(mw_rh, np.flatnonzero(rh_inf["MARS_label"] == 1))
 
-    grad = si.fetch_gradient(cfg.project_dir, cfg.subid, cfg.mesh,
+    grad = si.fetch_gradient(cfg.project_dir, cfg.subid,
                              packed.shape[1], cfg.n_grad_components)
     assert np.array_equal(grad, ref["gradient_mat"])
 
     # precomputed passthrough
-    g2 = si.fetch_gradient(cfg.project_dir, cfg.subid, cfg.mesh,
+    g2 = si.fetch_gradient(cfg.project_dir, cfg.subid,
                            packed.shape[1], cfg.n_grad_components,
                            precomputed_gradient_mat=grad)
     assert np.array_equal(g2, grad)
@@ -399,7 +399,7 @@ def test_sub001_sparse_inputs_bundle():
     assert np.array_equal(inp.gradient_mat, ref.data["gradient_mat"])
     assert np.array_equal(inp.sphere_xyz_bilateral, ref.sphere_xyz_bilateral)
     assert inp.ini_val == ref.ini_val
-    for k in ("mesh", "num_session", "num_clusters", "subid", "w", "c",
+    for k in ("num_session", "num_clusters", "subid", "w", "c",
               "epsilon", "connect_th", "dim", "num_verts"):
         assert inp.setting_params[k] == ref.setting_params[k], k
     assert np.array_equal(inp.setting_params["beta"],
@@ -466,11 +466,8 @@ def _tiny_packed_project(tmp_path, *, D, dirty):
     write_cohort_partial(
         tmp_path,
         subjects=[sub],
-        mesh={"targ": "fsaverage6", "seed": "fsaverage3"},
         n_grad_components=100,
         run_id=compute_run_id(subjects=["1"], sessions=["1", "2"],
-                              targ_mesh="fsaverage6",
-                              seed_mesh="fsaverage3",
                               n_grad_components=100),
     )
     half = {"MARS_label": np.array([2, 1, 2, 2], dtype=np.int32)[: N // 2]}
@@ -481,14 +478,14 @@ def _tiny_packed_project(tmp_path, *, D, dirty):
 def test_packed_bold_rejects_dirty_padding_bits(tmp_path, D):
     project, lh, rh = _tiny_packed_project(tmp_path, D=D, dirty=True)
     with pytest.raises(ValueError, match="padding bits"):
-        si.fetch_packed_bold_TND(project, 2, 1, "fsaverage6", lh, rh)
+        si.fetch_packed_bold_TND(project, 2, 1, lh, rh)
 
 
 @pytest.mark.parametrize("D", [11, 16])          # pad = 5 and 0 bits
 def test_packed_bold_accepts_clean_padding(tmp_path, D):
     project, lh, rh = _tiny_packed_project(tmp_path, D=D, dirty=False)
     packed, D_out, _, _ = si.fetch_packed_bold_TND(
-        project, 2, 1, "fsaverage6", lh, rh)
+        project, 2, 1, lh, rh)
     assert D_out == D
     assert packed.shape == (2, 4, (D + 7) // 8)
     assert (packed == 0b0000_0001).all()
@@ -506,7 +503,7 @@ def test_packed_bold_rejects_profile_wider_than_the_kernel_limit(tmp_path):
     project, lh, rh = _tiny_packed_project(tmp_path, D=D, dirty=False)
     with pytest.raises(ValueError, match=r"backend='gpu' requires "
                        r"ceil\(D/8\) <= 256.*use backend='cpu'"):
-        si.fetch_packed_bold_TND(project, 2, 1, "fsaverage6", lh, rh)
+        si.fetch_packed_bold_TND(project, 2, 1, lh, rh)
 
 
 def test_packed_bold_accepts_the_widest_supported_profile(tmp_path):
@@ -515,7 +512,7 @@ def test_packed_bold_accepts_the_widest_supported_profile(tmp_path):
     D = 8 * MAX_D_BYTES
     project, lh, rh = _tiny_packed_project(tmp_path, D=D, dirty=False)
     packed, D_out, _, _ = si.fetch_packed_bold_TND(
-        project, 2, 1, "fsaverage6", lh, rh)
+        project, 2, 1, lh, rh)
     assert D_out == D and packed.shape[2] == MAX_D_BYTES
 
 
@@ -525,11 +522,10 @@ def test_packed_bold_accepts_the_widest_supported_profile(tmp_path):
 def _dummy_cohort(**overrides):
     """A cohort object with the sub-001 identity and no payload.
 
-    ``check`` only reads the four identity fields, so the payload can be
+    ``check`` only reads the three identity fields, so the payload can be
     empty — this keeps the mismatch tests free of the data store.
     """
     d = dict(
-        mesh="fsaverage6",
         group_prior_path=str(_cfg().group_prior_path),
         spatial_mask_path=str(_cfg().spatial_mask_path),
         num_clusters=300,
@@ -545,12 +541,11 @@ def test_cohort_check_accepts_matching_cfg():
 
 # (cfg override, value, the identity field ``check`` reports). The
 # reported field is not always the one overridden: ``check`` walks
-# mesh → group_prior_path → spatial_mask_path → num_clusters and stops
+# group_prior_path → spatial_mask_path → num_clusters and stops
 # at the first disagreement, and both paths are *derived* from several
 # knobs (config.py's ``group_prior_path`` / ``spatial_mask_path``).
 @pytest.mark.parametrize("field, value, reported", [
     ("num_clusters", 299, "num_clusters"),
-    ("mesh", "fsaverage5", "mesh"),
     ("beta_scalar", 6.0, "group_prior_path"),
     ("pipeline_type", "dMSHBM", "group_prior_path"),
     ("project_dir", "/tmp/other_project", "group_prior_path"),
@@ -560,7 +555,7 @@ def test_cohort_check_rejects_mismatching_cfg(field, value, reported):
 
     kwargs = dict(
         project_dir=SUB001_DIR, num_session=6, num_clusters=300, subid=1,
-        mesh="fsaverage6", w=50.0, c=10.0, beta_scalar=5.0, backend="cpu",
+        w=50.0, c=10.0, beta_scalar=5.0, backend="cpu",
     )
     kwargs[field] = value
     cfg = Step3Config(**kwargs)
@@ -572,16 +567,16 @@ def test_cohort_check_rejects_mismatching_cfg(field, value, reported):
 
 
 def test_cohort_check_rejects_mismatching_spatial_mask_path():
-    """The only field reachable with mesh and prior path both matching.
+    """The only field reachable with the prior path matching.
 
     A different ``project_dir`` moves the mask; pinning the prior with
-    ``group_prior_path_override`` keeps the two earlier fields equal.
+    ``group_prior_path_override`` keeps the earlier field equal.
     """
     from arealmshbm.step3_pipeline import Step3Config
 
     cfg = Step3Config(
         project_dir="/tmp/other_project", num_session=6, num_clusters=300,
-        subid=1, mesh="fsaverage6", w=50.0, c=10.0, beta_scalar=5.0,
+        subid=1, w=50.0, c=10.0, beta_scalar=5.0,
         backend="cpu",
         group_prior_path_override=_cfg().group_prior_path,
     )

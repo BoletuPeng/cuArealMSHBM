@@ -9,7 +9,7 @@ the four numba kernels in :mod:`._kernels`.
 
     demean_l2norm_inplace_cupy(profile, keep)
         Per-row demean + L2-unit-norm, in place. RawKernel — one block
-        per row, fp64 sum/sumsq reduction via shared mem, two passes
+        per row, fp64 sum/sumsq reduction via shared mem, three passes
         over D. Skips rows where ``keep`` is False (matches CPU).
 
     build_parcel_csr_cupy(labels, L) -> (offsets, rows)
@@ -47,7 +47,7 @@ extern "C" __global__
 void demean_l2norm_rows_inplace(double* __restrict__ profile,
                                  const unsigned char* __restrict__ keep,
                                  int N, int D) {
-    // One thread block per row i. Two passes over D:
+    // One thread block per row i. Three passes over D:
     //   pass 1: sum -> mean (fp64 block-reduce via shared mem)
     //   pass 2: write (v - mean), accumulate sumsq -> norm
     //   pass 3: multiply by 1/norm (or 1.0 if zero-variance row)
@@ -145,8 +145,8 @@ def demean_l2norm_inplace_cupy(profile_dev: cp.ndarray,
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Ordered fp64 reductions — CPU-bit-exact replacements for the dense
-# one-hot dgemm (`groupsum`) and the `profile @ mtc` dgemm (`epsil`).
+# Ordered fp64 reductions — `groupsum` without a dense one-hot, and
+# `epsil` without the `profile @ mtc` dgemm the CPU path runs.
 #
 # Both kernels fix the fp64 summation order explicitly, because the
 # saved ``mtc`` is compared bit-for-bit against the numba CPU path:
@@ -347,9 +347,8 @@ def groupsum_csr_cupy(profile_dev: cp.ndarray, offsets_dev: cp.ndarray,
     contract). The backends' saved ``mtc`` still differ by ~1e-15 —
     that comes from ``demean_l2norm_inplace``, not from here.
 
-    Replaces the dense one-hot dgemm — no (N, L) fp64 one-hot is
-    materialised (256 MB at N=80k, L=400) and the arithmetic drops
-    from O(N·L·D) to O(N·D).
+    No (N, L) fp64 one-hot is materialised (256 MB at N=80k, L=400);
+    the arithmetic is O(N·D), not a one-hot GEMM's O(N·L·D).
     """
     if profile_dev.dtype != cp.float64 or mtc_DxL_dev.dtype != cp.float64:
         raise ValueError(

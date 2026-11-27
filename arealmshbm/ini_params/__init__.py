@@ -21,8 +21,8 @@ Backends (dispatched by the ``backend=`` kwarg on the supercall):
           a single scalar) stays CPU. cupy imported lazily.
 
 Public API:
-    generate_ini_params(seed_mesh, targ_mesh, lh_labels, rh_labels, out_dir,
-                         …, backend='cpu' | 'gpu')
+    generate_ini_params(lh_labels, rh_labels, out_dir, …,
+                         backend='cpu' | 'gpu')
         Optional hand-offs: ``precomputed_{lh,rh}_avg`` (host arrays),
         ``precomputed_{lh,rh}_avg_dev`` (cupy arrays from
         ``avg_profiles_from_accumulator``; GPU backend only),
@@ -30,7 +30,7 @@ Public API:
         ``result.writer.wait()``).
 
 Reads:
-    <out_dir>/profiles/avg_profile/{lh,rh}_<targ>_roi<seed>_avg_profile.npy
+    <out_dir>/profiles/avg_profile/{lh,rh}_avg_profile.npy
     (raw fp32 ``(V_h, D)`` C-contig, as written by :mod:`avg_profiles`)
 
 Writes:
@@ -38,9 +38,9 @@ Writes:
         ``mtc``       — (D, L) fp64 column-unit-norm cluster means
         ``epsil``     — scalar fp64 vMF concentration (invAd output)
         ``lambda``    — (N_keep, L) uint8 dense one-hot assignments
-        ``lh_labels`` — (V_lh, 1) input lh labels (unmodified)
-        ``rh_labels`` — (V_rh, 1) rh labels offset by ``max(lh_labels)``
-                        on non-zero entries.
+        ``lh_labels`` — (V_lh, 1) input lh labels, medial wall zeroed
+        ``rh_labels`` — (V_rh, 1) rh labels (medial wall zeroed) offset
+                        by ``max(lh_labels)`` on non-zero entries.
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """

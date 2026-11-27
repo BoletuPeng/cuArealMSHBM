@@ -1,6 +1,7 @@
 """spatial_priors
 
-Two spatial-prior terms added to ``log_vmf`` in the gMSHBM E-step:
+Two spatial-prior terms added to ``log_vmf`` in the step-3 E-step
+(gMSHBM uses both; cMSHBM only ``spatial_xyz_prior``):
 
   * ``spatial_xyz_prior``     — sphere-vMF compactness regularizer,
                                 activated by ``check_connectedness`` via
@@ -13,7 +14,7 @@ Both produce an ``(N, L)`` array.
 Public API:
     XyzSession              — Session for spatial_xyz_prior.
     ConnectSession          — Session for spatial_connect_prior.
-    compute_unit_sphere_xyz — load + row-normalize bilateral sphere coords;
+    compute_unit_sphere_xyz — row-normalize bilateral sphere coords;
                               shared with the step-3 ``gpu`` session
                               (vmf_clustering_gpu).
     warmup                  — pre-compile every numba kernel. Idempotent.

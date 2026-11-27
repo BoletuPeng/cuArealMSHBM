@@ -1,6 +1,6 @@
 """step3_pipeline
 
-End-to-end Python step-3 super-call (Mode A).
+End-to-end Python step-3 super-call (single subject; Mode A and Mode B).
 
 Public API:
     Step3Config         — pipeline-config dataclass (every knob).

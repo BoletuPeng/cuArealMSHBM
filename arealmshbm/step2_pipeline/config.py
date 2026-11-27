@@ -22,10 +22,6 @@ from typing import Literal, Optional
 from arealmshbm.pipeline.config import _VALID_BACKENDS
 
 
-_SUPPORTED_MESHES = frozenset({
-    "fsaverage", "fsaverage4", "fsaverage5", "fsaverage6",
-})
-
 _VALID_MODES = frozenset({"gMSHBM", "dMSHBM"})
 # cMSHBM is not wired — the master kernel has no xyz-vMF (s_muc / gamma /
 # log_xyz_term) path. Passing mode='cMSHBM' raises in __post_init__.
@@ -39,11 +35,11 @@ class Step2Config:
     ----------------
     project_dir : path containing the Mode-B layout produced by step1:
         project_dir/
-          cohort.json                                    (roster + artifact ledger)
-          profiles_raw/sub<S>/sub<S>_<…>.profile.b2nd    (per-subject BOLD)
+          cohort.json                                    (roster + per-subject paths)
+          profiles_raw/sub<S>/sub<S>.profile.b2nd        (per-subject BOLD)
           gradients/sub<S>/{lh,rh}_emb_<N>_*.npy|.mat    (gMSHBM only)
           group/group.mat
-          spatial_mask/spatial_mask_<mesh>.mat
+          spatial_mask/spatial_mask.mat
     num_sub : S — number of subjects in the training cohort.
                   Must match cohort.json's roster size.
     num_session : T — number of sessions per subject.
@@ -101,8 +97,7 @@ class Step2Config:
     #          and the final Params leave the GPU. Pipeline path:
     #          ``load_inputs_sparse`` → ``initialize_params_sparse`` →
     #          ``_run_em_sparse``. Static kernel limits, refused below:
-    #          a seed mesh with ⌈D/8⌉ ≤ 256 (fsaverage3), num_clusters ≤
-    #          512 and n_grad_components ≤ 11772.
+    #          num_clusters ≤ 512 and n_grad_components ≤ 11772.
     backend: Literal["cpu", "gpu"] = "cpu"
 
     # How the per-subject BOLD is held. On the GPU backend
@@ -112,29 +107,26 @@ class Step2Config:
     #                       (grad, s_t_nu / X_dot_sl, s_lambda on P, the
     #                       iteration-1 scratch) fits in free device
     #                       memory minus ``gpu_cache_safety_margin_gb``;
-    #                       otherwise ``stream``. Default.
+    #                       otherwise ``stream`` with a RuntimeWarning.
+    #                       Default.
     # 'eager_bitpacked'  — the packed cache is device-resident (~72 MB
     #                       per subject at fsaverage6 / T=6); raises when
     #                       it does not fit.
     # 'stream'           — one pinned (T, N, ⌈D/8⌉) slot refilled from a
-    #                       pageable host cache, two H2D visits per
-    #                       subject per EM iteration.
+    #                       pageable host cache (from disk when that cache
+    #                       exceeds half the available host RAM), two H2D
+    #                       visits per subject per EM iteration.
     # On the CPU backend the same knob picks the loader's host-side
     # bit-packed cache ('auto' / 'eager_bitpacked') or per-call disk
     # decode ('stream').
     bold_cache_mode: Literal[
         "auto", "eager_bitpacked", "stream"
     ] = "auto"
-    # Headroom (GB) added to the GPU sizing rule when
-    # ``bold_cache_mode='auto'`` decides whether the packed cache fits.
+    # Headroom (GB) added to the GPU sizing rule (every
+    # ``bold_cache_mode``: 'auto' picks the cache with it, the others
+    # raise when it does not fit). Unused on the CPU backend.
     gpu_cache_safety_margin_gb: float = 4.0
 
-    # ── mesh ──
-    mesh: str = "fsaverage6"
-    # Seed mesh used by step-1's profile writer; baked into the .b2nd
-    # canonical filename (``sub<S>_<targ>_roi<seed>.profile.b2nd``).
-    # Step-2's BOLD loader uses this to find the on-disk b2nd files.
-    seed_mesh: str = "fsaverage3"
     # Gradient embedding components per hemi (used only in gMSHBM mode).
     # Matches step-3's Step3Config.n_grad_components default.
     n_grad_components: int = 100
@@ -159,11 +151,6 @@ class Step2Config:
     def __post_init__(self) -> None:
         if not self.project_dir:
             raise ValueError("Step2Config: project_dir is required")
-        if self.mesh not in _SUPPORTED_MESHES:
-            raise ValueError(
-                f"Step2Config: mesh must be one of "
-                f"{sorted(_SUPPORTED_MESHES)} (got {self.mesh!r})"
-            )
         # cMSHBM is recognised but not implemented — raise the
         # semantically-correct NotImplementedError (matches
         # vmf_clustering_batch + Step2EmIterSession).
@@ -190,20 +177,8 @@ class Step2Config:
                 f"Step2Config: backend must be one of {sorted(_VALID_BACKENDS)} "
                 f"(got {self.backend!r})"
             )
-        # ``x_dot_sl_bits`` gives each of its 256 threads one byte of the
-        # packed row, so ⌈D/8⌉ ≤ 256; fsaverage4 and larger exceed it, and
-        # fsaverage3 (D = 1175) is also the only seed mesh the gpu sessions
-        # are validated on. Fail here rather than in the session ctor's
-        # ``check_dims``, which only runs after the step-2 input load and
-        # the kernel compile.
         if self.backend == "gpu":
-            if self.seed_mesh != "fsaverage3":
-                raise ValueError(
-                    f"Step2Config: backend='gpu' requires "
-                    f"seed_mesh='fsaverage3' (ceil(D/8) <= 256); got "
-                    f"{self.seed_mesh!r}. Use backend='cpu'."
-                )
-            # The other two static kernel limits: ``init_soft``
+            # Two static kernel limits: ``init_soft``
             # keeps ``INIT_MAXJ`` per-lane accumulators over a 32-lane
             # warp, and ``connect_u`` stages one float per gradient
             # component in shared memory. Checked here as well as in

@@ -4,7 +4,7 @@ Connectedness check + per-parcel component distance, called inside the EM
 body to decide which parcels need the spatial-xyz pull.
 
 Public API:
-    compute_components_general — BFS over parcel labels on the bilateral
+    compute_components_general — union-find over parcel labels on the bilateral
                                  mesh; returns per-parcel component count.
     component_distance         — pairwise centroid distance between
                                  components inside each parcel.

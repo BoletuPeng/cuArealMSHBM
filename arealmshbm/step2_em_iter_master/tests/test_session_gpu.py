@@ -40,7 +40,7 @@ from arealmshbm.step2_io.load_subject_profiles import (  # noqa: E402
     _widen_normalize_bitpacked_to_f32_NTD_kernel,
 )
 from arealmshbm.step2_io.tests._synthetic_project import (  # noqa: E402
-    SEED, TARG, load_project, make_project,
+    load_project, make_project,
 )
 from arealmshbm.step2_em_iter_master.tests import _bench_fixture as BF  # noqa: E402
 
@@ -412,7 +412,7 @@ def test_ctor_propagates_a_reader_failure(tmp_path, monkeypatch, cache, fraction
     import arealmshbm.step2_em_iter_master.session_gpu as sg
     from arealmshbm.initialize_concentration import initialize_concentration
     inputs, _bm, _mtc, _bold, _g = _synthetic(7, tmp_path)
-    write_subject_profile_tnd(profile_path(tmp_path, "2", TARG, SEED),
+    write_subject_profile_tnd(profile_path(tmp_path, "2"),
                               np.zeros((1, N, D), dtype=np.uint8))
     monkeypatch.setattr(sg, "_HOST_CACHE_FRACTION", fraction)
     dim = D - 1

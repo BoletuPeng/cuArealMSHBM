@@ -61,13 +61,11 @@ from arealmshbm.data_io.profile_io import (
     profile_path, write_subject_profile_tnd,
 )
 
-TARG, SEED = "fsaverage6", "fsaverage3"
-
 
 def _mesh_or_skip():
     """(V_lh, V_rh) for the test mesh, or skip when unstaged."""
     try:
-        return _hemi_vert_counts(TARG)
+        return _hemi_vert_counts()
     except FileNotFoundError as exc:      # pragma: no cover - env-dependent
         pytest.skip(f"avg_mesh bundle not staged: {exc}")
 
@@ -268,7 +266,7 @@ def test_from_accumulator_matches_cpu_and_npy_bytes(tmp_path, D, n_sub):
 
     acc = _accumulate(subs, V_lh, V_rh, D)
     assert acc.n_pairs == 2 * n_sub
-    res = avg_profiles_from_accumulator(acc, TARG, SEED, tmp_path, save=True)
+    res = avg_profiles_from_accumulator(acc, tmp_path, save=True)
     assert isinstance(res, AvgProfilesResult)
     assert np.array_equal(res.lh_avg, ref_lh)
     assert np.array_equal(res.rh_avg, ref_rh)
@@ -295,7 +293,7 @@ def test_from_accumulator_matches_cpu_and_npy_bytes(tmp_path, D, n_sub):
     with pytest.raises(RuntimeError, match="already taken"):
         acc.add(0, cp.asarray(subs[0][0]))
     with pytest.raises(RuntimeError, match="already taken"):
-        avg_profiles_from_accumulator(acc, TARG, SEED, tmp_path, save=False)
+        avg_profiles_from_accumulator(acc, tmp_path, save=False)
     assert np.array_equal(cp.asnumpy(acc.lh), ref_lh)
     assert np.array_equal(cp.asnumpy(acc.rh), ref_rh)
 
@@ -311,11 +309,11 @@ def test_disk_reading_gpu_supercall_matches_the_accumulator(tmp_path):
     for s in (1, 2):
         bits, packed = _random_packed(rng, T, N, D)
         write_subject_profile_tnd(
-            profile_path(tmp_path, str(s), TARG, SEED), bits)
+            profile_path(tmp_path, str(s)), bits)
         subs.append(packed)
     ref_lh, ref_rh = _cpu_reference(subs, D, V_lh, V_rh)
 
-    res = avg_profiles(seed_mesh=SEED, targ_mesh=TARG, out_dir=tmp_path,
+    res = avg_profiles(out_dir=tmp_path,
                        num_sub=2, num_sess=T, verbose=False, backend="gpu")
     assert res.lh_avg_dev is None and res.rh_avg_dev is None
     assert np.array_equal(res.lh_avg, ref_lh)
@@ -329,23 +327,20 @@ def test_from_accumulator_validation(tmp_path):
     N = V_lh + V_rh
     acc = PackedProfileAccumulator(V_lh, V_rh, 13, 2)
     with pytest.raises(ValueError, match="no session was accumulated"):
-        avg_profiles_from_accumulator(acc, TARG, SEED, tmp_path, save=False)
+        avg_profiles_from_accumulator(acc, tmp_path, save=False)
     acc.add(0, cp.zeros((N, 2), dtype=cp.uint8))
-    with pytest.raises(ValueError, match="only fsaverage"):
-        avg_profiles_from_accumulator(acc, "fs_LR_32k", SEED, tmp_path,
-                                      save=False)
     other = PackedProfileAccumulator(V_lh + 1, V_rh, 13, 1)
     other.add(0, cp.zeros((N + 1, 2), dtype=cp.uint8))
     with pytest.raises(ValueError, match="hemi sizes"):
-        avg_profiles_from_accumulator(other, TARG, SEED, tmp_path, save=False)
+        avg_profiles_from_accumulator(other, tmp_path, save=False)
     # one of two sessions folded in: the subject is incomplete
     with pytest.raises(ValueError, match="last subject is incomplete"):
-        avg_profiles_from_accumulator(acc, TARG, SEED, tmp_path, save=False)
+        avg_profiles_from_accumulator(acc, tmp_path, save=False)
     acc.add(1, cp.zeros((N, 2), dtype=cp.uint8))
 
     # save=False writes nothing but still names the canonical paths
-    res = avg_profiles_from_accumulator(acc, TARG, SEED, tmp_path, save=False)
+    res = avg_profiles_from_accumulator(acc, tmp_path, save=False)
     assert res.writer is None
     assert not res.lh_path.exists()
-    assert res.lh_path.name == f"lh_{TARG}_roi{SEED}_avg_profile.npy"
+    assert res.lh_path.name == "lh_avg_profile.npy"
     assert np.array_equal(res.lh_avg, np.zeros((V_lh, 13), np.float32))

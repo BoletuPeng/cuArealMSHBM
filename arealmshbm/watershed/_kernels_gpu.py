@@ -2,25 +2,26 @@
 
 GPU port of the watershed flooding kernel — CuPy RawKernels.
 
-Replaces the numba @njit prange-over-K implementation in
-:mod:`watershed_repaired` with a block-per-column GPU layout that
+GPU counterpart of the numba @njit prange-over-K implementation in
+:mod:`watershed_repaired`: a block-per-column GPU layout that
 exploits the K-column independence at much wider parallelism than
 the CPU's 24-core prange:
 
   * **Block-per-column** — one CUDA block handles one watershed column.
     K ≈ 125 columns per call (one per ``randinds_verts`` seed in
-    block_a). 60 SMs × 4 blocks/SM resident ⇒ ~240 concurrent blocks,
-    so one outer-iter_a's worth of columns fits in ~1 wave.
+    block_a).
 
-  * **(K, N) layout, host-transposed** — the kernel reads
+  * **(K, N) layout, device-transposed** — the kernel reads
     ``em[k, v]`` and ``label_k[neighbor_of_v]``. With (K, N) layout
     threads in a warp iterate over adjacent vertices for the same
     column, so the 32 fp32 loads collapse to 1 HBM transaction per
     warp instead of 1 transaction per thread (which is what the
     raw (N, K) layout would give — stride K between thread loads).
 
-  * **Single-kernel threshold sweep** — the n_h=50 threshold loop
-    lives inside the kernel; 1 launch per call instead of 50. Block-
+  * **Single-kernel threshold sweep** — the n_h-threshold loop
+    (n_h = stepnum + 1 = 51 at the stock ``stepnum = 50`` /
+    ``fracmaxh = 1``; fewer when ``fracmaxh < 1``) lives inside the
+    kernel; 1 launch per call instead of n_h. Block-
     local ``__syncthreads`` is sufficient because one block ↔ one
     column ↔ no cross-block dependency.
 
@@ -30,9 +31,9 @@ the CPU's 24-core prange:
     instead double-buffer through ``proposal`` and run ONE Jacobi
     iter per threshold step. Multi-hop chains naturally propagate
     over consecutive thresholds (the water keeps rising), so by the
-    end of the n_h=50 sweep all reachable labels have spread. The
-    shuffle-order semantic is replaced with a deterministic 1-pass
-    Jacobi semantic. Empirically on sub-001 the two agree on the
+    end of the n_h sweep all reachable labels have spread. The GPU
+    semantic is a deterministic 1-pass Jacobi, not the CPU shuffle
+    order. Empirically on sub-001 the two agree on the
     (labels==0) watershed-boundary mask to within ~0.5 pp of step3
     final vertex agreement (98.69% CPU → 98.22% GPU, both well above
     the 97.5% spec bar). The downstream consumer is
@@ -70,8 +71,8 @@ order, which is GPU-arbitrary. But the downstream consumer reads
 permutation: the watershed-boundary GEOMETRY depends on which
 catchments overlap, not on which integer was used to mark each
 catchment. The Jacobi propagation likewise produces a deterministic
-boundary mask given a (modulo-permutation) seed — multi-iter Jacobi
-to convergence does not depend on within-iter thread schedule order
+boundary mask given a (modulo-permutation) seed — the one Jacobi pass
+per threshold does not depend on within-pass thread schedule order
 since Phase-1 reads happen entirely before Phase-2 writes via
 ``__syncthreads``.
 
@@ -131,8 +132,8 @@ _SEED_BLOCK = 256
 # Algorithm: one Jacobi pass per threshold step (propose + commit).
 # Multi-hop label propagation chains spread across consecutive
 # thresholds — the water rising naturally drives transitive
-# propagation without an inner convergence loop. We deliberately
-# DROPPED the convergence loop because:
+# propagation without an inner convergence loop. There is deliberately
+# no convergence loop because:
 #
 #   * Adding it made the kernel ~3x slower on real-data sub-002
 #     (340 ms vs 100 ms watershed wall on the cohort).

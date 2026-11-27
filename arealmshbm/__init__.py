@@ -25,7 +25,7 @@ Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 # Lazy top-level re-exports (PEP 562): eager imports of the three step
 # packages cost a step-0-only process ~0.88 s of import graph it never
 # uses. The ``find_spec`` fallback in ``__getattr__`` preserves the
-# submodule spelling (``arealmshbm.data_io``) the eager imports gave.
+# attribute spelling of submodules (``arealmshbm.data_io``).
 
 _LAZY_EXPORTS = {
     "Step0Config": "step0_pipeline",

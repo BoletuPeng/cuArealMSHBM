@@ -64,7 +64,7 @@ void hemi_gradient_kernel(
     int tid = threadIdx.x;
     int K_thr = blockDim.x;
 
-    // Shared per-vertex state (computed once by warp 0; broadcast).
+    // Shared per-vertex state (computed once by thread 0; broadcast).
     __shared__ int   sm_m;
     __shared__ int   sm_nb[MAX_DEG];
     __shared__ float sm_xmag[MAX_DEG];
@@ -269,16 +269,16 @@ GradientMeshGPU = Tuple[cp.ndarray, cp.ndarray, cp.ndarray, cp.ndarray, cp.ndarr
 
 
 def prepare_gradient_mesh_gpu(cpu_prep) -> GradientMeshGPU:
-    """Push a CPU prepare_gradient_mesh output to device.
+    """Push a CPU gradient mesh-table tuple to device.
 
     Parameters
     ----------
-    cpu_prep : (deg, nbors, vn, va) — the 4-tuple from
-        :func:`.surface_gradient.prepare_gradient_mesh`.
+    cpu_prep : (deg, nbors, vn, va) — the 4-tuple on
+        ``Step0Inputs.{lh,rh}_grad_prep``.
 
     Returns
     -------
-    (deg_d, nbors_d, vn_d, va_d, verts_d=None placeholder)
+    (deg_d, nbors_d, vn_d, va_d)
 
     The verts array is uploaded separately by the pipeline (it's
     already part of Step0Inputs as ``lh_mid_verts``/``rh_mid_verts``
@@ -345,8 +345,9 @@ def cifti_gradient_gpu(data: Union[np.ndarray, cp.ndarray],
     ``test_gpu_correctness``).
 
     Returns a device-resident ``cp.ndarray``. The production caller's
-    per-iter_a accumulator lives on device too, so the only D2H is one
-    final copy at the end of subgraph A (~300 KB of edge_count). Tests
+    per-iter_a accumulator lives on device too, so the only bulk D2H in
+    subgraph A is the per-block ``(N_cortex,)`` int64 edge count out of
+    ``watershed_edge_count_gpu``. Tests
     that need a numpy view call ``cp.asnumpy`` at their boundary.
 
     Parameters

@@ -1,31 +1,34 @@
 # arealmshbm/data — precomputed assets
 
 This directory ships **empty** in the source repository: subject-invariant
-data is kept out of git so clones stay small. A missing mesh bundle
-(`avg_mesh`) is reported as a hard `FileNotFoundError` telling you to
-(re)install — it is never silently rebuilt at runtime. A missing step-0
-cache is the exception: it goes to the live rebuild described in the
-note under Layout.
+data is kept out of git so clones stay small. A missing asset — a mesh
+bundle (`avg_mesh`) or the step-0 inputs bundle (`step0_inputs`) — is
+reported as a hard `FileNotFoundError` telling you to (re)install; neither
+is rebuilt at runtime.
 
 ## Where to get the assets
 
 **Release assets** — published under the
-[`assets-v1`](https://github.com/BoletuPeng/cuArealMSHBM/releases/tag/assets-v1) tag, versioned independently of the
-code releases (the step-0 cache is keyed on `(mesh, smooth_sigma, K_hop)`
-and carries its own format version, none of which move when the pipeline
-changes). Verify downloads against the release's `SHA256SUMS.txt`.
+[`assets-v2`](https://github.com/BoletuPeng/cuArealMSHBM/releases/tag/assets-v2) tag, versioned independently of the
+code releases (the bundles carry their own format version and are only
+re-cut when the layout changes). Verify downloads against the release's
+`SHA256SUMS.txt`.
 
 | asset | size | needed by |
 |---|---:|---|
-| `avg_mesh-fsaverage6.tar.gz` | 4.3 MB | **everyone** |
-| `step0_inputs-fsaverage6_sigma2.55_khop3.tar.gz` | 82.6 MB | **everyone** (see the note under Layout) |
+| `avg_mesh.tar.gz` | 4.5 MB | **everyone** |
+| `step0_inputs.tar.gz` | 82.7 MB | **everyone** |
 
 ```bash
-curl -L -O https://github.com/BoletuPeng/cuArealMSHBM/releases/download/assets-v1/avg_mesh-fsaverage6.tar.gz
-curl -L -O https://github.com/BoletuPeng/cuArealMSHBM/releases/download/assets-v1/step0_inputs-fsaverage6_sigma2.55_khop3.tar.gz
-tar -xzf avg_mesh-fsaverage6.tar.gz -C arealmshbm/data/precomputed/
-tar -xzf step0_inputs-fsaverage6_sigma2.55_khop3.tar.gz -C arealmshbm/data/precomputed/
+curl -L -O https://github.com/BoletuPeng/cuArealMSHBM/releases/download/assets-v2/avg_mesh.tar.gz
+curl -L -O https://github.com/BoletuPeng/cuArealMSHBM/releases/download/assets-v2/step0_inputs.tar.gz
+tar -xzf avg_mesh.tar.gz -C arealmshbm/data/precomputed/
+tar -xzf step0_inputs.tar.gz -C arealmshbm/data/precomputed/
 ```
+
+[`assets-v1`](https://github.com/BoletuPeng/cuArealMSHBM/releases/tag/assets-v1) holds the same data under the file
+names v2.2.0 and earlier read (`avg_mesh/<hemi>_fsaverage6_<surface>.npz`,
+`step0_inputs/fsaverage6_sigma2.55_khop3/`); use it with those releases.
 
 **From a CBIG checkout** — the group priors and spatial masks below are
 byte-identical to CBIG's, so there is no second copy in this project.
@@ -37,38 +40,43 @@ Take them from
 ```
 arealmshbm/data/
   precomputed/                             # gitignored even when staged
-    avg_mesh/<hemi>_<mesh>_<surface>.npz   # fsaverage-family mesh bundles
-    step0_inputs/<mesh>_sigma<S>_khop<K>/  # step-0 gradient cache
+    avg_mesh/<hemi>_<surface>.npz          # fsaverage6 mesh bundles
+    step0_inputs/                          # step-0 inputs bundle
+      manifest.json
+      *.npy
   group_priors/                            # optional, from CBIG
-    HCP_fsaverage6_40sub/<K>/<variant>/beta<B>/Params_Final.mat
-    HCP_fs_LR_32k_40sub/<K>/<variant>/beta<B>/Params_Final.mat
-  spatial_mask/                            # optional, from CBIG
-    <K>/spatial_mask_<mesh>.mat
+    HCP_40sub/<K>/<variant>/beta<B>/Params_Final.mat
 ```
 
-- `precomputed/avg_mesh/` is read by `load_avg_mesh` (override the root
-  via `$MSHBM_PRECOMPUTED_ROOT`). There is **no** runtime rebuild from
-  FreeSurfer sources — these bundles are the only source of mesh
-  geometry.
-- `precomputed/step0_inputs/` is nominally a cache: `Step0Pipeline.load_inputs`
-  rebuilds it on a miss and writes it back. In practice, download it — the
-  rebuild (`python -m arealmshbm.precompute.step0_inputs_builder`) reads the
-  raw FreeSurfer sphere surfaces and `cortex.label` from
-  `<CBIG>/data/templates/surface/<mesh>/`, and current CBIG revisions keep
-  the fsaverage meshes at `fake_freesurfer/subjects/<mesh>/` instead, so the
-  builder raises `FileNotFoundError` against a real checkout. (It builds in
-  ~9 s once the sources are where it looks.) The midthickness atlas path it
-  uses is correct.
+- `precomputed/avg_mesh/` is read by `load_avg_mesh`: `<hemi>` is `lh` /
+  `rh`, `<surface>` is `inflated` / `sphere`. These bundles are the only
+  source of mesh geometry; there is **no** runtime rebuild from FreeSurfer
+  sources.
+- `precomputed/step0_inputs/` is read by `Step0Pipeline.load_inputs`
+  under the same contract: the sphere and midthickness meshes, the medial
+  mask, the smoothing and gradient mesh tables, the Gaussian smoothing
+  gather and the cortex neighbour table with its 3-hop expansion. The
+  2.55 mm smoothing sigma and the 3-hop neighbourhood are baked into it;
+  neither is a config key. A bundle whose `manifest.json` carries another
+  format version is refused.
+- `$MSHBM_PRECOMPUTED_ROOT` relocates `precomputed/` as a whole: point it
+  at a directory that holds `avg_mesh/` and `step0_inputs/`.
 - **Group priors** are model *inputs*, not required by the package: Mode A
   reads the prior only from `<project>/priors/<variant>/beta<B>/Params_Final.mat`
   (no `beta<B>/` segment for dMSHBM) and staging it there is the project
   creator's job; Mode B trains one from your own cohort. Copy one from
-  CBIG's `lib/group_priors/`, or from another project's Mode B output.
+  CBIG's `lib/group_priors/HCP_fsaverage6_40sub/`, or from another
+  project's Mode B output. The optional `group_priors/HCP_40sub/` slot
+  above is read by one test only
+  (`generate_profiles/tests/test_seed_vertices.py`, which checks the seed
+  count against the prior's profile dimension at
+  `HCP_40sub/100/gMSHBM/beta5/` and skips that half without it).
 - **Spatial masks** are likewise not required: step 1 generates the mask
-  your project uses into `<project>/spatial_mask/spatial_mask_<mesh>.mat`.
+  your project uses into `<project>/spatial_mask/spatial_mask.mat`.
   CBIG's `lib/spatial_mask/` copies are useful as a cross-check.
 - `MSHBM_ATLAS_DIR` is a separate, always-required runtime input (the live
-  `label/*.annot` reads in step 1) and is not part of any of the above.
+  `fsaverage6/label/*.annot` reads in step 1) and is not part of any of
+  the above.
 
 ## Terms
 

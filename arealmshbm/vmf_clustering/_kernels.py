@@ -6,7 +6,7 @@ accumulator).
 
 Per-call buffer shapes (sub-001, fsaverage6, 6 sessions, 300 ROIs):
     N = 81924    — total vertices (bilateral, medial wall included)
-    D = 1175     — BOLD time-series length per session
+    D = 1175     — RSFC profile dimension (fsaverage3 seeds off the medial wall)
     T = 6        — sessions
     L = 300      — clusters
     M_active     — N rows where theta sums > 0 (here 74947 ≤ N).

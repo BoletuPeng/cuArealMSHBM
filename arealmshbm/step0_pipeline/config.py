@@ -1,7 +1,6 @@
 """config.py
 
-Configuration dataclass for the step-0 super-call. Mode-A only —
-fsaverage6 (the canonical CBIG validation mesh).
+Configuration dataclass for the step-0 super-call, on fsaverage6.
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """
@@ -14,23 +13,22 @@ from typing import Any, Callable, Literal, Optional, Tuple
 from arealmshbm.pipeline.config import _VALID_BACKENDS
 
 
-_SUPPORTED_MESHES = frozenset({"fsaverage6"})
-
-
 @dataclass
 class Step0Config:
     """All parameters for one step-0 single-subject run.
 
     Required:
-        project_dir : Mode-A project root with ``converted_bold/``
-                      populated; outputs land under
+        project_dir : project root (``converted_bold/`` populated
+                      unless BOLD paths are given); outputs land under
                       ``project_dir/gradients/sub<out_subid>/``.
         sub_id      : 'sub-001' / 'sub-002' / ... — drives BOLD lookup.
         sess_list   : tuple of session IDs.
 
     Defaults match the CBIG canonical call (sub_FC=100, sub_verts=200,
-    block_a=3, block_b=10, smooth_sigma=2.55 mm, K_hop=3,
-    watershed_steps=50, downsample=3.2, num_components=100).
+    block_a=3, block_b=10, watershed_steps=50, downsample=3.2,
+    num_components=100). Its 2.55 mm smoothing sigma and 3-hop
+    neighbourhood are baked into the shipped inputs bundle
+    (:mod:`.inputs_bundle`).
     """
 
     project_dir: Path
@@ -38,25 +36,21 @@ class Step0Config:
     sess_list: Tuple[str, ...]
 
     out_subid: str = "1"
-    mesh: str = "fsaverage6"
     sub_FC: int = 100
     sub_verts: int = 200
     block_a: int = 3
     block_b: int = 10
-    smooth_sigma: float = 2.55
-    K_hop: int = 3
     watershed_steps: int = 50
     watershed_frac: float = 1.0
     downsample: float = 3.2
     num_components: int = 100
 
-    cbig_code_dir: Optional[Path] = None
     bold_root: Optional[Path] = None
     save_artifacts: bool = True
 
     # Explicit (lh, rh) path tuples per session, in 1-indexed order. When
     # set, ``bold_paths(sess_idx)`` returns directly from here and ignores
-    # ``bold_root`` / ``sub_id`` / ``mesh``-derived naming. Used by the
+    # ``bold_root`` / ``sub_id``-derived naming. Used by the
     # unified pipeline driver (``arealmshbm.pipeline``) so the BOLD
     # list in ``bold_inputs.json`` is the single source of truth without
     # imposing a filename convention on the user.
@@ -87,10 +81,11 @@ class Step0Config:
     #            CBIG .mat alongside the .npy.
     emb_output_format: Literal["npy", "mat", "both"] = "npy"
 
-    # 'cpu' = pure-numba CPU path (default).
-    # 'gpu' = CuPy backend for the dominant hotspot (subgraph C
-    #         eigsh / partial Lanczos). All other leaves stay on CPU
-    #         numba; gpu mode requires `cupy` installed.
+    # 'cpu' = numba / BLAS / scipy CPU path (default).
+    # 'gpu' = CuPy backend for subgraphs A-C (fc_similarity,
+    #         surface_gradient, smoothing, minima, watershed, geodesic
+    #         distance, eigsh); bold_io and the sphere interpolations
+    #         stay on CPU. gpu mode requires `cupy` installed.
     backend: str = "cpu"
 
     # ── geodesic distance matrix dump ──
@@ -111,8 +106,8 @@ class Step0Config:
     # ── edge_density.npy dump ──
     # ``edge_density.npy`` is a step-0 *intermediate* (subgraph A →
     # subgraph B handoff): subgraph A produces it from
-    # watershed → edge_count and subgraph B consumes it in-memory to
-    # seed the gradient-geodesic-distance Dijkstra. No production
+    # watershed → edge_count and subgraph B consumes it in-memory as
+    # the gradient-geodesic-distance edge weights. No production
     # downstream step reads the disk artifact — step3's pipeline
     # consumes only the embeddings, and step1/2 never look at it. The
     # only consumer is the internal step-0 CPU/GPU bit-equality
@@ -125,19 +120,14 @@ class Step0Config:
     save_edge_density: bool = False
 
     def __post_init__(self):
-        if self.mesh not in _SUPPORTED_MESHES:
-            raise ValueError(
-                f"step-0 currently supports only mesh in {sorted(_SUPPORTED_MESHES)}; "
-                f"got {self.mesh!r}"
-            )
         if self.backend not in _VALID_BACKENDS:
             raise ValueError(
                 f"backend must be one of {' / '.join(_VALID_BACKENDS)} "
                 f"(got {self.backend!r})"
             )
         if self.backend == "gpu":
-            # Fail at config time on a missing GPU stack rather than ~30 s
-            # into the pipeline at the first eigsh call.
+            # Fail at config time on a missing GPU stack rather than at
+            # the first GPU leaf import inside the pipeline.
             try:
                 import cupy  # noqa: F401
                 from cupyx.scipy.sparse.linalg import eigsh  # noqa: F401
@@ -147,8 +137,6 @@ class Step0Config:
                     f"import failed ({e}). Use backend='cpu' or install cupy."
                 ) from e
         self.project_dir = Path(self.project_dir)
-        if self.cbig_code_dir is not None:
-            self.cbig_code_dir = Path(self.cbig_code_dir)
         if self.bold_root is not None:
             self.bold_root = Path(self.bold_root)
         if not isinstance(self.sess_list, tuple):
@@ -156,11 +144,11 @@ class Step0Config:
         if len(self.sess_list) == 0:
             raise ValueError("sess_list must be non-empty")
         for k in ("sub_FC", "sub_verts", "block_a", "block_b",
-                  "K_hop", "watershed_steps", "num_components"):
+                  "watershed_steps", "num_components"):
             v = getattr(self, k)
             if not isinstance(v, int) or v <= 0:
                 raise ValueError(f"{k} must be a positive int; got {v!r}")
-        for k in ("smooth_sigma", "watershed_frac", "downsample"):
+        for k in ("watershed_frac", "downsample"):
             v = getattr(self, k)
             if not (isinstance(v, (int, float)) and v > 0):
                 raise ValueError(f"{k} must be a positive number; got {v!r}")
@@ -179,9 +167,9 @@ class Step0Config:
 
         Priority:
           1. ``bold_paths_override`` (driver-injected explicit list);
-          2. ``bold_root`` + ``sub_id`` + ``sess`` + ``mesh`` naming —
+          2. ``bold_root`` + ``sub_id`` + ``sess`` naming —
              synthesizes the canonical DeepPrep / fmriprep filename
-             ``{sub}_{ses}_task-rest_hemi-{L,R}_space-{mesh}_bold.func.gii``.
+             ``{sub}_{ses}_task-rest_hemi-{L,R}_space-fsaverage6_bold.func.gii``.
              Read by :func:`arealmshbm.bold_io.read_surface_bold`, which
              refuses any non-``.gii`` suffix.
         """
@@ -193,10 +181,10 @@ class Step0Config:
         )
         lh = root / (
             f"{self.sub_id}_{sess}_task-rest_hemi-L_"
-            f"space-{self.mesh}_bold.func.gii"
+            f"space-fsaverage6_bold.func.gii"
         )
         rh = root / (
             f"{self.sub_id}_{sess}_task-rest_hemi-R_"
-            f"space-{self.mesh}_bold.func.gii"
+            f"space-fsaverage6_bold.func.gii"
         )
         return lh, rh

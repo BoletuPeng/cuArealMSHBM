@@ -30,7 +30,8 @@ The step0 → step3 gradient hand-off is in-memory (driver collects each
 subject's ``(N, n_components)`` gradient matrix from step0 and forwards
 it to ``Step3Pipeline(precomputed_gradient_mat=...)``); step1's avg
 profile arrays are likewise threaded subgraph 2 → 3 without a disk
-re-read.
+re-read. Step 2 (Mode B) reads the gradients from disk, through the
+paths ``cohort.json`` records.
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """
@@ -42,7 +43,7 @@ import logging
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -134,34 +135,6 @@ class Pipeline:
                 f">= 2 subjects (got {self.inputs.num_subjects}). Mode B's "
                 f"coupled EM needs a cohort, not a single subject."
             )
-        # Mode A never runs step 2, so a leftover backend_step2 there is
-        # inert and must not be rejected.
-        if (not self.config.is_mode_a
-                and self.config.backend_step2 == "gpu"):
-            self._require_fsaverage3_seed("step2")
-        # Step 3 runs in both modes.
-        if self.config.backend_step3 == "gpu":
-            self._require_fsaverage3_seed("step3")
-
-    def _require_fsaverage3_seed(self, step: str) -> None:
-        """Reject the P-layout ``'gpu'`` backend of step 2 / step 3 on a
-        seed mesh it cannot serve.
-
-        Both bake a ``ceil(D/8) <= 256`` limit; fsaverage4 and larger
-        exceed it, and ``seed_mesh='fsaverage3'`` is also the only seed
-        mesh the gpu sessions are validated on. ``seed_mesh`` lives in
-        bold_inputs.json, so ``read_pipeline_config`` cannot see it and
-        the leaf-side rules (``Step2Config.__post_init__``, the step-3
-        packed-BOLD loader) fire only after steps 0-1 (step 3: 0-2)
-        have already burned minutes of wall time.
-        """
-        if self.inputs.seed_mesh != "fsaverage3":
-            raise ValueError(
-                f"pipeline_config.json: backend_{step}='gpu' requires "
-                f"bold_inputs.json seed_mesh='fsaverage3' (ceil(D/8) <= "
-                f"256); got {self.inputs.seed_mesh!r}. Use "
-                f"backend_{step}='cpu'."
-            )
 
     def _prior_includes_beta(self) -> bool:
         """Whether this variant's prior path carries a ``beta<X>`` segment.
@@ -222,23 +195,6 @@ class Pipeline:
     # ─────────────────────────────────────────────────────────────────
     # Per-step runners
     # ─────────────────────────────────────────────────────────────────
-    def _run_step0_all_subjects_maybe_tf32(self) -> Dict[str, "np.ndarray"]:
-        """Driver wrapper around step0 that toggles cuBLAS TF32 math
-        mode for the duration of the step (and only this step) when
-        ``config.step0.enable_tf32`` is True and step0 runs on GPU.
-
-        Only ``fc_similarity`` dispatches through cuBLAS sgemm inside
-        step0; other GPU leaves (``diffusion_map`` eigsh, RawKernels)
-        are unaffected by the math-mode toggle. The mode is restored
-        on exit so adjacent step1/2/3 keep strict fp32.
-        """
-        if (self.config.step0.enable_tf32
-                and self.config.backend_step0 == "gpu"):
-            from ._cublas_math_mode import cublas_tf32_scope
-            with cublas_tf32_scope():
-                return self._run_step0_all_subjects()
-        return self._run_step0_all_subjects()
-
     def _run_step0_all_subjects(self) -> Dict[str, "np.ndarray"]:
         """Step 0: gradients per subject. Each call writes
         ``project_dir/gradients/sub<id>/{lh,rh}_emb_<N>_distance_matrix.npy``
@@ -264,8 +220,8 @@ class Pipeline:
         overlaps the whole stack. See
         :mod:`arealmshbm.pipeline._step0_stage_pipeline`.
 
-        The CPU backend runs the same four stage threads, without cupy
-        streams.
+        The CPU backend runs through the same four stage threads, with
+        no cupy streams.
         """
         from arealmshbm.step0_pipeline import Step0Config, Step0Pipeline
         from ._step0_bold_prefetcher import Step0BoldPrefetcher
@@ -282,23 +238,19 @@ class Pipeline:
 
         # One-off ``load_inputs`` to extract the mesh-derived
         # constants the prefetcher needs (medial_mask + hemi sizes).
-        # Also populates the process-wide ``_INPUTS_CACHE`` so every
-        # per-subject pipeline below hits tier 1.
+        # Also populates the process-wide ``_INPUTS_CPU`` memo so every
+        # per-subject pipeline below reuses it.
         # ``**step0_kwargs`` splats every Step0Knobs algorithm field
         # into Step0Config via the field-name 1:1 mapping pinned by
         # test_knobs_field_match.test_step0_knobs_field_names_match_step0config
         # — adding an algorithm knob auto-flows here without a manual
-        # edit. ``enable_tf32`` is the one exception: it's consumed by
-        # the driver's tf32_scope wrapper (above), not by Step0Config
-        # itself, so it's popped from the splat.
+        # edit.
         step0_kwargs = asdict(self.config.step0)
-        step0_kwargs.pop("enable_tf32")
         seed_cfg = Step0Config(
             project_dir=self.layout.project_dir,
             sub_id=subjects[0].id,
             sess_list=sess_list,
             out_subid=subjects[0].id,
-            mesh=self.inputs.targ_mesh,
             num_components=self.config.n_grad_components,
             backend=self.config.backend_step0,
             bold_paths_override=tuple(sess_paths_per_sub[0]),
@@ -324,7 +276,6 @@ class Pipeline:
             coord = Step0StagePipeline(
                 project_dir=self.layout.project_dir,
                 sess_list=sess_list,
-                targ_mesh=self.inputs.targ_mesh,
                 n_grad_components=self.config.n_grad_components,
                 backend=self.config.backend_step0,
                 prefetcher=prefetcher,
@@ -349,7 +300,7 @@ class Pipeline:
 
         return gradients
 
-    def _run_step1_all_subjects(self) -> Dict[str, Any]:
+    def _run_step1_all_subjects(self) -> List[Tuple[str, Path]]:
         """Step 1: drives the four subgraphs directly via step1_runners.
 
         The driver owns the subgraph sequence, the inter-subgraph data
@@ -358,17 +309,19 @@ class Pipeline:
 
         GPU backend: the subgraphs are chained in memory / on device
         (the profile leaf folds each packed session into
-        ``avg_accumulator`` as it packs it → ``lh_avg_dev``) and every
-        disk write runs on a background thread joined once at the end
-        (:func:`step1_runners.join_step1_writers`); on CPU that
-        background writer carries the group.mat write alone. Part of
-        the one-time GPU cost is prewarmed on a daemon thread that
+        ``avg_accumulator`` as it packs it → ``lh_avg_dev``) and the
+        .b2nd, avg .npy and group.mat writes run on background threads
+        joined at the end (:func:`step1_runners.join_step1_writers`; a
+        multi-subject cohort joins each .b2nd write per subject). The
+        spatial-mask write is synchronous. On CPU the background
+        writer carries the group.mat write alone. Part of the
+        one-time GPU cost is prewarmed on a daemon thread that
         :meth:`run` starts before step 0. No subject's packed bytes
         outlive its .b2nd write: the average lives in two ``(V_h, D)``
         fp32 device sums, whatever the cohort size.
 
-        Returns the bundle of artifacts the cohort writer needs to
-        emit ``cohort.json``.
+        Returns the ``(sub_id, .b2nd path)`` list the cohort writer
+        records in ``cohort.json``.
         """
         from .step1_runners import (
             join_step1_writers, make_avg_accumulator, resolve_group_labels,
@@ -378,8 +331,6 @@ class Pipeline:
 
         subjects = self.inputs.subject_ids()
         sessions = self.inputs.session_ids()
-        targ = self.inputs.targ_mesh
-        seed = self.inputs.seed_mesh
         backend = self.config.backend_step1
         k1 = self.config.step1
         is_gpu = backend == "gpu"
@@ -387,7 +338,6 @@ class Pipeline:
         # Resolve group labels once for both ini_params + radius_mask
         # (hot Schaefer .annot parse).
         lh_labels, rh_labels = resolve_group_labels(
-            targ_mesh=targ,
             schaefer_resolution=str(self.config.num_clusters),
         )
 
@@ -397,18 +347,14 @@ class Pipeline:
         # runner's keyword arg. On GPU subgraph 2's sums are built on
         # device while the leaf packs, and the single-subject .b2nd
         # write is joined at the end of the step.
-        avg_acc = (make_avg_accumulator(targ_mesh=targ, seed_mesh=seed,
-                                        num_sess=len(sessions))
+        avg_acc = (make_avg_accumulator(num_sess=len(sessions))
                    if is_gpu else None)
         write_handles: Optional[list] = [] if is_gpu else None
         profile_b2nd_paths = run_generate_profiles(
             project_dir=self.layout.project_dir,
             subjects=subjects,
             sessions=sessions,
-            seed_mesh=seed,
-            targ_mesh=targ,
             threshold=k1.threshold,
-            split_flag=k1.split_flag,
             backend=backend,
             verbose=True,
             progress=self._progress,
@@ -434,8 +380,6 @@ class Pipeline:
                     project_dir=self.layout.project_dir,
                     num_sub=len(subjects),
                     num_sess=len(sessions),
-                    seed_mesh=seed,
-                    targ_mesh=targ,
                     backend=backend,
                     accumulator=avg_acc,
                 )
@@ -453,12 +397,8 @@ class Pipeline:
             try:
                 ini_res = run_ini_params(
                     project_dir=self.layout.project_dir,
-                    seed_mesh=seed,
-                    targ_mesh=targ,
                     lh_labels=lh_labels,
                     rh_labels=rh_labels,
-                    profile_dtype=np.dtype(k1.profile_dtype),
-                    reduction_dtype=np.dtype(k1.reduction_dtype),
                     backend=backend,
                     precomputed_lh_avg=avg_res.lh_avg,
                     precomputed_rh_avg=avg_res.rh_avg,
@@ -476,9 +416,8 @@ class Pipeline:
             # Subgraph 4 — spatial radius mask.
             self._progress.emit_state("step1_mask", COHORT_SUB_ID, "running")
             try:
-                spatial_mask_path = run_radius_mask(
+                run_radius_mask(
                     project_dir=self.layout.project_dir,
-                    targ_mesh=targ,
                     lh_labels=lh_labels,
                     rh_labels=rh_labels,
                     radius_mm=k1.radius_mask_radius_mm,
@@ -491,7 +430,8 @@ class Pipeline:
                 raise
             self._progress.emit_state("step1_mask", COHORT_SUB_ID, "done")
 
-            # Join every background write before cohort.json names the files.
+            # Join every background write before the step returns:
+            # cohort.json names the .b2nd files, step 2 reads group.mat.
             joined = True
             join_step1_writers(write_handles, avg_res, ini_res,
                                progress=self._progress)
@@ -502,7 +442,6 @@ class Pipeline:
                                        progress=self._progress)
                 except BaseException:      # noqa: BLE001 — never mask
                     pass                   # the failure being propagated
-        avg_paths = (avg_res.lh_path, avg_res.rh_path)
         # The pending single-subject write handle is the last reference
         # to the leaf's pinned D2H block, and the accumulator holds the
         # device means ``ini_params`` has already consumed — drop both
@@ -527,28 +466,19 @@ class Pipeline:
                 _log.debug("step1 GPU epilogue: pool release failed",
                            exc_info=True)
 
-        return {
-            "profile_b2nd_paths": profile_b2nd_paths,
-            "avg_profile_paths": avg_paths,
-            "group_mat_path": ini_res.group_mat_path,
-            "spatial_mask_path": spatial_mask_path,
-            "epsil": ini_res.epsil,
-        }
+        return profile_b2nd_paths
 
-    def _write_cohort(self, step1_outputs: Dict[str, Any]) -> Path:
-        """Driver writes cohort.json directly (was step1 subgraph 5)."""
+    def _write_cohort(
+        self, profile_b2nd_paths: List[Tuple[str, Path]],
+    ) -> Path:
+        """Driver writes cohort.json directly."""
         from .cohort_writer import write_cohort_manifest
         return write_cohort_manifest(
             project_dir=self.layout.project_dir,
             subjects=self.inputs.subject_ids(),
             sessions=self.inputs.session_ids(),
-            targ_mesh=self.inputs.targ_mesh,
-            seed_mesh=self.inputs.seed_mesh,
             n_grad_components=self.config.n_grad_components,
-            profile_b2nd_paths=step1_outputs["profile_b2nd_paths"],
-            group_mat_path=step1_outputs["group_mat_path"],
-            spatial_mask_path=step1_outputs["spatial_mask_path"],
-            avg_profile_paths=step1_outputs["avg_profile_paths"],
+            profile_b2nd_paths=profile_b2nd_paths,
         )
 
     def _run_step2_train_prior(self) -> Path:
@@ -559,8 +489,7 @@ class Pipeline:
         # ``**k2_kwargs`` splats every Step2Knobs field into Step2Config
         # via the field-name 1:1 mapping pinned by
         # test_knobs_field_match.test_step2_knobs_field_names_match_step2config
-        # — same pattern as step0, minus step0's driver-consumed
-        # ``enable_tf32`` (step 2 has no TF32 scope).
+        # — same pattern as step0.
         #
         # k2 is guaranteed non-None here: this method is only invoked from
         # ``run()`` on the Mode B branch, and the parser requires the
@@ -578,8 +507,6 @@ class Pipeline:
             num_clusters=self.config.num_clusters,
             mode=self.config.variant,  # type: ignore[arg-type]
             beta_scalar=self.config.beta_scalar,
-            mesh=self.inputs.targ_mesh,
-            seed_mesh=self.inputs.seed_mesh,
             n_grad_components=self.config.n_grad_components,
             backend=self.config.backend_step2,
             **k2_kwargs,
@@ -618,7 +545,8 @@ class Pipeline:
         gradient_by_sub: Dict[str, "np.ndarray"],
     ) -> None:
         """Step 3: per-subject parcellation EM. Each call writes
-        ``ind_parcellation_<variant>/<T>_sess/beta<B>/<id>/Ind_parcellation_*.mat``.
+        ``ind_parcellation_<variant>/<T>_sess/beta<B>/Ind_parcellation_MSHBM_sub<id>_*.mat``
+        (no ``beta<B>/`` segment for dMSHBM).
 
         ``gradient_by_sub`` is the dict returned by step0 — each entry
         is the in-memory ``(N, n_grad_components)`` fp32 gradient_mat
@@ -660,7 +588,6 @@ class Pipeline:
                 num_session=self.inputs.num_sessions,
                 num_clusters=self.config.num_clusters,
                 subid=int(sub.id),
-                mesh=self.inputs.targ_mesh,
                 w=self.config.w,
                 c=self.config.c,
                 beta_scalar=self.config.beta_scalar,
@@ -771,9 +698,9 @@ class Pipeline:
             timings["stage_bold_lists"] = time.perf_counter() - t
 
             current_phase = "prewarm"
-            # Mode A never runs step 2.
-            step2_gpu = (not self.config.is_mode_a
-                         and self.config.backend_step2 == "gpu")
+            # ``backend_step2`` is ``None`` in Mode A, which never runs
+            # step 2.
+            step2_gpu = self.config.backend_step2 == "gpu"
 
             # Every gpu backend needs CuPy, a visible CUDA device and
             # NVRTC. Checked first, so a run whose earlier steps are on
@@ -841,20 +768,20 @@ class Pipeline:
             # skipping the disk re-read.
             current_phase = "step0"
             t = time.perf_counter()
-            gradient_by_sub = self._run_step0_all_subjects_maybe_tf32()
+            gradient_by_sub = self._run_step0_all_subjects()
             timings["step0"] = time.perf_counter() - t
 
             # Step 1: profiles + ini params + radius mask, driver-owned.
             current_phase = "step1"
             t = time.perf_counter()
-            step1_outputs = self._run_step1_all_subjects()
+            profile_b2nd_paths = self._run_step1_all_subjects()
             timings["step1"] = time.perf_counter() - t
 
-            # Cohort.json: roster + artifact ledger that step2/step3 read
-            # as their sole discovery mechanism.
+            # Cohort.json: the roster and each subject's profile /
+            # gradient paths, which step2/step3 read from it.
             current_phase = "cohort_write"
             t = time.perf_counter()
-            cohort_path = self._write_cohort(step1_outputs)
+            cohort_path = self._write_cohort(profile_b2nd_paths)
             timings["cohort_write"] = time.perf_counter() - t
 
             # Prior: Mode A reads it in place from the project slot
@@ -872,8 +799,8 @@ class Pipeline:
                 timings["step2"] = time.perf_counter() - t
 
             # Step 3: per-subject parcellation. Consumes step0's gradients
-            # directly from memory — the cohort.json + .npy on disk stay
-            # as cache for resume runs.
+            # directly from memory — the .npy files on disk are what
+            # step 2 and the per-step APIs read through cohort.json.
             current_phase = "step3"
             t = time.perf_counter()
             self._run_step3_all_subjects(gradient_by_sub)
@@ -890,8 +817,7 @@ class Pipeline:
             if self.config.backend_step1 == "gpu":
                 from .step1_runners import join_step1_prewarm
                 join_step1_prewarm()
-            if (not self.config.is_mode_a
-                    and self.config.backend_step2 == "gpu"):
+            if self.config.backend_step2 == "gpu":
                 from .step2_runners import join_step2_prewarm
                 join_step2_prewarm()
             timings["total"] = time.perf_counter() - t_total

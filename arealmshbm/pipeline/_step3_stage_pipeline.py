@@ -7,7 +7,8 @@ Background: per-subject ``Step3Pipeline`` runs three phases:
         .mat parse)     into GPU)         loop on GPU)   write)
 
 ``load_inputs + build_session`` (host reads + the BOLD / gradient H2D)
-and ``save`` (argmax + .mat write) are off-GPU work that a sequential
+and ``save`` (.mat write; cMSHBM's final host-side remove-isolated
+cleanup) are off-GPU work that a sequential
 subject loop would serialize behind the previous subject's EM.
 
 This module pipelines step3 by phase, mirroring
@@ -346,7 +347,7 @@ class Step3StagePipeline:
             qES.put(work)
 
     # ─────────────────────────────────────────────────────────────────
-    # Stage SAVE — argmax + .mat write + close (pool free).
+    # Stage SAVE — .mat write (labels come from run()) + close (pool free).
     # Drains until stage EM forwards the sentinel.
     # ─────────────────────────────────────────────────────────────────
     def _stage_SAVE(self, qES: queue.Queue, qDone: queue.Queue) -> None:

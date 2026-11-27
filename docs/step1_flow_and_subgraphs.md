@@ -25,12 +25,14 @@ pipeline.Pipeline._run_step1_all_subjects()                    [arealmshbm/pipel
 │   backend ∈ {'cpu', 'gpu'} dispatched at each leaf supercall.
 │   gpu: prewarm_step1_gpu() on a daemon thread (started before
 │        step 0 in the driver); subgraphs chained in memory / on
-│        device; disk writes on background threads, joined once
-│        at the end (step1_runners.join_step1_writers).
+│        device; .b2nd / .npy / group.mat writes on background
+│        threads, joined at the end (step1_runners.join_step1_writers;
+│        a multi-subject cohort's .b2nd writes are joined per
+│        subject); the spatial-mask write is synchronous.
 │
-├── resolve_group_labels(targ_mesh, schaefer_resolution)       data_io/annot_io.read_annot_labels (numpy-only .annot)
+├── resolve_group_labels(schaefer_resolution)                  data_io/annot_io.read_annot_labels (numpy-only .annot)
 │
-├── run_generate_profiles(seed_mesh, targ_mesh, sub, sess, …)  pipeline/step1_runners.py → generate_profiles
+├── run_generate_profiles(sub, sess, …)                        pipeline/step1_runners.py → generate_profiles
 │   ├── gpu: generate_subject_profiles_gpu (one call per subject) generate_profiles/profiles_subject_gpu.py
 │   │   ├── batched nvCOMP GIFTI ingest, (T, n_lh+n_rh) fp32   data_io/gifti_bold_gpu.iter_subject_bold_gpu
 │   │   │   (pinned readinto → H2D → GPU bytescan + base64 →
@@ -48,8 +50,8 @@ pipeline.Pipeline._run_step1_all_subjects()                    [arealmshbm/pipel
 │   │   ├── per-session pinned D2H of slab t (event-gated)
 │   │   └── .b2nd streamed one chunk (= session) at a time on  data_io/profile_io.SubjectProfileStreamWriter
 │   │       a background thread; .wait() joins the last slab
-│   └── cpu: stage pipeline (unchanged)                        pipeline/_step1_stage_pipeline.py
-│       ├── parallel BOLD reads (.func.gii, numba b64 + isal)  data_io/gifti_io.read_surface_gifti
+│   └── cpu: stage pipeline                                    pipeline/_step1_stage_pipeline.py
+│       ├── parallel BOLD reads (.func.gii, numba b64 + isal)  Step1BoldPrefetcher → data_io/gifti_io.read_surface_gifti
 │       ├── seed_select, zscore, MKL GEMM, nan_to_zero, sum    generate_profiles/_kernels.py (numba)
 │       ├── threshold_top_fraction (introselect), binarize     np.partition / numba
 │       └── per-subject .b2nd writer                           data_io/profile_io.write_subject_profile_tnd
@@ -69,14 +71,14 @@ pipeline.Pipeline._run_step1_all_subjects()                    [arealmshbm/pipel
 │   ├── zero_mw + detect_nonzero                               _kernels[_gpu] (numba / cupy primitives)
 │   ├── demean + L2-unit-norm rows                             _kernels[_gpu] (numba / RawKernel)
 │   ├── groupsum (mtc): per-parcel row sums in ascending-i     _kernels (numba) / _kernels_gpu.groupsum_csr_cupy
-│   │   order — GPU bit-exact vs the numba kernel               (parcel CSR; replaces the dense one-hot dgemm)
+│   │   order — GPU bit-exact vs the numba kernel               (parcel CSR; no dense one-hot)
 │   ├── column L2-renorm in numpy's sum(axis=0) order          _kernels_gpu.colnorm_scale_cupy
 │   ├── ε input: Σ_i ⟨profile[i], mtc[:, l_i]⟩ (row-dot)       _kernels (numba GEMM+gather) / _kernels_gpu.epsil_input_rowdot_cupy
 │   ├── invAd(D-1, rbar)                                       _invad (scipy Bessel, CPU only)
-│   └── group.mat write, compressed as before                  ini_params/_group_mat_writer.py
-│       (gpu: on a background thread — same bytes, off the wall)
+│   └── group.mat write, compressed                            ini_params/_group_mat_writer.py
+│       (on a background thread on both backends — save_async)
 │
-├── run_radius_mask(lh_labels, rh_labels, mesh, radius)        pipeline/step1_runners.py → radius_mask
+├── run_radius_mask(lh_labels, rh_labels, radius)              pipeline/step1_runners.py → radius_mask
 │   ├── _build_mesh_csr (MARS rescale + vertexNbors + checks)  _common (numpy)
 │   ├── build_parcel_csr                                       _kernels (numba; CPU on both backends)
 │   ├── classify_central_relevance                             _kernels (numba; CPU on both backends)
@@ -87,13 +89,11 @@ pipeline.Pipeline._run_step1_all_subjects()                    [arealmshbm/pipel
 │   │   ├── cpu: per-parcel Dijkstra, prange over parcels      _kernels.add_spatial_constraint_kernel
 │   │   └── gpu: batched pull-based BF bounded by radius       _kernels_gpu.bellman_ford_bounded_cupy
 │   ├── truncate (anatomical correction)                       _kernels (numba; CPU on both backends)
-│   └── mask → csc + savemat(compressed, as before)            _common._mask_to_csc + scipy.io
+│   └── mask → csc + savemat(compressed, synchronous)          _common._mask_to_csc + scipy.io
 │
 └── write_cohort_manifest                                       pipeline/cohort_writer.py
-    └── project_dir/cohort.json                                 roster + artifact ledger (subjects, mesh, run_id,
-                                                                profile_b2nd / gradient_{lh,rh} per subject,
-                                                                top-level group.mat / spatial_mask /
-                                                                avg_profile_{lh,rh}.npy)
+    └── project_dir/cohort.json                                 roster + per-subject paths (subjects, run_id,
+                                                                profile_b2nd / gradient_{lh,rh} per subject)
 ```
 
 The cohort.json write runs at the end of the driver's step-1 phase.
@@ -107,7 +107,7 @@ Subgraph coverage by mode:
 * **Mode A** (HCP-prior, production path) consumes step 1's
   ``generate_profiles`` output (per-subject .b2nd) via cohort.json.
   Step 3 reads the spatial mask that ``radius_mask`` writes into the
-  project (``spatial_mask/spatial_mask_<mesh>.mat``), so that subgraph
+  project (``spatial_mask/spatial_mask.mat``), so that subgraph
   is needed too; ``avg_profiles`` + ``ini_params`` are not needed
   because the group prior comes pre-trained.
 * **Mode B** (self-trained prior) consumes all four subgraphs:
@@ -128,7 +128,7 @@ arealmshbm/
 │   │                                        threads avg-profile arrays in-memory subgraph 2 → 3
 │   ├── step1_runners.py                     run_generate_profiles / run_avg_profiles / run_ini_params /
 │   │                                        run_radius_mask + resolve_group_labels (single source of truth)
-│   └── cohort_writer.py                     write_cohort_manifest: roster + artifact ledger
+│   └── cohort_writer.py                     write_cohort_manifest: roster + per-subject paths
 │
 ├── step1_pipeline/                          # standalone harness for step 1 (no orchestration)
 │   └── profile.py                           per-stage wall-time report (--backend cpu|gpu)
@@ -182,14 +182,15 @@ arealmshbm/
 | # | Subgraph | Inputs → Outputs |
 |---|---|---|
 | 1 | `generate_profiles/` | per-session BOLD `.func.gii` (lh, rh) → one per-subject `.b2nd` (T sessions stacked) |
-| 2 | `avg_profiles/` | per-subject `.b2nd` files → `{lh,rh}_…_avg_profile.npy` |
+| 2 | `avg_profiles/` | per-subject `.b2nd` files → `{lh,rh}_avg_profile.npy` |
 | 3 | `ini_params/` | avg profile + group labels → `group.mat` (mtc, epsil, lambda, …) |
 | 4 | `radius_mask/` | group labels + mesh + radius → sparse `lh_boundary`, `rh_boundary` |
-| + | `cohort_writer.write_cohort_manifest` (always, end of step-1 phase) | cohort + step1 outputs → `cohort.json` (roster + artifact ledger; merged with prior runs) |
+| + | `cohort_writer.write_cohort_manifest` (always, end of step-1 phase) | cohort + step1 outputs → `cohort.json` (roster + per-subject paths; merged with prior runs) |
 
-fsaverage* meshes only — `fs_LR_32k` is intentionally not ported
-(Mode A is fsaverage6, and the rest of the pipeline is gated to
-fsaverage6 too).
+One surface throughout: profiles are computed at the fsaverage6
+vertices against seeds at the fsaverage3 vertices — an icosphere's
+coarser levels are a prefix of its vertex list, so the seeds are the
+first 642 vertices of each fsaverage6 hemisphere.
 
 ## Backend dispatch
 
@@ -225,9 +226,7 @@ supercall):
   per-session, per-hemi-sgemm oracle kept in `test_subject_profiles_gpu.py`
   — an empirical fact
   at the production shape (two per-hemi sgemms plus `nan_to_num`
-  against one whole-subject sgemm), which is why it stays pinned. The
-  path is fp32 only, so a non-`float32` `profile_dtype_reduce` is
-  rejected rather than ignored.
+  against one whole-subject sgemm), which is why it stays pinned.
 
   **Ingest** is the batched nvCOMP device decode
   (`gifti_bold_gpu.iter_subject_bold_gpu`), full
@@ -254,13 +253,15 @@ supercall):
 * `ini_params_gpu`: device means → concat + fp64 widen on device →
   row-demean+L2 (RawKernel) → `groupsum_csr_cupy` (parcel CSR, rows
   summed in ascending order — bit-exact vs the numba kernel, no dense
-  one-hot dgemm) → `colnorm_scale_cupy` (numpy's `sum(axis=0)`
+  one-hot) → `colnorm_scale_cupy` (numpy's `sum(axis=0)`
   order) → `epsil_input_rowdot_cupy` (one dot per row against its own
-  parcel column; replaces the second dgemm plus its `(N, L)`
-  intermediate and the gather) → scalar D2H for `invAd` (scipy Bessel
-  stays CPU) → `group.mat` on a background thread. The file itself is
-  unchanged: still `do_compression=True`, still the same fields.
-* `radius_mask_gpu`: mesh CSR + labels + aparc H2D once per hemi.
+  parcel column, in place of the CPU path's `profile @ mtc` dgemm, its
+  `(N, L)` intermediate and the gather) → scalar D2H for `invAd`
+  (scipy Bessel stays CPU) → `group.mat` on a background thread, the
+  same `do_compression=True` file with the same fields as the CPU
+  backend writes.
+* `radius_mask_gpu`: mesh CSR + labels H2D once per hemi (aparc and
+  the parcel CSR stay on host for classify / truncate).
   The **radius mask** (K = L_h ≈ 150 problems, bounded at 30 mm) stays
   on the batched pull-based Bellman-Ford: one RawKernel pass over V·K
   cells with neighbour pull-relax, looping until the `changed` flag
@@ -272,20 +273,21 @@ supercall):
   are one 128 B transaction), delta-stepping over a ring of
   shared-memory frontier bitmasks, gathering only the relevant-vertex
   rows. Distances are bit-identical to the BF solver. The frontier
-  bitmask is static shared memory, so this backend needs V ≤ 90080 —
-  fsaverage6 / fsaverage5 are fine, `fsaverage` is CPU-only for this
-  leaf. Classify / truncate (heavy control flow, ~1 ms) stay CPU.
+  bitmask is static shared memory, sized for V ≤ 90080 (a fsaverage6
+  hemisphere is 40962). Classify / truncate (heavy control flow,
+  ~1 ms) stay CPU.
 
 GPU memory-pool release is the caller's responsibility. The unified
-driver releases the device pool at the end of step 1, after the
-background writers are joined; `step1_pipeline/profile.py` releases
+driver releases the device pool, the pinned pool and the ingest
+staging buffer at the end of step 1, after the background writers are
+joined; `step1_pipeline/profile.py` releases
 the device pool after each run and the pinned pool only at the very
 end, so the pinned avg-profile D2H blocks stay page-locked across
 runs exactly as the driver keeps them warm across a cohort.
 
 ## CPU ↔ GPU consistency
 
-The GPU paths match CPU at sub-ULP across the four numeric subgraphs.
+The GPU paths match CPU at sub-ULP in subgraphs 2–4.
 Subgraph 3's ε computes via a different fp64 reduction order between
 numba and cupy, producing a ~4.7e-16 rel-diff that round-trips
 through ``invAd`` without visible effect. The avg-profile accumulation
@@ -317,7 +319,7 @@ compressed (637 KB). `mtc` differs by ≤ 7.8e-16 absolute (2.4e-15
 relative to `max|mtc|`) and ε by 4.5e-13 absolute / 3.3e-16 relative —
 fp64 reduction order, the same class of delta the leaf already
 documented. The CPU backend is byte-identical throughout, `mtc` and ε
-included. `mtc` and ε are the only step-1 artifacts step 2 reads, so a
+included. Step 2 reads `mtc` and ε from `group.mat`, so a
 Mode-B run whose step 1 ran on GPU is **not** bit-identical to a
 clean-8cb68a0 GPU run: compare a GPU candidate against a GPU baseline,
 or pin `backend_step1='cpu'` when a byte-exact A/B is what is
@@ -400,13 +402,14 @@ phase-pipeline. Four stages, each on its own worker thread, with
 ```
 
 * **`Step1BoldPrefetcher`** ([`_step1_bold_prefetcher.py`](../arealmshbm/pipeline/_step1_bold_prefetcher.py))
-  — persistent 8-worker pool decodes BOLD ahead of the GPU consumer
-  with an 8-session sliding lookahead. base64 + isal_zlib release the
+  — persistent 8-worker pool decodes BOLD ahead of the leaf consumer
+  with an 8-session sliding lookahead (the CPU backend's; the GPU
+  backend ingests through `iter_subject_bold_gpu`). base64 + isal_zlib release the
   GIL on the per-darray decode, so the 240-session phase saturates the
   codec in parallel.
 * **`Step1GenerateProfilesStagePipeline`** ([`_step1_stage_pipeline.py`](../arealmshbm/pipeline/_step1_stage_pipeline.py))
-  — coordinator that owns the GPU / POST / ASSEM worker threads and
-  the WRITE pool. The prime loop maintains the prefetcher's sliding
+  — the CPU backend's coordinator: owns the leaf / POST / ASSEM worker
+  threads and the WRITE pool. The prime loop maintains the prefetcher's sliding
   window from its own thread, throttled naturally by qIN's
   backpressure.
 

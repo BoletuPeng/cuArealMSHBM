@@ -3,9 +3,9 @@
 The master kernel's per-EM-iter loop reads each subject's BOLD twice
 (Phase A.3 + Phase D) and grad once (Phase C); these loaders decode
 **one subject at a time** from disk on demand, capping peak BOLD RAM
-at one subject's slab (~770 MB at fsa6/T=6) and grad RAM at ~30 MB
+at one subject's slab (2.31 GB at fsa6/T=6) and grad RAM at ~200 MB
 regardless of cohort size S. At S=200 the eager-mega-buffer
-alternative would be 231 GB BOLD + 39 GB grad — incompatible with any
+alternative would be 462 GB BOLD + 39 GB grad — incompatible with any
 reasonable RAM budget.
 
 Discovery contract
@@ -96,8 +96,6 @@ class SubjectProfileLoader:
         cohort: CohortManifest,
         project_dir: Path,
         *,
-        targ_mesh: str,
-        seed_mesh: str,
         lh_mars: Optional[np.ndarray] = None,
         rh_mars: Optional[np.ndarray] = None,
         cache_mode: str = "stream",
@@ -120,22 +118,6 @@ class SubjectProfileLoader:
         self.project_dir = Path(project_dir)
         self.num_sub = cohort.num_sub
         self.num_session = cohort.num_session
-
-        # Mesh-config consistency check: the caller's expected
-        # (targ_mesh, seed_mesh) must agree with what cohort.json
-        # records. Mismatch means the cohort was produced for a
-        # different surface space and the .b2nd filenames don't line up
-        # with the consumer's mesh-derived state.
-        if cohort.mesh.get("targ") != targ_mesh:
-            raise ValueError(
-                f"SubjectProfileLoader: cohort targ_mesh="
-                f"{cohort.mesh.get('targ')!r} != expected {targ_mesh!r}"
-            )
-        if cohort.mesh.get("seed") != seed_mesh:
-            raise ValueError(
-                f"SubjectProfileLoader: cohort seed_mesh="
-                f"{cohort.mesh.get('seed')!r} != expected {seed_mesh!r}"
-            )
 
         self._lh_mars = (None if lh_mars is None
                          else np.asarray(lh_mars).ravel())

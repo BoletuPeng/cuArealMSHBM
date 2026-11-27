@@ -28,8 +28,6 @@ def _make_manifest(lh: str, rh: str) -> dict:
     return {
         "schema_version": "1",
         "dataset_name": "synth",
-        "targ_mesh": "fsaverage6",
-        "seed_mesh": "fsaverage3",
         "subjects": [
             {
                 "id": "1",
@@ -92,6 +90,21 @@ def test_rejects_unknown_suffix(tmp_path: Path):
         rh="/data/sub-001_ses-01_hemi-R_bold.dat",
     )), encoding="utf-8")
     with pytest.raises(ValueError, match=r"\.func\.gii"):
+        read_bold_inputs(p)
+
+
+@pytest.mark.parametrize("key", ["targ_mesh", "seed_mesh", "notes"])
+def test_rejects_unknown_top_level_key(tmp_path: Path, key):
+    """The manifest names subjects and nothing else: the surface space
+    is not a choice, so a key that tries to pick one is an error rather
+    than a silently ignored line."""
+    lh = tmp_path / "lh.func.gii"
+    rh = tmp_path / "rh.func.gii"
+    manifest = _make_manifest(str(lh), str(rh))
+    manifest[key] = "fsaverage5"
+    p = tmp_path / "bold_inputs.json"
+    p.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match=f"unknown key.*{key}"):
         read_bold_inputs(p)
 
 

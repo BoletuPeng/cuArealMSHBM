@@ -33,8 +33,9 @@ whole-subject call per subject
 ingest, compute and writer.
 
 NOT thread-safe across runs — one ``Step1GenerateProfilesStagePipeline``
-instance per ``run_generate_profiles`` call; the driver owns the
-prefetcher's lifecycle and primes the sliding window externally.
+instance per ``run_generate_profiles`` call; that caller owns the
+prefetcher's lifecycle, and this coordinator's prime loop keeps its
+sliding window filled.
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """
@@ -45,7 +46,7 @@ import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -101,7 +102,7 @@ class Step1GenerateProfilesStagePipeline:
         with Step1BoldPrefetcher(n_workers=8) as prefetcher:
             coord = Step1GenerateProfilesStagePipeline(
                 project_dir=..., bold_paths=..., schedule=...,
-                sess_per_sub=..., out_paths=..., leaf_kwargs=...,
+                sess_per_sub=..., out_paths=..., threshold=...,
                 prefetcher=prefetcher, lookahead=8, verbose=True,
             )
             results = coord.run()  # -> [(sub_id, out_path), ...]
@@ -114,7 +115,7 @@ class Step1GenerateProfilesStagePipeline:
         bold_paths: Dict[Tuple[str, str], Tuple[List[str], List[str]]],
         sess_per_sub: Dict[str, int],
         out_paths: Dict[str, Path],
-        leaf_kwargs: Dict[str, Any],
+        threshold: float,
         prefetcher: Step1BoldPrefetcher,
         lookahead: int = 8,
         write_workers: int = 1,
@@ -126,7 +127,7 @@ class Step1GenerateProfilesStagePipeline:
         self.bold_paths = bold_paths
         self.sess_per_sub = sess_per_sub
         self.out_paths = out_paths
-        self.leaf_kwargs = leaf_kwargs
+        self.threshold = threshold
         self.prefetcher = prefetcher
         self.lookahead = int(lookahead)
         self.write_workers = int(write_workers)
@@ -288,15 +289,10 @@ class Step1GenerateProfilesStagePipeline:
                             flush=True,
                         )
                     lh_bin, rh_bin = compute_profile_arrays(
-                        seed_mesh=self.leaf_kwargs["seed_mesh"],
-                        targ_mesh=self.leaf_kwargs["targ_mesh"],
                         out_dir=self.project_dir,
                         sub=work.sub_id,
                         sess=work.sess_id,
-                        split_flag=self.leaf_kwargs.get("split_flag", "0"),
-                        threshold=self.leaf_kwargs.get("threshold", 0.1),
-                        dtype_reduce=self.leaf_kwargs.get(
-                            "profile_dtype_reduce", np.float32),
+                        threshold=self.threshold,
                         precomputed_bold_runs=bold_runs,
                     )
                     # Drop the prefetched host buffer eagerly — the
@@ -356,8 +352,8 @@ class Step1GenerateProfilesStagePipeline:
         pending_writes: List[Tuple[str, Path, Future, np.ndarray]] = []
         # Per-subject "first terminal state wins" set — sub_ids that
         # have already had a terminal (done/failed) state emitted +
-        # qDone result pushed. Guards against the pre-existing
-        # buffer-logic edge case where a per-session failure followed
+        # qDone result pushed. Guards against the buffer-logic edge
+        # case where a per-session failure followed
         # by later sessions of the same subject assembling + writing
         # successfully would emit ``failed`` → ``done`` (out-of-
         # order terminal states from the frontend's perspective). Also
@@ -375,10 +371,8 @@ class Step1GenerateProfilesStagePipeline:
         # progress emit AND the qDone.put. This matches the
         # caller contract (exactly one ``_SubjectResult`` per
         # subject; the upstream coordinator drains K results for K
-        # subjects). The pre-existing pre-this-PR behaviour would
-        # double-put a sub whose early session failed then later
-        # sessions succeeded, violating that contract — the
-        # idempotency closes both holes simultaneously.
+        # subjects): a sub whose early session failed and whose later
+        # sessions succeeded is put, and its state emitted, once.
         def _finish(sub_id: str, out_path: Path,
                     failure: Optional[BaseException] = None) -> None:
             if sub_id in terminated:

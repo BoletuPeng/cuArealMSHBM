@@ -107,7 +107,7 @@ class TestValidateVariantRequirements:
     def test_cMSHBM_only_needs_spheres_not_grad(self) -> None:
         """cMSHBM has use_xyz_prior + use_check_connectedness but
         use_connect_prior=False — grad_data not required, but spheres
-        still are (for the xyz prior + connectedness BFS)."""
+        still are (for the xyz prior + connectedness check)."""
         v = VariantSpec.from_pipeline_type("cMSHBM")
         # grad_data None is fine for cMSHBM.
         validate_variant_requirements(

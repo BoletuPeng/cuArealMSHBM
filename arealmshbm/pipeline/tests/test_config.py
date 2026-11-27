@@ -12,13 +12,13 @@ are rejected. There is no default-fallback path.
 
 Covered:
   - schema_version must be '2'
-  - Mode-aware block presence (Mode A: step0/1/3 required, step2 forbidden;
-    Mode B: all four required)
+  - Mode-aware block presence (Mode A: step0/1/3 required, step2 and
+    backend_step2 forbidden; Mode B: all four blocks and backend_step2
+    required)
   - Missing required top-level fields → raises with field name
   - Missing required step block → raises with mode + block name
   - Missing required field within a step block → raises with block.key
   - num_clusters enum quantization (350 rejected, 100.0 rejected too)
-  - step1.split_flag enum (only "0")
   - step3.connect_th == null survives parse (dMSHBM contract)
   - Unknown-key rejection at top-level + each step{N} block
   - Strict bool/int/float type guards
@@ -70,22 +70,17 @@ def _complete_step0() -> dict:
     return {
         "sub_FC": 100, "sub_verts": 200,
         "block_a": 3, "block_b": 10,
-        "smooth_sigma": 2.55, "K_hop": 3,
         "watershed_steps": 50, "watershed_frac": 1.0,
         "downsample": 3.2,
         "emb_output_format": "npy",
         "save_geodesic_distance": False,
         "save_edge_density": False,
-        "enable_tf32": False,
     }
 
 
 def _complete_step1() -> dict:
     return {
         "threshold": 0.1,
-        "split_flag": "0",
-        "profile_dtype": "float64",
-        "reduction_dtype": "float64",
         "radius_mask_radius_mm": 30.0,
     }
 
@@ -121,8 +116,7 @@ def _complete_step3() -> dict:
 
 
 def _top_level_modeB() -> dict:
-    """Campaign-spanning fields + schema_version (Mode B / gMSHBM).
-    the enable_tf32 toggle lives INSIDE the step0 block, not here."""
+    """Campaign-spanning fields + schema_version (Mode B / gMSHBM)."""
     return {
         "schema_version": "2",
         "mode": "modeB_train_prior",
@@ -151,9 +145,11 @@ def _full_v2_modeB() -> dict:
 
 
 def _full_v2_modeA_single() -> dict:
-    """Complete v2 Mode A single-subject config — no step2 block."""
+    """Complete v2 Mode A single-subject config — no step2 block, no
+    ``backend_step2``."""
     body = _top_level_modeB()
     body["mode"] = "modeA_single"
+    del body["backend_step2"]
     return {
         **body,
         "step0": _complete_step0(),
@@ -197,6 +193,7 @@ def test_modeA_single_complete_config_parses(tmp_path: Path) -> None:
     cfg = read_pipeline_config(_write_config(tmp_path, _full_v2_modeA_single()))
     assert cfg.mode == "modeA_single"
     assert cfg.step2 is None
+    assert cfg.backend_step2 is None
     assert isinstance(cfg.step0, Step0Knobs)
     assert isinstance(cfg.step1, Step1Knobs)
     assert isinstance(cfg.step3, Step3Knobs)
@@ -218,6 +215,26 @@ def test_modeA_with_step2_block_rejected(tmp_path: Path) -> None:
     assert "modeA_single" in msg
     assert "sample_modeA_single" in msg
     assert "sample_modeA_batch" in msg
+
+
+def test_modeA_with_backend_step2_rejected(tmp_path: Path) -> None:
+    """``backend_step2`` follows the step2 block: Mode A rejects it with
+    the same Mode-A hint."""
+    body = _full_v2_modeA_single()
+    body["backend_step2"] = "cpu"
+    p = _write_config(tmp_path, body)
+    with pytest.raises(ValueError,
+                       match=r"does not run step2.*backend_step2"):
+        read_pipeline_config(p)
+
+
+def test_modeB_missing_backend_step2_rejected(tmp_path: Path) -> None:
+    body = _full_v2_modeB()
+    del body["backend_step2"]
+    p = _write_config(tmp_path, body)
+    with pytest.raises(ValueError,
+                       match=r"missing required key 'backend_step2'"):
+        read_pipeline_config(p)
 
 
 def test_modeB_missing_step2_block_rejected(tmp_path: Path) -> None:
@@ -249,9 +266,9 @@ def test_missing_step0_block_rejected(tmp_path: Path) -> None:
 # ─────────────────────────────────────────────────────────────────────
 def test_missing_step0_field_rejected(tmp_path: Path) -> None:
     body = _full_v2_modeB()
-    del body["step0"]["smooth_sigma"]
+    del body["step0"]["watershed_frac"]
     p = _write_config(tmp_path, body)
-    with pytest.raises(ValueError, match=r"missing required key 'step0\.smooth_sigma'"):
+    with pytest.raises(ValueError, match=r"missing required key 'step0\.watershed_frac'"):
         read_pipeline_config(p)
 
 
@@ -272,16 +289,6 @@ def test_missing_top_level_beta_scalar_rejected(tmp_path: Path) -> None:
         read_pipeline_config(p)
 
 
-def test_missing_step0_enable_tf32_rejected(tmp_path: Path) -> None:
-    """``step0.enable_tf32`` is required; omitting it raises the
-    nested-key error."""
-    body = _full_v2_modeB()
-    del body["step0"]["enable_tf32"]
-    p = _write_config(tmp_path, body)
-    with pytest.raises(ValueError, match=r"missing required key 'step0\.enable_tf32'"):
-        read_pipeline_config(p)
-
-
 # ─────────────────────────────────────────────────────────────────────
 # Enum quantization on top-level fields
 # ─────────────────────────────────────────────────────────────────────
@@ -294,14 +301,6 @@ def test_num_clusters_enum_rejects_non_atlas(tmp_path: Path) -> None:
     msg = str(excinfo.value)
     assert "num_clusters" in msg
     assert "100" in msg and "1000" in msg
-
-
-def test_step1_split_flag_rejects_nonzero(tmp_path: Path) -> None:
-    body = _full_v2_modeB()
-    body["step1"]["split_flag"] = "1"
-    p = _write_config(tmp_path, body)
-    with pytest.raises(ValueError, match=r"step1\.split_flag"):
-        read_pipeline_config(p)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -405,11 +404,11 @@ def test_step2_verbose_rejects_string(tmp_path: Path) -> None:
         read_pipeline_config(p)
 
 
-def test_step0_smooth_sigma_rejects_bool(tmp_path: Path) -> None:
+def test_step0_watershed_frac_rejects_bool(tmp_path: Path) -> None:
     body = _full_v2_modeB()
-    body["step0"]["smooth_sigma"] = True
+    body["step0"]["watershed_frac"] = True
     p = _write_config(tmp_path, body)
-    with pytest.raises(ValueError, match=r"step0\.smooth_sigma.*bool"):
+    with pytest.raises(ValueError, match=r"step0\.watershed_frac.*bool"):
         read_pipeline_config(p)
 
 
@@ -440,16 +439,6 @@ def test_step2_epsilon_rejects_string(tmp_path: Path) -> None:
 # ─────────────────────────────────────────────────────────────────────
 # Top-level type guards
 # ─────────────────────────────────────────────────────────────────────
-def test_step0_enable_tf32_rejects_non_bool(tmp_path: Path) -> None:
-    """``step0.enable_tf32`` rejects non-bool with the nested-key error
-    prefix."""
-    body = _full_v2_modeB()
-    body["step0"]["enable_tf32"] = "true"
-    p = _write_config(tmp_path, body)
-    with pytest.raises(ValueError, match=r"step0\.enable_tf32.*bool"):
-        read_pipeline_config(p)
-
-
 def test_beta_scalar_rejects_bool(tmp_path: Path) -> None:
     body = _full_v2_modeB()
     body["beta_scalar"] = True
@@ -569,14 +558,6 @@ def test_step0_emb_output_format_rejects_invalid(tmp_path: Path) -> None:
         read_pipeline_config(p)
 
 
-def test_step1_profile_dtype_rejects_invalid(tmp_path: Path) -> None:
-    body = _full_v2_modeB()
-    body["step1"]["profile_dtype"] = "float16"
-    p = _write_config(tmp_path, body)
-    with pytest.raises(ValueError, match=r"step1\.profile_dtype.*one of"):
-        read_pipeline_config(p)
-
-
 def test_step2_bold_cache_mode_rejects_invalid(tmp_path: Path) -> None:
     body = _full_v2_modeB()
     body["step2"]["bold_cache_mode"] = "lazy"
@@ -588,11 +569,11 @@ def test_step2_bold_cache_mode_rejects_invalid(tmp_path: Path) -> None:
 # ─────────────────────────────────────────────────────────────────────
 # Validator range / positivity checks
 # ─────────────────────────────────────────────────────────────────────
-def test_step0_smooth_sigma_negative_rejected(tmp_path: Path) -> None:
+def test_step0_watershed_frac_negative_rejected(tmp_path: Path) -> None:
     body = _full_v2_modeB()
-    body["step0"]["smooth_sigma"] = -1.0
+    body["step0"]["watershed_frac"] = -1.0
     p = _write_config(tmp_path, body)
-    with pytest.raises(ValueError, match=r"step0\.smooth_sigma.*positive"):
+    with pytest.raises(ValueError, match=r"step0\.watershed_frac.*positive"):
         read_pipeline_config(p)
 
 
@@ -676,19 +657,14 @@ def test_full_v2_roundtrip_non_default(tmp_path: Path) -> None:
     body["step0"] = {
         "sub_FC": 120, "sub_verts": 250,
         "block_a": 4, "block_b": 12,
-        "smooth_sigma": 3.0, "K_hop": 4,
         "watershed_steps": 60, "watershed_frac": 0.8,
         "downsample": 4.0,
         "emb_output_format": "both",
         "save_geodesic_distance": True,
         "save_edge_density": True,
-        "enable_tf32": True,
     }
     body["step1"] = {
         "threshold": 0.15,
-        "split_flag": "0",
-        "profile_dtype": "float32",
-        "reduction_dtype": "float32",
         "radius_mask_radius_mm": 25.0,
     }
     body["step2"] = {
@@ -723,20 +699,17 @@ def test_full_v2_roundtrip_non_default(tmp_path: Path) -> None:
     assert (cfg.w, cfg.c) == (80, 20)
     assert cfg.n_grad_components == 150
 
-    # step0 — all 13 (including save_edge_density + enable_tf32)
+    # step0 — all 12 (including save_edge_density)
     s0 = cfg.step0
     assert (s0.sub_FC, s0.sub_verts, s0.block_a, s0.block_b) == (120, 250, 4, 12)
-    assert s0.smooth_sigma == 3.0 and s0.K_hop == 4
     assert (s0.watershed_steps, s0.watershed_frac, s0.downsample) == (60, 0.8, 4.0)
     assert s0.emb_output_format == "both"
     assert s0.save_geodesic_distance is True
     assert s0.save_edge_density is True
-    assert s0.enable_tf32 is True
 
-    # step1 — all 5
+    # step1 — both
     s1 = cfg.step1
-    assert s1.threshold == 0.15 and s1.split_flag == "0"
-    assert s1.profile_dtype == "float32" and s1.reduction_dtype == "float32"
+    assert s1.threshold == 0.15
     assert s1.radius_mask_radius_mm == 25.0
 
     # step2 — all 12
@@ -911,40 +884,8 @@ def test_catalog_backend_step3_values() -> None:
     assert entry["default"] == "cpu"
 
 
-
-def test_step1_gpu_rejects_fp32_reduction_at_parse(tmp_path: Path) -> None:
-    """The GPU ini_params kernels are fp64-only; a float32 reduction on
-    ``backend_step1='gpu'`` is refused when the config is read."""
-    body = _full_v2_modeB()
-    body["backend_step1"] = "gpu"
-    body["step1"]["reduction_dtype"] = "float32"
-    with pytest.raises(
-            ValueError,
-            match=r"backend_step1='gpu' requires "
-                  r"step1\.reduction_dtype='float64'"):
-        read_pipeline_config(_write_config(tmp_path, body))
-
-
-def test_step1_gpu_fp32_profile_dtype_accepted(tmp_path: Path) -> None:
-    body = _full_v2_modeB()
-    body["backend_step1"] = "gpu"
-    body["step1"]["profile_dtype"] = "float32"
-    cfg = read_pipeline_config(_write_config(tmp_path, body))
-    assert cfg.step1.profile_dtype == "float32"
-    assert cfg.step1.reduction_dtype == "float64"
-
-
-def test_step1_cpu_fp32_reduction_accepted(tmp_path: Path) -> None:
-    body = _full_v2_modeB()
-    body["step1"]["reduction_dtype"] = "float32"
-    cfg = read_pipeline_config(_write_config(tmp_path, body))
-    assert cfg.backend_step1 == "cpu"
-    assert cfg.step1.reduction_dtype == "float32"
-
-
 _FLOAT_KNOBS = [
-    ("step0", "smooth_sigma"), ("step0", "watershed_frac"),
-    ("step0", "downsample"),
+    ("step0", "watershed_frac"), ("step0", "downsample"),
     ("step1", "threshold"), ("step1", "radius_mask_radius_mm"),
     ("step2", "epsilon"), ("step2", "intra_em_convergence_eps"),
     ("step2", "inter_convergence_eps"), ("step2", "em_convergence_eps"),
@@ -973,10 +914,10 @@ def test_overflowing_float_literal_rejected(tmp_path: Path) -> None:
     body = _full_v2_modeB()
     p = _write_config(tmp_path, body)
     text = p.read_text(encoding="utf-8")
-    sigma = json.dumps(body["step0"]["smooth_sigma"])
-    needle = f'"smooth_sigma": {sigma}'
+    frac = json.dumps(body["step0"]["watershed_frac"])
+    needle = f'"watershed_frac": {frac}'
     assert text.count(needle) == 1
-    p.write_text(text.replace(needle, '"smooth_sigma": 1e400'),
+    p.write_text(text.replace(needle, '"watershed_frac": 1e400'),
                  encoding="utf-8")
-    with pytest.raises(ValueError, match=r"step0\.smooth_sigma"):
+    with pytest.raises(ValueError, match=r"step0\.watershed_frac"):
         read_pipeline_config(p)

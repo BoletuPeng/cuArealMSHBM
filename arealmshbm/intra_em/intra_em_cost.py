@@ -11,7 +11,7 @@ Math (single-subject, no S axis):
     term2 = Σ_{d, l} ε[l] · μ[d, l] · s_psi[d, l]
             + Σ_l Cdln(ε_l, dim)
 
-    update_cost = term1 + term2
+    update_cost = term1 + term2 + Σ cost_em
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """

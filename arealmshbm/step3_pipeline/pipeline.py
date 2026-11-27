@@ -1,14 +1,16 @@
 """pipeline.py
 
 End-to-end Python step-3 super-call. One entry point that consumes a
-CBIG-style ``project_dir``, runs the full single-subject Mode-A
+CBIG-style ``project_dir``, runs the full single-subject
 parcellation EM, and writes the ``Ind_parcellation_*.mat`` artifact.
 
-Composes (in order):
+Composes (in order; ``backend='cpu'`` — ``backend='gpu'`` replaces 1-9
+with ``sparse_inputs.load_step3_sparse_inputs`` +
+``VmfClusteringSessionSparseCUDA.run_intra_em``):
 
     1. ``data_io.load_group_prior``           — Params_Final.mat (mu, θ, ε, σ).
-    2. ``data_io.load_spatial_mask``          — spatial_mask_<mesh>.mat.
-    3. ``data_io.load_avg_mesh``              — fsaverage* inflated + sphere.
+    2. ``data_io.load_spatial_mask``          — spatial_mask.mat.
+    3. ``data_io.load_avg_mesh``              — fsaverage6 inflated + sphere.
     4. ``data_io.fetch_data``                 — BOLD profile + diffusion gradient.
     5. ``initialize_concentration``           — vMF κ init.
     6. ``initialize_params``                  — Params dict (s_psi/s_t_nu/…).
@@ -106,9 +108,10 @@ class Step3Pipeline:
     Lifecycle:
       * ``__init__(cfg)``                       — store config; no IO.
       * ``load_inputs() -> Step3Inputs``         — read everything the EM needs.
-      * ``build_session(inputs)``                — construct VmfClusteringSession.
-      * ``run(time_stages=True) -> Step3Result`` — load + build (both cached), then the intra_em loop.
-      * ``save(result, out_path=None) -> Path``  — argmax + savemat.
+      * ``build_session(inputs)``                — construct VmfClusteringSession
+        (gpu: VmfClusteringSessionSparseCUDA).
+      * ``run(time_stages=True) -> Step3Result`` — load + build (both cached), then the intra_em loop + argmax.
+      * ``save(result, out_path=None) -> Path``  — (cMSHBM cleanup +) savemat of the result's labels.
       * ``close()``                              — release Session + Inputs refs and the
         cupy device-memory pool. **Required** between sequential subjects on
         the GPU backend; otherwise the cupy memory pool keeps holding the
@@ -134,12 +137,13 @@ class Step3Pipeline:
         ----------
         cfg : Step3Config
         precomputed_gradient_mat : (N, n_grad_components) fp32, optional
-            In-memory gradient array. When set, fetch_data skips the
-            per-hemi gradient .npy/.mat disk reads and uses this array
+            In-memory gradient array. When set, fetch_data (cpu) /
+            fetch_gradient (gpu) skips the per-hemi gradient .npy/.mat
+            disk reads named in cohort.json and uses this array
             directly. The unified pipeline driver passes step0's
             ``Step0Result.lh_emb_up``/``rh_emb_up`` (concatenated) here
             so step3 reads gradients from memory instead of re-reading
-            the .npy step0 just wrote. Validated by fetch_data.
+            the .npy step0 just wrote. Validated by the same reader.
         sparse_cohort : Step3SparseCohort, optional
             ``backend='gpu'`` only. The group prior + spatial masks +
             candidate layout, already loaded for this cohort. The step3
@@ -175,9 +179,10 @@ class Step3Pipeline:
     def close(self) -> None:
         """Release Session + Inputs and free the cupy memory pool.
 
-        Idempotent. The cupy free-blocks call is a no-op when ``cupy``
-        isn't importable (CPU backend) or when the default pool is
-        already empty.
+        Idempotent. The cupy free-blocks call runs on either backend
+        whenever ``cupy`` is importable (it is skipped only when the
+        import fails) and is a no-op when the default pool is already
+        empty.
 
         After ``close()`` the Pipeline is unusable — calling ``run()``
         again would re-allocate everything from scratch. To run a new
@@ -191,9 +196,10 @@ class Step3Pipeline:
         self._session = None
         self._inputs = None
         self._sparse_cohort = None
-        # Free cupy memory pools if cupy is loaded. Importing inside
-        # the function (not at module top) keeps the CPU-only path
-        # cupy-free.
+        # Free cupy memory pools if cupy is importable. Importing inside
+        # the function (not at module top) keeps a box without cupy
+        # working on the cpu backend; with cupy installed, the cpu
+        # backend imports it here too.
         try:
             import cupy as cp  # type: ignore[import-not-found]
         except ImportError:
@@ -240,10 +246,10 @@ class Step3Pipeline:
         self.timings["load_spatial_mask"] = time.perf_counter() - t0
 
         t0 = time.perf_counter()
-        lh_inflated = load_avg_mesh("lh", cfg.mesh, "inflated")
-        rh_inflated = load_avg_mesh("rh", cfg.mesh, "inflated")
-        lh_sphere = load_avg_mesh("lh", cfg.mesh, "sphere")
-        rh_sphere = load_avg_mesh("rh", cfg.mesh, "sphere")
+        lh_inflated = load_avg_mesh("lh", "inflated")
+        rh_inflated = load_avg_mesh("rh", "inflated")
+        lh_sphere = load_avg_mesh("lh", "sphere")
+        rh_sphere = load_avg_mesh("rh", "sphere")
         self.timings["load_avg_mesh"] = time.perf_counter() - t0
 
         # bilateral sphere coords (N, 3) for spatial_xyz_prior.
@@ -252,8 +258,8 @@ class Step3Pipeline:
         )
 
         # ``with_gradient`` is gMSHBM-only — cMSHBM/dMSHBM never read
-        # the diffusion-embedding ``.mat`` files (no gradient prior
-        # term), which saves ~2 mat reads.
+        # the per-hemi diffusion-embedding files named in cohort.json
+        # (no gradient prior term), which saves 2 reads.
         #
         # fetch_data always returns bit-packed BOLD; the cpu Session
         # runs its own unpack+normalize step on this buffer.
@@ -262,7 +268,6 @@ class Step3Pipeline:
             project_dir=cfg.project_dir,
             num_session=cfg.num_session,
             subid=cfg.subid,
-            mesh=cfg.mesh,
             lh_mesh=lh_inflated,
             rh_mesh=rh_inflated,
             n_grad_components=cfg.n_grad_components,
@@ -287,15 +292,8 @@ class Step3Pipeline:
         L = int(cfg.num_clusters)
         dim = D - 1
 
-        # MATLAB driver: ``ini_val=650`` is hardcoded for D-1=1482 (a
-        # special-case for fs_LR_32k); the ``CBIG_ArealMSHBM_initialize_
-        # concentration`` call runs otherwise. For fsaverage* the
-        # special-case is unused.
         t0 = time.perf_counter()
-        if dim == 1482:
-            ini_val = 650.0
-        else:
-            ini_val = initialize_concentration(dim)
+        ini_val = initialize_concentration(dim)
         self.timings["initialize_concentration"] = time.perf_counter() - t0
 
         t0 = time.perf_counter()
@@ -325,7 +323,6 @@ class Step3Pipeline:
         beta_vec = np.full(L, cfg.beta_internal, dtype=np.float64)
 
         setting_params: Dict[str, Any] = {
-            "mesh": cfg.mesh,
             "num_session": T,
             "num_clusters": L,
             "subid": int(cfg.subid),
@@ -626,9 +623,12 @@ class Step3Pipeline:
              ) -> Path:
         """Write ``Ind_parcellation_*.mat`` to disk.
 
-        cMSHBM: applies :func:`remove_isolated_surface_components` (size 5)
-        per hemisphere on the argmax labels BEFORE save (mirrors MATLAB
-        cMSHBM lines 319-320). gMSHBM/dMSHBM skip the post-process.
+        cMSHBM: applies :func:`remove_isolated_surface_components` (size
+        ``cfg.cMSHBM_isolated_component_min_size``) per hemisphere on the
+        argmax labels BEFORE save (mirrors MATLAB cMSHBM lines 319-320).
+        This is the host function on both backends; the device
+        port ``ConnectednessGPU.remove_isolated`` is used only inside the
+        EM. gMSHBM/dMSHBM skip the post-process.
 
         dMSHBM: filename omits the ``_beta<B>`` suffix.
 

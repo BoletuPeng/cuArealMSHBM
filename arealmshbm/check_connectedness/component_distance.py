@@ -4,7 +4,7 @@ Connectedness check + per-parcel component distance, called inside the
 EM body to decide which parcels need the spatial-xyz pull.
 
 Public API:
-    compute_components_general    — BFS over parcel labels on the
+    compute_components_general    — union-find over parcel labels on the
                                     bilateral mesh; returns per-parcel
                                     component count.
     component_distance            — pairwise distance between components
@@ -54,8 +54,7 @@ from . import _kernels
 # serialize anyway.
 #
 # Disable via ``CHECK_CONN_SERIAL=1`` for batch jobs that already saturate
-# CPU cores with outer subject-level multiprocessing (preserves the
-# original kernel-docstring contract). The env var is read ONCE at module
+# CPU cores with outer subject-level multiprocessing. The env var is read ONCE at module
 # import — changing it later has no effect; embedded callers that want to
 # toggle at runtime should set ``_PARALLEL_HEMI = False`` on this module
 # (which makes ``_get_rh_worker`` return None on every subsequent call).

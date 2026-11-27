@@ -3,8 +3,6 @@
 Configuration dataclass for the step-3 super-call. Bundles every knob
 the Python pipeline accepts; constructor is keyword-only.
 
-Mode-A only — fsaverage / fsaverage4 / fsaverage5 / fsaverage6.
-
 Public API:
     Step3Config — all parameters for one single-subject parcellation run.
 
@@ -21,11 +19,6 @@ from .variant import VariantSpec, VALID_PIPELINE_TYPES
 from arealmshbm.pipeline.config import _VALID_BACKENDS
 
 
-_SUPPORTED_MESHES = frozenset({
-    "fsaverage", "fsaverage4", "fsaverage5", "fsaverage6",
-})
-
-
 @dataclass
 class Step3Config:
     """All parameters for one step-3 single-subject parcellation run.
@@ -35,10 +28,10 @@ class Step3Config:
     project_dir : path to the project directory produced by step1:
                     project_dir/
                       cohort.json                                (roster + artifacts)
-                      profiles_raw/sub<S>/sub<S>_*.profile.b2nd  (per-subject BOLD)
-                      gradients/sub<S>/{lh,rh}_emb_*.npy|.mat    (per-subject gradient)
-                      priors/gMSHBM/beta<B>/Params_Final.mat     (group prior)
-                      spatial_mask/spatial_mask_<mesh>.mat       (spatial prior)
+                      profiles_raw/sub<S>/sub<S>.profile.b2nd    (per-subject BOLD)
+                      gradients/sub<S>/{lh,rh}_emb_*.npy|.mat    (per-subject gradient, gMSHBM)
+                      priors/<variant>/[beta<B>/]Params_Final.mat (group prior)
+                      spatial_mask/spatial_mask.mat              (spatial prior)
     num_session : T — number of sessions for this subject. Validated
                   against the cohort manifest.
     num_clusters : L — number of cortical parcels (e.g. 300).
@@ -47,7 +40,6 @@ class Step3Config:
     ------------------------------------------------------------------
     subid : 1-based positional index into the cohort's ``subjects``
             list (i.e. the n-th subject step1 was invoked with).
-    mesh : surface space; 'fsaverage6' / 'fsaverage5' / 'fsaverage'.
     w : weight on the group spatial prior log(theta); must be > 0 so
         the w*log(theta) term excludes cells outside supp(theta).
     c : weight on the MRF Potts smoothness prior.
@@ -61,8 +53,7 @@ class Step3Config:
               (:class:`arealmshbm.vmf_clustering.VmfClusteringSession`);
               'gpu' is the candidate-set EM on the theta support
               (``docs/step3_sparse_design.md``), serving all three
-              variants. 'gpu' requires ceil(D/8) <= 256 (seed_mesh
-              fsaverage3).
+              variants.
     connect_th : connectedness threshold for the distributed-parcel test.
     epsilon : convergence tolerance shared across the four nested loops.
     max_iter_intra_em : outer loop cap (MATLAB hardcodes 50).
@@ -75,7 +66,7 @@ class Step3Config:
     Output routing:
     ---------------
     out_dir : where to write Ind_parcellation_*.mat. Default:
-                project_dir/ind_parcellation_gMSHBM/<T>_sess/beta<B>/
+                project_dir/ind_parcellation_<variant>/<T>_sess/[beta<B>/]
     out_subid : the id string interpolated into the filename. Default is
                 str(subid) — kept separate so a multi-subject driver
                 can save under "sub-002" while the cohort.json data
@@ -90,7 +81,6 @@ class Step3Config:
 
     # ── core knobs (defaults match driver-example) ──
     subid: int = 1
-    mesh: str = "fsaverage6"
     w: float = 50.0
     c: float = 10.0
     beta_scalar: float = 5.0
@@ -168,11 +158,6 @@ class Step3Config:
         # Resolve VariantSpec early — every default-derivation below
         # branches on it.
         self._variant = VariantSpec.from_pipeline_type(self.pipeline_type)
-        if self.mesh not in _SUPPORTED_MESHES:
-            raise ValueError(
-                f"Step3Config: mesh must be one of {sorted(_SUPPORTED_MESHES)} "
-                f"(got {self.mesh!r}). fs_LR_32k is left for a later port."
-            )
         # Numeric guards. The hot path doesn't validate these; a negative
         # epsilon or zero iter cap would silently produce wrong / never-
         # terminating runs. ``c/beta_scalar`` are non-negative weights.
@@ -278,7 +263,7 @@ class Step3Config:
 
     @property
     def spatial_mask_path(self) -> Path:
-        return self.project_dir / "spatial_mask" / f"spatial_mask_{self.mesh}.mat"
+        return self.project_dir / "spatial_mask" / "spatial_mask.mat"
 
 
 def _fmt_num(x: float | int | str) -> str:

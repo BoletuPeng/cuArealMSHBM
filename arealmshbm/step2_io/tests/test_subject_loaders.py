@@ -83,9 +83,7 @@ def _normalize_session_ref(series: np.ndarray) -> np.ndarray:
 # ─────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────
-def _build_b2nd_fixture(project_dir: Path, S: int, T: int, N: int, D: int,
-                        *, targ_mesh: str = "fsaverage6",
-                        seed_mesh: str = "fsaverage3"):
+def _build_b2nd_fixture(project_dir: Path, S: int, T: int, N: int, D: int):
     """Write S per-subject .b2nd files at the canonical
     ``profiles_raw/sub<S>/...profile.b2nd`` path, build a minimal
     cohort.json, and return ``(raw_arrays, cohort)``.
@@ -94,15 +92,13 @@ def _build_b2nd_fixture(project_dir: Path, S: int, T: int, N: int, D: int,
     raws = []
     for s in range(1, S + 1):
         raw_TND = (rng.random((T, N, D)) < 0.1).astype(np.float32)
-        p = profile_path(project_dir, str(s), targ_mesh, seed_mesh)
+        p = profile_path(project_dir, str(s))
         write_subject_profile_tnd(p, np.ascontiguousarray(raw_TND))
         raws.append(raw_TND)
     cohort = backfill_cohort_json(
         project_dir,
         subjects=[str(s) for s in range(1, S + 1)],
         sessions=[str(t) for t in range(1, T + 1)],
-        targ_mesh=targ_mesh,
-        seed_mesh=seed_mesh,
         n_grad_components=100,
     )
     return raws, cohort
@@ -122,8 +118,6 @@ def test_profile_loader_b2nd_matches_inline_normalize(tmp_path: Path) -> None:
     loader = SubjectProfileLoader(
         cohort=cohort,
         project_dir=tmp_path,
-        targ_mesh="fsaverage6",
-        seed_mesh="fsaverage3",
     )
     assert loader.format == "b2nd"
     assert loader.dims() == (N, T, D)
@@ -149,7 +143,6 @@ def test_profile_loader_load_into_zero_alloc(tmp_path: Path) -> None:
     loader = SubjectProfileLoader(
         cohort=cohort,
         project_dir=tmp_path,
-        targ_mesh="fsaverage6", seed_mesh="fsaverage3",
     )
 
     scratch = np.empty((N, T, D), dtype=np.float32)
@@ -178,12 +171,11 @@ def test_profile_loader_rejects_a_subject_unlike_subject_1(
     rng = np.random.default_rng(11)
     other = (rng.random((sub2_T, N, sub2_D)) < 0.1).astype(np.float32)
     write_subject_profile_tnd(
-        profile_path(tmp_path, "2", "fsaverage6", "fsaverage3"),
+        profile_path(tmp_path, "2"),
         np.ascontiguousarray(other))
 
     loader = SubjectProfileLoader(
         cohort=cohort, project_dir=tmp_path,
-        targ_mesh="fsaverage6", seed_mesh="fsaverage3",
         cache_mode=cache_mode,
     )
     assert loader.load(1).shape == (N, T, D)
@@ -215,7 +207,6 @@ def test_gradient_loader_npy_round_trip(tmp_path: Path) -> None:
         tmp_path,
         subjects=[str(s) for s in range(1, S + 1)],
         sessions=[str(t) for t in range(1, T + 1)],
-        targ_mesh="fsaverage6", seed_mesh="fsaverage3",
         n_grad_components=D_grad,
     )
 

@@ -1,12 +1,13 @@
 """load_avg_mesh.py
 
-Load an fsaverage average-mesh bundle — the inflated surface (used by
+Load an fsaverage6 average-mesh bundle — the inflated surface (used by
 the connectivity BFS) and the sphere (used by ``spatial_xyz_prior``).
+fsaverage6 is the one surface space the pipeline runs on.
 
 Returns the same fields as the MATLAB ``CBIG_ReadNCAvgMesh``:
     vertices    : (3, N) coords
     vertexNbors : (max_neigh, N) int, 1-indexed, 0 = absent slot
-    MARS_label  : (1, N) int — 1 for medial wall, 2 for cortex
+    MARS_label  : (N,) int — 1 for medial wall, 2 for cortex
     faces       : (F, 3) int, 0-indexed
 
 ``vertexNbors`` ordering inside each column is not MATLAB
@@ -15,7 +16,7 @@ matters for both downstream consumers (V_lambda's Potts stencil uses
 every non-zero slot uniformly; ``check_connectedness`` treats it as a
 graph adjacency).
 
-**On-disk format is the single source of truth.** Each ``(hemi, mesh,
+**On-disk format is the single source of truth.** Each ``(hemi,
 surface)`` bundle is a shipped ``.npz`` asset under
 ``arealmshbm/data/precomputed/avg_mesh/`` (override via
 ``$MSHBM_PRECOMPUTED_ROOT``). There is NO runtime rebuild from raw
@@ -36,7 +37,7 @@ from __future__ import annotations
 import os
 from functools import lru_cache
 from pathlib import Path
-from typing import Dict, Literal
+from typing import Dict, Literal, Optional
 
 import numpy as np
 
@@ -46,7 +47,7 @@ def _atlas_dir() -> Path:
     if not env:
         raise RuntimeError(
             "MSHBM_ATLAS_DIR is unset or empty. Point it at a directory "
-            "whose per-mesh subdirs hold `<targ_mesh>/label/` — the "
+            "that holds `fsaverage6/label/` — the "
             "FreeSurfer annot files read live in step 1 "
             "(`<hemi>.aparc.annot` and `<hemi>.Schaefer2018_*.annot`). "
             "Mesh geometry does NOT come from here — it comes from the "
@@ -57,8 +58,16 @@ def _atlas_dir() -> Path:
     return Path(env)
 
 
+def atlas_label_dir(atlas_dir: Optional[str | Path] = None) -> Path:
+    """``<atlas>/fsaverage6/label`` — the FreeSurfer subject layout the
+    live ``.annot`` reads use. ``atlas_dir`` overrides
+    ``MSHBM_ATLAS_DIR``."""
+    base = Path(atlas_dir) if atlas_dir else _atlas_dir()
+    return base / "fsaverage6" / "label"
+
+
 # ─────────────────────────────────────────────────────────────────────
-# Shipped avg-mesh bundles. Each (hemi, mesh, surface) is one ``.npz``
+# Shipped avg-mesh bundles. Each (hemi, surface) is one ``.npz``
 # (uncompressed — a zip of raw .npy entries) holding vertices / faces /
 # MARS_label / vertexNbors.
 #
@@ -70,7 +79,7 @@ def _atlas_dir() -> Path:
 # installer, exactly like game textures. A missing bundle is a broken
 # install, resolved by reinstalling — never by recomputing at runtime.
 #
-# Bundle key: (hemi, mesh, surface). Pointing at a different atlas
+# Bundle key: (hemi, surface). Pointing at a different atlas
 # revision ⇒ restage the bundles (or redirect via
 # ``$MSHBM_PRECOMPUTED_ROOT``).
 # ─────────────────────────────────────────────────────────────────────
@@ -84,24 +93,22 @@ def _avg_mesh_bundle_dir() -> Path:
             / "data" / "precomputed" / "avg_mesh")
 
 
-def _avg_mesh_bundle_file(hemi: str, mesh: str, surface: str) -> Path:
-    return _avg_mesh_bundle_dir() / f"{hemi}_{mesh}_{surface}.npz"
+def _avg_mesh_bundle_file(hemi: str, surface: str) -> Path:
+    return _avg_mesh_bundle_dir() / f"{hemi}_{surface}.npz"
 
 
 def load_avg_mesh(hemi: Literal["lh", "rh"],
-                  mesh: str = "fsaverage6",
                   surface: Literal["inflated", "sphere"] = "inflated",
                   ) -> Dict[str, np.ndarray]:
-    """Load one fsaverage mesh bundle (one hemi, one surface).
+    """Load one fsaverage6 mesh bundle (one hemi, one surface).
 
-    Results are cached in-process by ``(hemi, mesh, surface)``; repeated
+    Results are cached in-process by ``(hemi, surface)``; repeated
     calls within a session avoid the ~5-15 ms bundle read. Callers MUST
     treat the returned arrays as read-only; the project does so already.
 
     Parameters
     ----------
     hemi    : 'lh' or 'rh'.
-    mesh    : 'fsaverage6' (default), 'fsaverage5', etc.
     surface : 'inflated' (connectivity / vertexNbors) or 'sphere'
               (spatial_xyz_prior coords).
 
@@ -123,16 +130,15 @@ def load_avg_mesh(hemi: Literal["lh", "rh"],
         raise ValueError(f"hemi must be 'lh' or 'rh'; got {hemi!r}")
     if surface not in ("inflated", "sphere"):
         raise ValueError(f"surface must be 'inflated' or 'sphere'; got {surface!r}")
-    return _load_avg_mesh_cached(hemi, mesh, surface)
+    return _load_avg_mesh_cached(hemi, surface)
 
 
-@lru_cache(maxsize=16)
-def _load_avg_mesh_cached(hemi: str, mesh: str, surface: str
-                           ) -> Dict[str, np.ndarray]:
-    p = _avg_mesh_bundle_file(hemi, mesh, surface)
+@lru_cache(maxsize=4)
+def _load_avg_mesh_cached(hemi: str, surface: str) -> Dict[str, np.ndarray]:
+    p = _avg_mesh_bundle_file(hemi, surface)
     if not p.exists():
         raise FileNotFoundError(
-            f"avg_mesh bundle missing for ({hemi}, {mesh}, {surface}): {p}. "
+            f"avg_mesh bundle missing for ({hemi}, {surface}): {p}. "
             f"This is a shipped asset, not a cache — reinstall to restage "
             f"it. (The raw-FreeSurfer builder that produces these bundles "
             f"lives in git history at the commit that assetized "

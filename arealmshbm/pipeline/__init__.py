@@ -3,7 +3,9 @@
 A *project* is a directory under ``projects/<name>/`` representing one
 parcellation campaign on one dataset. The only user-provided input is
 ``bold_inputs.json`` (BOLD time-series manifest) + ``pipeline_config.json``
-(mode + hyperparams). Everything else under the project dir is **cache**
+(mode + hyperparams), plus, in Mode A, the group prior staged at
+``priors/<variant>/beta<X>/Params_Final.mat``. Everything else under
+the project dir is **cache**
 — produced, owned, and overwritten by the driver.
 
 The driver dispatches across three modes:

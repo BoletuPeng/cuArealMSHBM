@@ -56,7 +56,7 @@ def test_atlas_dir_set_returns_path(monkeypatch, tmp_path):
 
 def test_atlas_dir_error_describes_annot_layout(monkeypatch):
     """The RuntimeError must describe what the atlas dir is now FOR — the
-    live ``<targ_mesh>/label/*.annot`` reads — so a library-only consumer
+    live ``fsaverage6/label/*.annot`` reads — so a library-only consumer
     can act on it. It must NOT claim surf/ is read (mesh geometry comes
     from the shipped bundles now); pin that the message stays annot-scoped.
     """
@@ -83,9 +83,9 @@ def test_load_avg_mesh_missing_bundle_is_hard_error(monkeypatch, tmp_path):
     _load_avg_mesh_cached.cache_clear()
     try:
         with pytest.raises(FileNotFoundError) as excinfo:
-            load_avg_mesh("lh", "fsaverage3", "inflated")
+            load_avg_mesh("lh", "inflated")
         msg = str(excinfo.value)
-        assert "fsaverage3" in msg, "must name the missing bundle"
+        assert "lh_inflated.npz" in msg, "must name the missing bundle"
         assert "asset" in msg, "must frame it as a shipped asset, not a cache"
     finally:
         _load_avg_mesh_cached.cache_clear()
@@ -97,6 +97,6 @@ def test_load_avg_mesh_validates_hemi_and_surface(monkeypatch, tmp_path):
     """
     monkeypatch.setenv("MSHBM_PRECOMPUTED_ROOT", str(tmp_path / "precomputed"))
     with pytest.raises(ValueError, match="hemi"):
-        load_avg_mesh("LH", "fsaverage6", "inflated")
+        load_avg_mesh("LH", "inflated")
     with pytest.raises(ValueError, match="surface"):
-        load_avg_mesh("lh", "fsaverage6", "midthickness")
+        load_avg_mesh("lh", "midthickness")

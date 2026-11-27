@@ -16,11 +16,11 @@ The b2nd ``vlmeta`` carries ``format_version='bitpacked_uint8_v1'`` plus
 bytes per row.
 
 Layout:
-    project_dir/profiles_raw/sub<S>/sub<S>_<targ>_roi<seed>.profile.b2nd
+    project_dir/profiles_raw/sub<S>/sub<S>.profile.b2nd
 
 Public API
 ----------
-    profile_path(out_dir, sub, targ_mesh, seed_mesh) -> Path
+    profile_path(out_dir, sub) -> Path
         Canonical per-subject .b2nd path.
 
     write_subject_profile_tnd(path, arr_tnd) -> Path
@@ -60,7 +60,7 @@ import numpy as np
 # ``blosc2`` is imported lazily: ``import blosc2`` pulls ``requests``
 # (a remote-proxy feature this project never uses) and cost half a
 # second on the import of *any* entry point. The codec/filter constants
-# moved into ``_cparams()`` for that reason; their values are unchanged.
+# live in ``_cparams()`` for that reason.
 _BLOSC2 = None
 
 
@@ -73,7 +73,7 @@ def _blosc2():
     return _BLOSC2
 
 
-PROFILE_NAME_FMT = "sub{sub}_{targ_mesh}_roi{seed_mesh}.profile.b2nd"
+PROFILE_NAME_FMT = "sub{sub}.profile.b2nd"
 
 # A plain int, so it needs no blosc2 attribute access at import time.
 _CLEVEL = 5
@@ -113,12 +113,10 @@ _VLMETA_BITORDER_VAL = "little"
 # ─────────────────────────────────────────────────────────────────────
 # Path helper
 # ─────────────────────────────────────────────────────────────────────
-def profile_path(out_dir: str | Path, sub: str | int,
-                 targ_mesh: str, seed_mesh: str) -> Path:
+def profile_path(out_dir: str | Path, sub: str | int) -> Path:
     """Canonical per-subject .b2nd path under ``profiles_raw/sub<S>/``."""
     return (Path(out_dir) / "profiles_raw" / f"sub{sub}" /
-            PROFILE_NAME_FMT.format(sub=sub, targ_mesh=targ_mesh,
-                                     seed_mesh=seed_mesh))
+            PROFILE_NAME_FMT.format(sub=sub))
 
 
 # ─────────────────────────────────────────────────────────────────────

@@ -188,14 +188,14 @@ def test_layouts_equal_detects_a_difference() -> None:
 # ─────────────────────────────────────────────────────────────────────
 @pytest.mark.skipif(
     not (BENCH_DIR / "proj" / "spatial_mask"
-         / "spatial_mask_fsaverage6.mat").exists(),
+         / "spatial_mask.mat").exists(),
     reason="step-2 bench project not present")
 def test_bench_layout_matches_the_dense_pipeline_path() -> None:
     from arealmshbm.data_io import mat5_stream
     from arealmshbm.data_io.load_spatial_mask import load_spatial_mask
     from arealmshbm.step2_init.boundary_mask import build_step2_boundary_mask
 
-    p = BENCH_DIR / "proj" / "spatial_mask" / "spatial_mask_fsaverage6.mat"
+    p = BENCH_DIR / "proj" / "spatial_mask" / "spatial_mask.mat"
     lay = build_step2_layout(mat5_stream.read_sparse(p, "lh_boundary"),
                              mat5_stream.read_sparse(p, "rh_boundary"))
     lh_b, rh_b = load_spatial_mask(p)

@@ -102,39 +102,18 @@ class _SessionInputs(NamedTuple):
     censor_runs: Optional[List]   # n_runs × (T,) int32 or None per run; None when all-keep.
     lh_mars: np.ndarray
     rh_mars: np.ndarray
-    n_seed_lh_verts: int
-    n_seed_rh_verts: int
     threshold_f: float
 
 
-def _icosphere_nverts(mesh: str) -> int:
-    """Vertex count of an fsaverage icosphere: ``10·4^order + 2``.
-
-    fsaverage3→642, 4→2562, 5→10242, 6→40962. The seed only needs its
-    vertex count (the seed mask is the first N cortex verts of the targ
-    mesh), so we compute it in closed form instead of loading the seed
-    mesh — the count is topology-invariant, no surface read required.
-    """
-    if not mesh.startswith("fsaverage"):
-        raise ValueError(f"not an fsaverage mesh: {mesh!r}")
-    suffix = mesh[len("fsaverage"):]
-    if suffix == "":
-        order = 7
-    elif suffix.isdigit():
-        order = int(suffix)
-    else:
-        # fs_LR-style names (e.g. 'fsaverage_LR32k') are not icospheres;
-        # reject clearly instead of a cryptic int() ValueError.
-        raise ValueError(f"not an icosphere fsaverage mesh: {mesh!r}")
-    return 10 * (4 ** order) + 2
+# The RSFC seeds are the fsaverage3 vertices. An icosphere's coarser
+# levels are a prefix of its vertex list, so they are the first 642
+# vertices (10·4³ + 2) of each fsaverage6 hemisphere.
+N_SEED_VERTS = 642
 
 
-def _load_session_inputs(seed_mesh: str,
-                          targ_mesh: str,
-                          out_dir,
+def _load_session_inputs(out_dir,
                           sub: str,
                           sess: str,
-                          split_flag: str,
                           threshold,
                           precomputed_bold_runs,
                           ) -> _SessionInputs:
@@ -143,22 +122,10 @@ def _load_session_inputs(seed_mesh: str,
     and runs its per-run kernels over.
     """
     out_dir = Path(out_dir)
-    if not targ_mesh.startswith("fsaverage"):
-        raise ValueError(
-            f"only fsaverage targets are supported; got {targ_mesh!r}"
-        )
-    if str(split_flag) != "0":
-        raise NotImplementedError(
-            f"split_flag={split_flag!r}: only '0' (no-split) is supported."
-        )
     threshold_f = float(threshold)
 
-    lh_targ = load_avg_mesh("lh", targ_mesh, "inflated")
-    rh_targ = load_avg_mesh("rh", targ_mesh, "inflated")
-    n_seed_lh_verts = _icosphere_nverts(seed_mesh)
-    n_seed_rh_verts = _icosphere_nverts(seed_mesh)
-    lh_mars = lh_targ["MARS_label"]
-    rh_mars = rh_targ["MARS_label"]
+    lh_mars = load_avg_mesh("lh", "inflated")["MARS_label"]
+    rh_mars = load_avg_mesh("rh", "inflated")["MARS_label"]
 
     if precomputed_bold_runs is not None:
         # Driver-level Step1BoldPrefetcher already gzip-decoded ahead of
@@ -241,7 +208,6 @@ def _load_session_inputs(seed_mesh: str,
         lh_runs=lh_runs, rh_runs=rh_runs, n_runs=n_runs,
         censor_runs=censor_runs,
         lh_mars=lh_mars, rh_mars=rh_mars,
-        n_seed_lh_verts=n_seed_lh_verts, n_seed_rh_verts=n_seed_rh_verts,
         threshold_f=threshold_f,
     )
 
@@ -264,14 +230,10 @@ def _threshold_top_fraction(combined_corr: np.ndarray, fraction: float) -> np.fl
     return np.float32(np.partition(flat, kth)[kth])
 
 
-def compute_profile_arrays(seed_mesh: str,
-                            targ_mesh: str,
-                            out_dir,
+def compute_profile_arrays(out_dir,
                             sub: str,
                             sess: str,
-                            split_flag: str = "0",
                             threshold="0.1",
-                            dtype_reduce: np.dtype = np.float32,
                             precomputed_bold_runs=None,
                             ):
     """Compute one (sub, sess) FC-profile array pair WITHOUT writing.
@@ -298,11 +260,6 @@ def compute_profile_arrays(seed_mesh: str,
     :func:`~arealmshbm.generate_profiles.profiles_subject_gpu.generate_subject_profiles_gpu`,
     a whole-subject call with its own entry point.
     """
-    if np.dtype(dtype_reduce) != np.float32:
-        raise ValueError(
-            f"compute_profile_arrays: dtype_reduce must be np.float32 (got "
-            f"{np.dtype(dtype_reduce)!r}); the leaf is hard-coded fp32."
-        )
     # Backend-mismatch guard: ``precomputed_bold_runs`` is public, so a
     # caller can hand this CPU leaf device buffers (e.g. straight out of
     # ``iter_subject_bold_gpu``). They would reach the numba kernel below
@@ -319,8 +276,8 @@ def compute_profile_arrays(seed_mesh: str,
                 "for the GPU path."
             )
     inputs = _load_session_inputs(
-        seed_mesh=seed_mesh, targ_mesh=targ_mesh, out_dir=out_dir,
-        sub=sub, sess=sess, split_flag=split_flag, threshold=threshold,
+        out_dir=out_dir,
+        sub=sub, sess=sess, threshold=threshold,
         precomputed_bold_runs=precomputed_bold_runs,
     )
     lh_runs = inputs.lh_runs
@@ -333,12 +290,10 @@ def compute_profile_arrays(seed_mesh: str,
 
     V_lh = int(lh_runs[0].shape[1])
     V_rh = int(rh_runs[0].shape[1])
-    if lh_mars.shape[0] < inputs.n_seed_lh_verts or rh_mars.shape[0] < inputs.n_seed_rh_verts:
-        raise ValueError("MARS_label arrays shorter than seed-vert count")
     lh_seed_mask = np.zeros(V_lh, dtype=bool)
     rh_seed_mask = np.zeros(V_rh, dtype=bool)
-    lh_seed_mask[:inputs.n_seed_lh_verts] = (lh_mars[:inputs.n_seed_lh_verts] == 2)
-    rh_seed_mask[:inputs.n_seed_rh_verts] = (rh_mars[:inputs.n_seed_rh_verts] == 2)
+    lh_seed_mask[:N_SEED_VERTS] = (lh_mars[:N_SEED_VERTS] == 2)
+    rh_seed_mask[:N_SEED_VERTS] = (rh_mars[:N_SEED_VERTS] == 2)
     K = int(lh_seed_mask.sum() + rh_seed_mask.sum())
 
     lh_corr_sum = np.zeros((K, V_lh), dtype=np.float32)
@@ -398,7 +353,7 @@ def compute_profile_arrays(seed_mesh: str,
     # bitpacked .b2nd contract + step2 SubjectProfileLoader require
     # zero rows at MW vertices. The actual clamp + shape assertion live
     # in ``_apply_mw_zero`` so a no-disk unit test can exercise the same
-    # code.
+    # code (the GPU leaf zeroes inside ``binarize_mwzero_pack_cupy``).
     _apply_mw_zero(lh_bin_KxV, rh_bin_KxV, lh_mars, rh_mars)
 
     return lh_bin_KxV, rh_bin_KxV

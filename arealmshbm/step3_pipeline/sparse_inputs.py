@@ -22,7 +22,7 @@ numbers, without ever forming an (N, L) array:
                                 falls back to ``scipy.io.loadmat`` +
                                 dense→CSR for anything it does not handle
                                 (v7.3, uncompressed, unexpected classes).
-    load_spatial_mask_csr       spatial_mask_<mesh>.mat → two csr_matrix.
+    load_spatial_mask_csr       spatial_mask.mat → two csr_matrix.
     build_candidate_layout_fast CSR θ + CSR masks → CandidateLayout
                                 (equality with the dense reference builder
                                 is pinned by the tests).
@@ -410,7 +410,7 @@ def load_group_prior_csr(prior_path: str | Path) -> Dict[str, Any]:
 # 2. spatial mask → CSR
 # ─────────────────────────────────────────────────────────────────────
 def load_spatial_mask_csr(mask_path: str | Path):
-    """Read ``spatial_mask_<mesh>.mat`` as two fp64 ``csr_matrix``.
+    """Read ``spatial_mask.mat`` as two fp64 ``csr_matrix``.
 
     Same reader as step 2 (:func:`arealmshbm.data_io.mat5_stream.read_sparse`,
     MATLAB sparse straight from ``ir``/``jc``/``pr``), never densified.
@@ -572,13 +572,9 @@ def build_candidate_layout_fast(theta_csr,
 # ─────────────────────────────────────────────────────────────────────
 # 4. BOLD + gradient
 # ─────────────────────────────────────────────────────────────────────
-def _cohort_entry(project_dir: Path, subid: int, mesh: str):
+def _cohort_entry(project_dir: Path, subid: int):
     from arealmshbm.data_io.cohort import read_cohort
     cohort = read_cohort(project_dir)
-    if cohort.mesh.get("targ") != mesh:
-        raise ValueError(
-            f"fetch: cohort mesh.targ={cohort.mesh.get('targ')!r} "
-            f"!= caller mesh={mesh!r}")
     idx = int(subid) - 1
     if idx < 0 or idx >= cohort.num_sub:
         raise IndexError(
@@ -590,7 +586,6 @@ def _cohort_entry(project_dir: Path, subid: int, mesh: str):
 def fetch_packed_bold_TND(project_dir: str | Path,
                           num_session: int,
                           subid: int,
-                          mesh: str,
                           lh_mesh: Dict[str, np.ndarray],
                           rh_mesh: Dict[str, np.ndarray],
                           ) -> Tuple[np.ndarray, int, np.ndarray, np.ndarray]:
@@ -603,9 +598,6 @@ def fetch_packed_bold_TND(project_dir: str | Path,
     Returns ``(packed_TND, D_unpacked, mw_lh_idx, mw_rh_idx)``; the MW
     index lists are 0-based into their own hemisphere's row block.
     """
-    if not mesh.startswith("fsaverage"):
-        raise ValueError(
-            f"fetch_packed_bold_TND is fsaverage only; got mesh={mesh!r}")
     project_dir = Path(project_dir)
     T = int(num_session)
 
@@ -618,7 +610,7 @@ def fetch_packed_bold_TND(project_dir: str | Path,
     from arealmshbm.data_io.cohort import resolve_path
     from arealmshbm.data_io.profile_io import read_subject_profile_packed_tnd
 
-    sub_entry, idx = _cohort_entry(project_dir, subid, mesh)
+    sub_entry, idx = _cohort_entry(project_dir, subid)
     if len(sub_entry.sessions) != T:
         raise ValueError(
             f"fetch_packed_bold_TND: cohort subjects[{idx}].sessions has "
@@ -651,9 +643,8 @@ def fetch_packed_bold_TND(project_dir: str | Path,
     if D_bytes > MAX_D_BYTES:
         raise ValueError(
             f"fetch_packed_bold_TND: backend='gpu' requires "
-            f"ceil(D/8) <= {MAX_D_BYTES} (D <= {MAX_D_BYTES * 8}, i.e. "
-            f"seed_mesh fsaverage3); got D={D} (ceil(D/8)={D_bytes}); "
-            f"use backend='cpu'.")
+            f"ceil(D/8) <= {MAX_D_BYTES} (D <= {MAX_D_BYTES * 8}); "
+            f"got D={D} (ceil(D/8)={D_bytes}); use backend='cpu'.")
     # The profile format requires the padding bits past D to be zero
     # (docs/profile_disk_format.md): the bit-count normalisers fold all
     # 8 bits of every byte with no ``d < D`` clamp, so a set padding bit
@@ -673,7 +664,6 @@ def fetch_packed_bold_TND(project_dir: str | Path,
 
 def fetch_gradient(project_dir: str | Path,
                    subid: int,
-                   mesh: str,
                    N: int,
                    n_grad_components: int = 100,
                    *,
@@ -696,7 +686,7 @@ def fetch_gradient(project_dir: str | Path,
         return np.ascontiguousarray(g[:, :n_grad_components], dtype=np.float32)
 
     project_dir = Path(project_dir)
-    sub_entry, idx = _cohort_entry(project_dir, subid, mesh)
+    sub_entry, idx = _cohort_entry(project_dir, subid)
     if sub_entry.gradient_lh is None or sub_entry.gradient_rh is None:
         raise ValueError(
             f"fetch_gradient: cohort subjects[{idx}] (id={sub_entry.id!r}) "
@@ -742,7 +732,7 @@ class Step3SparseCohort:
     """The cohort-constant half of :class:`Step3SparseInputs`.
 
     The group prior, the two spatial masks and the derived
-    :class:`CandidateLayout` depend only on ``cfg.mesh``,
+    :class:`CandidateLayout` depend only on
     ``cfg.group_prior_path``, ``cfg.spatial_mask_path`` and
     ``cfg.num_clusters`` — identical for every subject of one cohort.
     Loaded once by :func:`load_step3_sparse_cohort` and shared
@@ -752,7 +742,6 @@ class Step3SparseCohort:
     subject's ``Step3Result.Params['mu']``. The two spatial masks are
     not kept — the layout is the only thing built from them.
     """
-    mesh: str
     group_prior_path: str
     spatial_mask_path: str
     num_clusters: int
@@ -763,7 +752,6 @@ class Step3SparseCohort:
     def check(self, cfg) -> None:
         """Raise ``ValueError`` naming the first field ``cfg`` disagrees on."""
         for name, mine, theirs in (
-            ("mesh", self.mesh, str(cfg.mesh)),
             ("group_prior_path", self.group_prior_path,
              str(cfg.group_prior_path)),
             ("spatial_mask_path", self.spatial_mask_path,
@@ -786,8 +774,8 @@ def load_step3_sparse_cohort(cfg, *, overlap: bool = True,
     from arealmshbm.data_io import load_avg_mesh
 
     timings: Dict[str, float] = {}
-    lh_inflated = load_avg_mesh("lh", cfg.mesh, "inflated")
-    rh_inflated = load_avg_mesh("rh", cfg.mesh, "inflated")
+    lh_inflated = load_avg_mesh("lh", "inflated")
+    rh_inflated = load_avg_mesh("rh", "inflated")
     N_expect = (int(lh_inflated["MARS_label"].shape[0])
                 + int(rh_inflated["MARS_label"].shape[0]))
 
@@ -827,7 +815,6 @@ def load_step3_sparse_cohort(cfg, *, overlap: bool = True,
     timings["build_candidate_layout"] = time.perf_counter() - t0
 
     return Step3SparseCohort(
-        mesh=str(cfg.mesh),
         group_prior_path=str(cfg.group_prior_path),
         spatial_mask_path=str(cfg.spatial_mask_path),
         num_clusters=int(cfg.num_clusters),
@@ -866,10 +853,10 @@ def load_step3_sparse_inputs(cfg,
     t_total = time.perf_counter()
 
     t0 = time.perf_counter()
-    lh_inflated = load_avg_mesh("lh", cfg.mesh, "inflated")
-    rh_inflated = load_avg_mesh("rh", cfg.mesh, "inflated")
-    lh_sphere = load_avg_mesh("lh", cfg.mesh, "sphere")
-    rh_sphere = load_avg_mesh("rh", cfg.mesh, "sphere")
+    lh_inflated = load_avg_mesh("lh", "inflated")
+    rh_inflated = load_avg_mesh("rh", "inflated")
+    lh_sphere = load_avg_mesh("lh", "sphere")
+    rh_sphere = load_avg_mesh("rh", "sphere")
     timings["load_avg_mesh"] = time.perf_counter() - t0
 
     sphere_xyz_bilateral = np.concatenate(
@@ -885,7 +872,7 @@ def load_step3_sparse_inputs(cfg,
     def _bold():
         t = time.perf_counter()
         r = fetch_packed_bold_TND(cfg.project_dir, cfg.num_session, cfg.subid,
-                                  cfg.mesh, lh_inflated, rh_inflated)
+                                  lh_inflated, rh_inflated)
         timings["fetch_packed_bold"] = time.perf_counter() - t
         return r
 
@@ -893,7 +880,7 @@ def load_step3_sparse_inputs(cfg,
         if not want_grad:
             return None
         t = time.perf_counter()
-        r = fetch_gradient(cfg.project_dir, cfg.subid, cfg.mesh, N_expect,
+        r = fetch_gradient(cfg.project_dir, cfg.subid, N_expect,
                            cfg.n_grad_components,
                            precomputed_gradient_mat=precomputed_gradient_mat)
         timings["fetch_gradient"] = time.perf_counter() - t
@@ -925,11 +912,10 @@ def load_step3_sparse_inputs(cfg,
 
     dim = int(D) - 1
     t0 = time.perf_counter()
-    ini_val = 650.0 if dim == 1482 else float(initialize_concentration(dim))
+    ini_val = float(initialize_concentration(dim))
     timings["initialize_concentration"] = time.perf_counter() - t0
 
     setting_params: Dict[str, Any] = {
-        "mesh": cfg.mesh,
         "num_session": T,
         "num_clusters": L,
         "subid": int(cfg.subid),

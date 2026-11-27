@@ -17,7 +17,7 @@ a slower reader.
 
 Public API:
 
-    subject_seed_and_mw(seed_mesh, targ_mesh)
+    subject_seed_and_mw()
         ``(seed_idx, mw_mask, n_lh, n_rh)`` on the joint ``lh|rh`` axis.
 
     compute_subject_profiles_gpu(sessions, ...) -> (packed_host, K)
@@ -84,39 +84,31 @@ from ._kernels_gpu import (
     threshold_top_fraction_exact_cupy,
     zscore_unit_norm_columns_zerovar_cupy,
 )
-from .profiles import _icosphere_nverts, _read_censor_vector, _read_lines
+from .profiles import N_SEED_VERTS, _read_censor_vector, _read_lines
 
 
 # ─────────────────────────────────────────────────────────────────────
 # Seed / medial-wall index construction
 # ─────────────────────────────────────────────────────────────────────
-def subject_seed_and_mw(seed_mesh: str, targ_mesh: str):
-    """``(seed_idx, mw_mask, n_lh, n_rh)`` for one (seed, targ) pair.
+def subject_seed_and_mw():
+    """``(seed_idx, mw_mask, n_lh, n_rh)`` of the mesh.
 
     ``seed_idx`` is the ``(K,) int64`` **global** column index into the
-    joint ``lh|rh`` axis: the first ``_icosphere_nverts(seed_mesh)``
+    joint ``lh|rh`` axis: the first ``N_SEED_VERTS``
     vertices of each hemi whose ``MARS_label == 2``, with the rh block
     offset by ``n_lh``. ``mw_mask`` is ``(n_lh + n_rh,) uint8``, 1 at
     ``MARS_label == 1`` (medial wall).
     """
     from ..data_io.load_avg_mesh import load_avg_mesh
 
-    if not targ_mesh.startswith("fsaverage"):
-        raise ValueError(
-            f"only fsaverage targets are supported; got {targ_mesh!r}")
-    lh_mars = np.asarray(load_avg_mesh("lh", targ_mesh, "inflated")
+    lh_mars = np.asarray(load_avg_mesh("lh", "inflated")
                          ["MARS_label"]).ravel()
-    rh_mars = np.asarray(load_avg_mesh("rh", targ_mesh, "inflated")
+    rh_mars = np.asarray(load_avg_mesh("rh", "inflated")
                          ["MARS_label"]).ravel()
-    n_seed = _icosphere_nverts(seed_mesh)
     n_lh = int(lh_mars.shape[0])
     n_rh = int(rh_mars.shape[0])
-    if n_lh < n_seed or n_rh < n_seed:
-        raise ValueError(
-            f"MARS_label arrays ({n_lh}, {n_rh}) shorter than the "
-            f"{n_seed}-vertex seed mesh {seed_mesh!r}")
-    lh_seed = np.flatnonzero(lh_mars[:n_seed] == 2).astype(np.int64)
-    rh_seed = (np.flatnonzero(rh_mars[:n_seed] == 2).astype(np.int64)
+    lh_seed = np.flatnonzero(lh_mars[:N_SEED_VERTS] == 2).astype(np.int64)
+    rh_seed = (np.flatnonzero(rh_mars[:N_SEED_VERTS] == 2).astype(np.int64)
                + np.int64(n_lh))
     seed_idx = np.concatenate([lh_seed, rh_seed])
     mw = np.concatenate([(lh_mars == 1), (rh_mars == 1)]).astype(np.uint8)
@@ -732,10 +724,7 @@ def generate_subject_profiles_gpu(project_dir,
                                    bold_paths: Optional[Dict] = None,
                                    *,
                                    out_path=None,
-                                   seed_mesh: str,
-                                   targ_mesh: str,
                                    threshold=0.1,
-                                   split_flag: str = "0",
                                    write: bool = True,
                                    on_packed=None) -> SubjectProfilesResult:
     """Ingest + fused compute + .b2nd write for one subject.
@@ -755,11 +744,9 @@ def generate_subject_profiles_gpu(project_dir,
         ``data_list/fMRI_list`` when omitted.
     out_path : path, optional
         Target .b2nd. Defaults to
-        ``profile_io.profile_path(project_dir, sub_id, targ, seed)``.
+        ``profile_io.profile_path(project_dir, sub_id)``.
     threshold : float
         Top fraction admitted by the binarize.
-    split_flag : str
-        Only ``'0'`` is supported, as on the per-session path.
     write : bool
         Stream the .b2nd out on a background thread, one chunk per
         session, as the sessions finish. ``False`` skips it entirely
@@ -798,9 +785,6 @@ def generate_subject_profiles_gpu(project_dir,
 
     from ..data_io.profile_io import profile_path
 
-    if str(split_flag) != "0":
-        raise NotImplementedError(
-            f"split_flag={split_flag!r}: only '0' (no-split) is supported.")
     project_dir = Path(project_dir)
     sub = str(sub_id)
     sess_ids = [str(s) for s in sess_ids]
@@ -819,7 +803,7 @@ def generate_subject_profiles_gpu(project_dir,
                     f"missing fMRI lists: {lh_lp} or {rh_lp}")
             bold_paths[sess] = (_read_lines(lh_lp), _read_lines(rh_lp))
 
-    seed_idx, mw, n_lh, n_rh = subject_seed_and_mw(seed_mesh, targ_mesh)
+    seed_idx, mw, n_lh, n_rh = subject_seed_and_mw()
     n_full = n_lh + n_rh
 
     # Flatten (session, run) into the reader's pair list; the reader
@@ -873,7 +857,7 @@ def generate_subject_profiles_gpu(project_dir,
                 f"subject ({si} of {len(run_counts)} sessions)")
 
     if out_path is None:
-        out_path = profile_path(project_dir, sub, targ_mesh, seed_mesh)
+        out_path = profile_path(project_dir, sub)
     out_path = Path(out_path)
 
     # Pinned destination for the subject's D2H, from CuPy's pinned

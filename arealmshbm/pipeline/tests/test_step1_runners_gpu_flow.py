@@ -41,9 +41,6 @@ from arealmshbm.pipeline.step1_runners import (
     run_generate_profiles, run_ini_params,
 )
 
-_MESH = "fsaverage6"
-_SEED = "fsaverage3"
-
 
 def _synth_gifti_bytes(N: int, T: int, seed: int) -> bytes:
     rng = np.random.default_rng(seed)
@@ -68,7 +65,7 @@ def _synth_gifti_bytes(N: int, T: int, seed: int) -> bytes:
 def _stage_project(tmp_path: Path, subjects, sessions, T=5):
     """Write a project dir with fsaverage6-sized synthetic BOLD lists."""
     from arealmshbm.data_io.load_avg_mesh import load_avg_mesh
-    V = int(load_avg_mesh("lh", _MESH, "inflated")["MARS_label"].shape[0])
+    V = int(load_avg_mesh("lh", "inflated")["MARS_label"].shape[0])
     proj = tmp_path / "proj"
     lists = proj / "data_list" / "fMRI_list"
     lists.mkdir(parents=True)
@@ -113,8 +110,8 @@ def _gpu_skip_reason() -> str:
         return "nvidia-nvcomp-cu12 not installed"
     try:
         from arealmshbm.data_io.load_avg_mesh import load_avg_mesh
-        load_avg_mesh("lh", _MESH, "inflated")
-        load_avg_mesh("rh", _MESH, "inflated")
+        load_avg_mesh("lh", "inflated")
+        load_avg_mesh("rh", "inflated")
     except Exception as e:      # noqa: BLE001 — absent, stale or corrupt
         return f"fsaverage6 avg_mesh bundles not loadable ({e})"
     return ""
@@ -129,12 +126,11 @@ def test_single_subject_in_memory_chain_matches_disk(tmp_path, monkeypatch):
     subjects, sessions = ["1"], ["1", "2"]
     proj = _stage_project(tmp_path, subjects, sessions)
 
-    acc = make_avg_accumulator(targ_mesh=_MESH, seed_mesh=_SEED,
-                               num_sess=len(sessions))
+    acc = make_avg_accumulator(num_sess=len(sessions))
     handles: list = []
     paths = run_generate_profiles(
         project_dir=proj, subjects=subjects, sessions=sessions,
-        seed_mesh=_SEED, targ_mesh=_MESH, backend="gpu", verbose=False,
+        backend="gpu", verbose=False,
         avg_accumulator=acc, write_handles=handles,
     )
     assert [p[0] for p in paths] == ["1"]
@@ -143,21 +139,21 @@ def test_single_subject_in_memory_chain_matches_disk(tmp_path, monkeypatch):
 
     avg_mem = run_avg_profiles(
         project_dir=proj, num_sub=1, num_sess=len(sessions),
-        seed_mesh=_SEED, targ_mesh=_MESH, backend="gpu", verbose=False,
+        backend="gpu", verbose=False,
         accumulator=acc,
     )
     assert avg_mem.lh_avg_dev is acc.lh and avg_mem.writer is not None
 
     # Labels: a synthetic 4-parcel partition of the cortex per hemi.
     from arealmshbm.data_io.load_avg_mesh import load_avg_mesh
-    lh_m = load_avg_mesh("lh", _MESH, "inflated")["MARS_label"]
-    rh_m = load_avg_mesh("rh", _MESH, "inflated")["MARS_label"]
+    lh_m = load_avg_mesh("lh", "inflated")["MARS_label"]
+    rh_m = load_avg_mesh("rh", "inflated")["MARS_label"]
     V = lh_m.shape[0]
     lh_labels = np.where(lh_m == 2, (np.arange(V) % 4) + 1, 0).astype(np.int64)
     rh_labels = np.where(rh_m == 2, (np.arange(V) % 4) + 1, 0).astype(np.int64)
 
     ini_mem = run_ini_params(
-        project_dir=proj, seed_mesh=_SEED, targ_mesh=_MESH,
+        project_dir=proj,
         lh_labels=lh_labels, rh_labels=rh_labels, backend="gpu",
         precomputed_lh_avg=avg_mem.lh_avg, precomputed_rh_avg=avg_mem.rh_avg,
         precomputed_lh_avg_dev=avg_mem.lh_avg_dev,
@@ -183,7 +179,7 @@ def test_single_subject_in_memory_chain_matches_disk(tmp_path, monkeypatch):
     ref_lh = np.load(avg_mem.lh_path)
     avg_disk = run_avg_profiles(
         project_dir=proj, num_sub=1, num_sess=len(sessions),
-        seed_mesh=_SEED, targ_mesh=_MESH, backend="gpu", verbose=False,
+        backend="gpu", verbose=False,
     )
     join_step1_writers(None, avg_disk, None)
     assert np.array_equal(avg_disk.lh_avg, ref_lh)
@@ -193,7 +189,7 @@ def test_single_subject_in_memory_chain_matches_disk(tmp_path, monkeypatch):
     # mtc / epsil as the device hand-off.
     m_mem = sio.loadmat(str(path))
     ini_disk = run_ini_params(
-        project_dir=proj, seed_mesh=_SEED, targ_mesh=_MESH,
+        project_dir=proj,
         lh_labels=lh_labels, rh_labels=rh_labels, backend="gpu",
         precomputed_lh_avg=avg_disk.lh_avg, precomputed_rh_avg=avg_disk.rh_avg,
     )
@@ -208,12 +204,11 @@ def test_single_subject_in_memory_chain_matches_disk(tmp_path, monkeypatch):
 def test_multi_subject_joins_per_subject(tmp_path):
     subjects, sessions = ["1", "2"], ["1"]
     proj = _stage_project(tmp_path, subjects, sessions, T=4)
-    acc = make_avg_accumulator(targ_mesh=_MESH, seed_mesh=_SEED,
-                               num_sess=len(sessions))
+    acc = make_avg_accumulator(num_sess=len(sessions))
     handles: list = []
     paths = run_generate_profiles(
         project_dir=proj, subjects=subjects, sessions=sessions,
-        seed_mesh=_SEED, targ_mesh=_MESH, backend="gpu", verbose=False,
+        backend="gpu", verbose=False,
         avg_accumulator=acc, write_handles=handles,
     )
     assert [p[0] for p in paths] == ["1", "2"]
@@ -228,13 +223,13 @@ def test_multi_subject_joins_per_subject(tmp_path):
     # disk-mediated average of the two .b2nd files it wrote.
     avg_mem = run_avg_profiles(
         project_dir=proj, num_sub=2, num_sess=1,
-        seed_mesh=_SEED, targ_mesh=_MESH, backend="gpu", verbose=False,
+        backend="gpu", verbose=False,
         accumulator=acc,
     )
     join_step1_writers(None, avg_mem, None)
     avg_disk = run_avg_profiles(
         project_dir=proj, num_sub=2, num_sess=1,
-        seed_mesh=_SEED, targ_mesh=_MESH, backend="gpu", verbose=False,
+        backend="gpu", verbose=False,
     )
     join_step1_writers(None, avg_disk, None)
     assert np.array_equal(avg_mem.lh_avg, avg_disk.lh_avg)
@@ -256,7 +251,7 @@ def test_cpu_backend_rejects_the_accumulator_handoff(tmp_path):
     with pytest.raises(ValueError, match="GPU-only"):
         run_avg_profiles(
             project_dir=tmp_path, num_sub=1, num_sess=1,
-            seed_mesh=_SEED, targ_mesh=_MESH, backend="cpu",
+            backend="cpu",
             accumulator=_FakeAccumulator(1),
         )
     lists = tmp_path / "data_list" / "fMRI_list"
@@ -266,7 +261,7 @@ def test_cpu_backend_rejects_the_accumulator_handoff(tmp_path):
     with pytest.raises(ValueError, match="GPU-only"):
         run_generate_profiles(
             project_dir=tmp_path, subjects=["1"], sessions=["1"],
-            seed_mesh=_SEED, targ_mesh=_MESH, backend="cpu",
+            backend="cpu",
             avg_accumulator=_FakeAccumulator(1),
         )
 
@@ -296,14 +291,14 @@ def test_accumulator_handoff_rejects_a_num_sess_mismatch(
                        match=r"built for num_sess=2 but num_sess=6"):
         run_avg_profiles(
             project_dir=tmp_path, num_sub=1, num_sess=6,
-            seed_mesh=_SEED, targ_mesh=_MESH, backend="gpu",
+            backend="gpu",
             accumulator=acc,
         )
     assert calls == [], "the leaf must not be reached"
 
     assert run_avg_profiles(
         project_dir=tmp_path, num_sub=7, num_sess=2,
-        seed_mesh=_SEED, targ_mesh=_MESH, backend="gpu",
+        backend="gpu",
         accumulator=acc,
     ) == "avg"
     assert len(calls) == 1 and calls[0][0][0] is acc
@@ -334,7 +329,7 @@ def test_cpu_backend_forwards_save_async(tmp_path, monkeypatch):
     monkeypatch.setattr(ini_pkg, "generate_ini_params", _fake_generate)
 
     res = run_ini_params(
-        project_dir=tmp_path, seed_mesh=_SEED, targ_mesh=_MESH,
+        project_dir=tmp_path,
         lh_labels=np.zeros(4, np.int64), rh_labels=np.zeros(4, np.int64),
         backend="cpu", save_async=True,
     )
@@ -374,7 +369,7 @@ def test_fused_gpu_path_reports_each_subject_when_verbose(
         capsys.readouterr()
         step1_runners.run_generate_profiles(
             project_dir=tmp_path, subjects=["1"], sessions=["1", "2"],
-            seed_mesh=_SEED, targ_mesh=_MESH, backend="gpu", verbose=verbose,
+            backend="gpu", verbose=verbose,
         )
         return capsys.readouterr().out
 

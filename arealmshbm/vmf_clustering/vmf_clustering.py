@@ -203,8 +203,8 @@ class VmfClusteringSession:
     Session-owned scratch and ping-pong buffers; concurrent calls on the
     same Session would race. Build one Session per worker.
 
-    Pure CPU numba kernels throughout; this is the ``backend='cpu'``
-    session.
+    CPU numba kernels plus numpy BLAS sgemms (``np.matmul``); this is
+    the ``backend='cpu'`` session.
     """
 
     def __init__(self,

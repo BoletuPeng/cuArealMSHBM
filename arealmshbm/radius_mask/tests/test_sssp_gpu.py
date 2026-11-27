@@ -4,7 +4,7 @@ What is pinned here, on a synthetic icosphere:
 
   * ``central_sulcus_distances_cupy`` reproduces the pull-based
     Bellman-Ford (:func:`bellman_ford_bounded_cupy`, the reference
-    solver this replaced) **bit for bit** at every (source, relevant
+    solver) **bit for bit** at every (source, relevant
     vertex) pair -- for a source count that is and is not a multiple of
     the 32-source block, and across bucket widths, which is the whole
     delta-stepping correctness claim: the schedule reorders
@@ -51,7 +51,7 @@ import numba
 BASELINE_MAT = Path(os.environ.get("MSHBM_STEP1_BENCH_DIR",
                                    "testdata/step1_bench"),
                     "baseline_gpu/spatial_mask/"
-                    "spatial_mask_fsaverage6.mat")
+                    "spatial_mask.mat")
 
 
 def _nbors_from_faces(faces, n):
@@ -214,10 +214,9 @@ def test_sssp_preconditions(sphere):
 
 def test_sssp_refuses_a_mesh_too_large_for_shared_memory():
     """The frontier bitmask is RING x ceil(V/32) words of STATIC shared
-    memory, so V has a hard ceiling (~90 k) well below fsaverage's
-    163842. Refuse it by name here rather than at ptxas."""
+    memory, so V has a hard ceiling (~90 k); fsaverage6's 40962 fits.
+    Refuse a larger graph by name here rather than at ptxas."""
     assert K._sssp_smem_bytes(40962, K._SSSP_CAP) <= K._SMEM_LIMIT
-    assert K._sssp_smem_bytes(10242, K._SSSP_CAP) <= K._SMEM_LIMIT
     with pytest.raises(ValueError, match="mesh too large"):
         K._sssp_module(163842, K._SSSP_CAP, K._SSSP_TPB)
 
@@ -238,7 +237,7 @@ def test_fsaverage6_masks_match_baseline(tmp_path):
         pytest.skip(f"Schaefer-300 annot not staged under {atlas}")
     try:
         from arealmshbm.data_io.load_avg_mesh import load_avg_mesh
-        load_avg_mesh("lh", "fsaverage6", "inflated")
+        load_avg_mesh("lh", "inflated")
     except FileNotFoundError as e:  # pragma: no cover - staging dependent
         pytest.skip(f"avg_mesh bundle not staged: {e}")
 
@@ -247,7 +246,7 @@ def test_fsaverage6_masks_match_baseline(tmp_path):
         return np.where(a < 0, 0, a).astype(np.int64)
 
     res = generate_radius_mask(lh_labels=lab("lh"), rh_labels=lab("rh"),
-                               mesh="fsaverage6", radius=30,
+                               radius=30,
                                out_dir=tmp_path, verbose=False, backend="gpu")
     got = sio.loadmat(res["mat_path"])
     ref = sio.loadmat(str(BASELINE_MAT))

@@ -107,7 +107,7 @@ class Step0StagePipeline:
     Usage::
 
         coord = Step0StagePipeline(
-            project_dir=..., sess_list=..., targ_mesh=...,
+            project_dir=..., sess_list=...,
             n_grad_components=..., backend="gpu",
             prefetcher=prefetcher,
             sess_paths_per_sub=...,
@@ -120,7 +120,6 @@ class Step0StagePipeline:
         self, *,
         project_dir: Path,
         sess_list: Tuple[str, ...],
-        targ_mesh: str,
         n_grad_components: int,
         backend: str,
         prefetcher: Step0BoldPrefetcher,
@@ -131,7 +130,6 @@ class Step0StagePipeline:
     ):
         self.project_dir = project_dir
         self.sess_list = sess_list
-        self.targ_mesh = targ_mesh
         self.n_grad_components = n_grad_components
         self.backend = backend
         self.is_gpu = backend == "gpu"
@@ -237,15 +235,11 @@ class Step0StagePipeline:
         ctx = stream if stream is not None else nullcontext()
         # ``asdict(self.step0_knobs)`` splats every Step0Knobs algorithm
         # field into Step0Config via the field-name 1:1 mapping pinned
-        # by test_knobs_field_match. ``enable_tf32`` is the one
-        # exception: it's consumed by the driver's tf32_scope wrapper
-        # higher up the call stack, not by Step0Config itself, so it's
-        # popped from the splat. Computed once at method entry rather
+        # by test_knobs_field_match. Computed once at method entry rather
         # than per-subject — ``self.step0_knobs`` is bound at __init__
         # time and does not vary across subjects, so this saves one
         # dataclasses.fields walk per subject (~11 primitives, modest).
         extra_knob_kwargs = asdict(self.step0_knobs)
-        extra_knob_kwargs.pop("enable_tf32")
         try:
             for sub_idx, sub in enumerate(subjects):
                 cfg = Step0Config(
@@ -253,7 +247,6 @@ class Step0StagePipeline:
                     sub_id=sub.id,
                     sess_list=self.sess_list,
                     out_subid=sub.id,
-                    mesh=self.targ_mesh,
                     num_components=self.n_grad_components,
                     backend=self.backend,
                     bold_paths_override=tuple(
@@ -355,7 +348,8 @@ class Step0StagePipeline:
                             )
                         # Free the device-resident lh_dist/rh_dist refs
                         # in b_out now that subgraph C has consumed
-                        # them and emitted host copies in c_out.
+                        # them (any host copy, gated by
+                        # save_geodesic_distance, is in c_out).
                         # Otherwise they'd live until the work item is
                         # dequeued in stage D, doubling the device
                         # footprint while stage C is mid-eigsh.

@@ -93,8 +93,7 @@ def _scale_demean_norm_inplace(x, row_scale, col_scale, mag_out):
         (1) x[i,j] /= row_scale[i] * col_scale[j]
         (2) x[i,j] -= mean(x[:,j])    (mean accumulated in fp64)
         (3) mag_out[j] = ||x[:,j]||_2 fp32 (sum in fp64)
-    Eliminates the two (M, K) outer-product temporaries (mt @ col_scale)
-    that the prior numpy code allocated per j-iter.
+    No (M, K) outer-product temporary (mt @ col_scale) is allocated.
     """
     M, K = x.shape
     for j in nb.prange(K):
@@ -237,7 +236,7 @@ def compute_FC_simi_block(
         FC_B = t @ s_series_B
         if FC_B.dtype != np.float32:
             FC_B = FC_B.astype(np.float32, copy=False)
-        # Fused: divide by mt @ mag_s_B (was a 22 MB temp), then column
+        # Fused: divide by mt @ mag_s_B (no outer-product temp), then column
         # demean + L2 — single in-place sweep over FC_B.
         mag_b = np.empty(kb, dtype=np.float32)
         _scale_demean_norm_inplace(FC_B, mt_flat, mag_s_B, mag_b)

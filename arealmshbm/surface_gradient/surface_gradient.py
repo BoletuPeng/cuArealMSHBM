@@ -19,104 +19,15 @@ from __future__ import annotations
 import numpy as np
 from numba import njit, prange
 
-# Maximum 1-ring degree on a fsaverage-class triangulation. Real meshes
-# top out at 6-8; 32 is generous headroom for stack-allocated buffers
-# and forecloses the silent-truncation footgun for anything short of
-# pathologically irregular meshes (the bump from 16 costs ~64 B/vertex
-# of stack-alloc inside the prange body — negligible).
+# Width of the 1-ring neighbor table (``nbors`` is (N_v, _MAX_DEG), -1
+# padded) and of the per-vertex stack buffers in the prange body.
+# fsaverage-class triangulations top out at degree 6-8.
 _MAX_DEG = 32
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# Mesh derivative helpers (all @njit, no Python objects)
+# Tangent-basis helper
 # ─────────────────────────────────────────────────────────────────────────
-@njit(cache=True)
-def _vertex_one_ring(faces, n_verts):
-    """Build per-vertex 1-ring neighbor lists as a (degree, idx) pair.
-
-    Returns
-    -------
-    deg    : (n_verts,) int32       — number of unique neighbors per vertex
-    nbors  : (n_verts, _MAX_DEG)    — neighbor indices, padded with -1
-    """
-    deg = np.zeros(n_verts, dtype=np.int32)
-    nbors = np.full((n_verts, _MAX_DEG), -1, dtype=np.int32)
-    n_faces = faces.shape[0]
-    for fi in range(n_faces):
-        a = faces[fi, 0]
-        b = faces[fi, 1]
-        c = faces[fi, 2]
-        # Inline 6 directed edges (a,b),(a,c),(b,a),(b,c),(c,a),(c,b).
-        for which in range(6):
-            if which == 0:
-                u = a; v = b
-            elif which == 1:
-                u = a; v = c
-            elif which == 2:
-                u = b; v = a
-            elif which == 3:
-                u = b; v = c
-            elif which == 4:
-                u = c; v = a
-            else:
-                u = c; v = b
-            d = deg[u]
-            found = False
-            for k in range(d):
-                if nbors[u, k] == v:
-                    found = True
-                    break
-            if not found and d < _MAX_DEG:
-                nbors[u, d] = v
-                deg[u] = d + 1
-    return deg, nbors
-
-
-@njit(cache=True)
-def _vertex_normals_and_areas(verts, faces):
-    """Per-vertex normal (unit) and per-vertex area (1/3 of incident face areas).
-
-    fp32 outputs; accumulation in fp64 for parity with the numpy version.
-    """
-    n_verts = verts.shape[0]
-    n_faces = faces.shape[0]
-    vn = np.zeros((n_verts, 3), dtype=np.float64)
-    va = np.zeros(n_verts, dtype=np.float64)
-    for fi in range(n_faces):
-        i0 = faces[fi, 0]
-        i1 = faces[fi, 1]
-        i2 = faces[fi, 2]
-        ax = verts[i1, 0] - verts[i0, 0]
-        ay = verts[i1, 1] - verts[i0, 1]
-        az = verts[i1, 2] - verts[i0, 2]
-        bx = verts[i2, 0] - verts[i0, 0]
-        by = verts[i2, 1] - verts[i0, 1]
-        bz = verts[i2, 2] - verts[i0, 2]
-        # Face normal (un-normalized) = a x b ; magnitude == 2 * area.
-        nx = ay * bz - az * by
-        ny = az * bx - ax * bz
-        nz = ax * by - ay * bx
-        face_area = 0.5 * np.sqrt(nx * nx + ny * ny + nz * nz)
-        vn[i0, 0] += nx; vn[i0, 1] += ny; vn[i0, 2] += nz; va[i0] += face_area
-        vn[i1, 0] += nx; vn[i1, 1] += ny; vn[i1, 2] += nz; va[i1] += face_area
-        vn[i2, 0] += nx; vn[i2, 1] += ny; vn[i2, 2] += nz; va[i2] += face_area
-    third = 1.0 / 3.0
-    vn_out = np.zeros((n_verts, 3), dtype=np.float32)
-    va_out = np.empty(n_verts, dtype=np.float32)
-    for i in range(n_verts):
-        nx = vn[i, 0]
-        ny = vn[i, 1]
-        nz = vn[i, 2]
-        nm = np.sqrt(nx * nx + ny * ny + nz * nz)
-        if nm > 0.0:
-            inv = 1.0 / nm
-            vn_out[i, 0] = np.float32(nx * inv)
-            vn_out[i, 1] = np.float32(ny * inv)
-            vn_out[i, 2] = np.float32(nz * inv)
-        va_out[i] = np.float32(va[i] * third)
-    return vn_out, va_out
-
-
 @njit(cache=True, inline='always')
 def _seed_xhat_yhat(nx, ny, nz):
     """Workbench convention for picking a tangent basis given a normal.
@@ -148,38 +59,18 @@ def _seed_xhat_yhat(nx, ny, nz):
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# Mesh-only precomputation (deterministic in (verts, faces)). Cached in
-# Step0Inputs by the pipeline at load_inputs time, then reused across
-# every (session × block-a) call to cifti_gradient — saves ~30 ms × ~24
-# calls per subject on the midthickness mesh.
-# ─────────────────────────────────────────────────────────────────────────
-def prepare_gradient_mesh(verts: np.ndarray, faces: np.ndarray):
-    """Build the per-hemi mesh-only inputs ``_hemi_gradient`` consumes.
-
-    Returns a 4-tuple ``(deg, nbors, vn, va)``:
-        deg   : (N_v,)            int32   — 1-ring degree
-        nbors : (N_v, _MAX_DEG)   int32   — 1-ring neighbor indices, -1 padded
-        vn    : (N_v, 3)          fp32    — unit vertex normals
-        va    : (N_v,)            fp32    — 1/3 of incident-face area sum
-    """
-    v = np.ascontiguousarray(verts, dtype=np.float32)
-    f = np.ascontiguousarray(faces, dtype=np.int32)
-    deg, nbors = _vertex_one_ring(f, v.shape[0])
-    vn, va = _vertex_normals_and_areas(v, f)
-    return deg, nbors, vn, va
-
-
-# ─────────────────────────────────────────────────────────────────────────
 # Per-hemisphere gradient magnitude — parallel over vertices
 # ─────────────────────────────────────────────────────────────────────────
 @njit(cache=True, parallel=True)
 def _hemi_gradient(deg, nbors, vn, va, verts, data, roi, out):
     """Fill ``out[v, k]`` with gradient magnitude. Medial rows stay zero.
 
-    The four ``deg / nbors / vn / va`` inputs come from
-    :func:`prepare_gradient_mesh` — deterministic in ``(verts, faces)``,
-    so the pipeline caches them on Step0Inputs and reuses across every
-    block-a call.
+    The four mesh tables ship in the step-0 inputs bundle
+    (``Step0Inputs.{lh,rh}_grad_prep``):
+        deg   : (N_v,)            int32   — 1-ring degree
+        nbors : (N_v, _MAX_DEG)   int32   — 1-ring neighbor indices, -1 padded
+        vn    : (N_v, 3)          fp32    — unit vertex normals
+        va    : (N_v,)            fp32    — 1/3 of incident-face area sum
     """
     n_verts = verts.shape[0]
     K = data.shape[1]
@@ -300,7 +191,7 @@ def _hemi_gradient(deg, nbors, vn, va, verts, data, roi, out):
                     ok = True
             if not ok:
                 # Workbench fallback: weighted finite-difference average.
-                # Matches the original numpy: tempf2 = tempf / (unrollMag * mag2d);
+                # tempf2 = tempf / (unrollMag * mag2d);
                 # sol_a = sum(xmag_scaled * tempf2 * w) / sum(w).
                 tot = 0.0
                 acc_a = 0.0
@@ -339,9 +230,9 @@ def cifti_gradient(data,
     """Drop-in replacement for ``wb_command -cifti-gradient`` on the
     surface portion of a CIFTI dtseries (no subcortical voxels).
 
-    Mesh-only inputs (``{lh,rh}_{deg,nbors,vn,va}``) come from
-    :func:`prepare_gradient_mesh` and are cached on Step0Inputs once
-    per pipeline; the per-call hot path stays purely data-bound.
+    Mesh-only inputs (``{lh,rh}_{deg,nbors,vn,va}``) are the
+    ``Step0Inputs.{lh,rh}_grad_prep`` tables; the per-call hot path
+    stays purely data-bound.
 
     Returns
     -------

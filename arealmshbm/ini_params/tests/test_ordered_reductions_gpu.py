@@ -1,5 +1,5 @@
 """test_ordered_reductions_gpu.py — bit-exactness gate for the ordered
-fp64 device reductions that replaced the two dgemms in ini_params.
+fp64 device reductions of GPU ini_params.
 
 The whole point of these kernels is that they reproduce a *specific*
 fp64 summation order, so the tests compare with ``np.array_equal``,

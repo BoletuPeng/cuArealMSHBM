@@ -33,10 +33,22 @@ from ._kernels import (
 )
 
 
+def _stack_fp64(lh_avg: np.ndarray, rh_avg: np.ndarray) -> np.ndarray:
+    """``(V_lh, D)`` over ``(V_rh, D)`` as one fp64 ``(N, D)`` matrix.
+
+    The average is fp32 on both backends; the widen is exact.
+    """
+    n_lh = lh_avg.shape[0]
+    out = np.empty((n_lh + rh_avg.shape[0], lh_avg.shape[1]),
+                   dtype=np.float64)
+    out[:n_lh] = lh_avg
+    out[n_lh:] = rh_avg
+    return out
+
+
 def _concat_precomputed_avg(lh_avg: np.ndarray, rh_avg: np.ndarray,
-                             n_lh: int, n_rh: int,
-                             profile_dtype: np.dtype) -> np.ndarray:
-    """vstack the in-memory ``(V_h, D)`` arrays + dtype-cast.
+                             n_lh: int, n_rh: int) -> np.ndarray:
+    """Stack the in-memory ``(V_h, D)`` arrays into ``(N, D)`` fp64.
 
     Validates shapes against the label-derived vertex counts so a
     mis-aligned hand-off fails early (before any reduction kernel).
@@ -58,22 +70,19 @@ def _concat_precomputed_avg(lh_avg: np.ndarray, rh_avg: np.ndarray,
         raise ValueError(
             f"precomputed lh/rh D mismatch: {lh_avg.shape[1]} vs {rh_avg.shape[1]}"
         )
-    profile = np.vstack([lh_avg, rh_avg])
-    if profile_dtype != profile.dtype:
-        profile = profile.astype(profile_dtype, copy=False)
-    return profile
+    return _stack_fp64(lh_avg, rh_avg)
 
 
-def _read_profile_concat(out_dir: str, targ_mesh: str, seed_mesh: str,
-                          profile_dtype: np.dtype) -> np.ndarray:
-    """Read lh+rh avg-profile .npy files in parallel and concat → (V, D).
+def _read_profile_concat(out_dir: str) -> np.ndarray:
+    """Read lh+rh avg-profile .npy files in parallel and concat → (N, D)
+    fp64.
 
     The .npy is already ``(V_h, D)`` fp32 C-contig as written by
     :mod:`avg_profiles` — concatenated directly along the V axis.
     """
     base = os.path.join(out_dir, "profiles", "avg_profile")
-    lh_path = os.path.join(base, f"lh_{targ_mesh}_roi{seed_mesh}_avg_profile.npy")
-    rh_path = os.path.join(base, f"rh_{targ_mesh}_roi{seed_mesh}_avg_profile.npy")
+    lh_path = os.path.join(base, "lh_avg_profile.npy")
+    rh_path = os.path.join(base, "rh_avg_profile.npy")
     if not (os.path.exists(lh_path) and os.path.exists(rh_path)):
         raise FileNotFoundError(
             f"avg profile not found: {lh_path} / {rh_path}"
@@ -84,21 +93,20 @@ def _read_profile_concat(out_dir: str, targ_mesh: str, seed_mesh: str,
         f_rh = pool.submit(np.load, rh_path, allow_pickle=False)
         lh_vol = f_lh.result()
         rh_vol = f_rh.result()
-    profile = np.vstack([lh_vol, rh_vol])
-    if profile_dtype != np.float32:
-        profile = profile.astype(profile_dtype, copy=False)
-    return profile
-
-
-def _load_medial_mask(targ_mesh: str) -> np.ndarray:
-    """Concatenated lh+rh medial-wall mask (1=MW)."""
-    if "fsaverage" not in targ_mesh:
+    if (lh_vol.ndim != 2 or rh_vol.ndim != 2
+            or lh_vol.shape[1] != rh_vol.shape[1]):
         raise ValueError(
-            f"ini_params: only fsaverage* targ_mesh supported, got {targ_mesh!r}."
+            f"avg profile lh/rh must both be (V_h, D) with one D; got "
+            f"{lh_vol.shape} ({lh_path}) and {rh_vol.shape} ({rh_path})"
         )
+    return _stack_fp64(lh_vol, rh_vol)
+
+
+def _load_medial_mask() -> np.ndarray:
+    """Concatenated lh+rh medial-wall mask (1=MW)."""
     from arealmshbm.data_io.load_avg_mesh import load_avg_mesh
-    lh = load_avg_mesh("lh", targ_mesh, "inflated")
-    rh = load_avg_mesh("rh", targ_mesh, "inflated")
+    lh = load_avg_mesh("lh", "inflated")
+    rh = load_avg_mesh("rh", "inflated")
     return np.concatenate(
         [lh["MARS_label"] == 1, rh["MARS_label"] == 1]
     ).astype(bool)
@@ -120,14 +128,10 @@ def _renumber_labels(labels: np.ndarray) -> np.ndarray:
 
 
 def generate_ini_params(
-    seed_mesh: str,
-    targ_mesh: str,
     lh_labels: np.ndarray,
     rh_labels: np.ndarray,
     out_dir: str,
     *,
-    profile_dtype: np.dtype = np.float64,
-    reduction_dtype: np.dtype = np.float64,
     save: bool = True,
     backend: str = "cpu",
     precomputed_lh_avg: Optional[np.ndarray] = None,
@@ -140,17 +144,13 @@ def generate_ini_params(
 
     Parameters
     ----------
-    seed_mesh, targ_mesh : str
-        e.g. ``'fsaverage3'`` and ``'fsaverage6'``.
     lh_labels, rh_labels : (V_h,) int — group parcellation labels in
         [0, L_h], 0 = medial wall.
     out_dir : str — project root containing ``profiles/avg_profile/...``.
         Output written to ``<out_dir>/group/group.mat`` when ``save=True``.
-    profile_dtype : on-load precision for the avg profile.
-    reduction_dtype : precision for demean / normalize / matmul / sum.
     save : whether to write ``group.mat``.
-    precomputed_lh_avg, precomputed_rh_avg : in-memory (V_h, D) fp32 (or
-        ``profile_dtype``) arrays — when both are set, ini_params skips
+    precomputed_lh_avg, precomputed_rh_avg : in-memory (V_h, D) fp32
+        arrays — when both are set, ini_params skips
         the .npy disk read under ``out_dir/profiles/avg_profile/`` and
         uses the arrays directly. The unified pipeline driver passes
         the just-computed ``AvgProfilesResult.lh_avg`` / ``rh_avg``
@@ -169,13 +169,14 @@ def generate_ini_params(
     :class:`IniParamsResult` — a ``dict`` with keys ``mtc``, ``epsil``,
     ``lambda``, ``lh_labels``, ``rh_labels``, carrying the (optional)
     background-write handle on ``.writer``.
+
+    The reduction (demean / normalize / group sum / ε) runs in fp64 on
+    both backends.
     """
     if backend == "gpu":
         from .ini_params_gpu import generate_ini_params_gpu
         return generate_ini_params_gpu(
-            seed_mesh=seed_mesh, targ_mesh=targ_mesh,
             lh_labels=lh_labels, rh_labels=rh_labels, out_dir=out_dir,
-            profile_dtype=profile_dtype, reduction_dtype=reduction_dtype,
             save=save,
             precomputed_lh_avg=precomputed_lh_avg,
             precomputed_rh_avg=precomputed_rh_avg,
@@ -196,7 +197,7 @@ def generate_ini_params(
     n_lh = lh_labels.size
     n_rh = rh_labels.size
 
-    medial_mask = _load_medial_mask(targ_mesh)
+    medial_mask = _load_medial_mask()
     if medial_mask.shape[0] != n_lh + n_rh:
         raise ValueError(
             f"medial_mask size ({medial_mask.shape[0]}) != lh+rh labels "
@@ -210,10 +211,10 @@ def generate_ini_params(
 
     if precomputed_lh_avg is not None and precomputed_rh_avg is not None:
         profile_mat = _concat_precomputed_avg(
-            precomputed_lh_avg, precomputed_rh_avg, n_lh, n_rh, profile_dtype,
+            precomputed_lh_avg, precomputed_rh_avg, n_lh, n_rh,
         )
     elif precomputed_lh_avg is None and precomputed_rh_avg is None:
-        profile_mat = _read_profile_concat(out_dir, targ_mesh, seed_mesh, profile_dtype)
+        profile_mat = _read_profile_concat(out_dir)
     else:
         raise ValueError(
             "generate_ini_params: must pass BOTH precomputed_lh_avg and "
@@ -225,7 +226,6 @@ def generate_ini_params(
         raise ValueError(
             f"profile_mat first axis ({n_total}) != lh+rh ({n_lh + n_rh})"
         )
-    profile_mat = profile_mat.astype(reduction_dtype, copy=False)
 
     keep_mask = np.empty(profile_mat.shape[0], dtype=np.bool_)
     _zero_mw_and_detect_nonzero_kernel(profile_mat, medial_mask, keep_mask)
@@ -247,7 +247,7 @@ def generate_ini_params(
     if L == 0:
         raise RuntimeError("ini_params: no non-zero labels — empty parcellation")
 
-    mtc = np.empty((d_orig, L), dtype=reduction_dtype)
+    mtc = np.empty((d_orig, L), dtype=np.float64)
     _groupsum_kernel(profile_mat, labels, L, mtc)
     col_norm = np.sqrt((mtc * mtc).sum(axis=0, keepdims=True))
     col_norm = np.where(col_norm == 0, 1.0, col_norm)
@@ -266,7 +266,7 @@ def generate_ini_params(
     lam[np.flatnonzero(has_label), keep_labels[has_label] - 1] = 1
 
     out = IniParamsResult({
-        "mtc": mtc.astype(np.float64, copy=False),
+        "mtc": mtc,
         "epsil": np.array([[epsil]], dtype=np.float64),
         "lambda": lam,
         "lh_labels": lh_labels.reshape(-1, 1),

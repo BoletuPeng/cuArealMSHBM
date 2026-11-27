@@ -59,7 +59,7 @@ def _config(backend: str, variant: str):
     from arealmshbm.step3_pipeline import Step3Config
     return Step3Config(
         project_dir=SUB001_DIR, num_session=6, num_clusters=300, subid=1,
-        mesh="fsaverage6", w=50.0, c=10.0, beta_scalar=5.0, backend=backend,
+        w=50.0, c=10.0, beta_scalar=5.0, backend=backend,
         pipeline_type=variant,
     )
 

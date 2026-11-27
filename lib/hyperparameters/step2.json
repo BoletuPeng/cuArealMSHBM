@@ -15,7 +15,7 @@
       "default": "cpu",
       "source": "arealmshbm/pipeline/config.py (PipelineConfig.backend_step2)",
       "description": "step2 backend. 'cpu' is the numba master kernel, the numerical reference. 'gpu' is the P-layout / bit-packed CuPy backend (Step2SparseSession): BOLD stays bit-packed on device, EM state is carried on the P = nnz(boundary_mask) support instead of the dense (N, L) grid, and the outer-EM closure leaves (L16/L17/L18) run on-device too.",
-      "notes": "'gpu' contract: docs/step2_sparse_design.md; ~130x faster than 'cpu' at S=10 (4.1 s vs 538 s) and run-to-run deterministic. It requires a seed mesh with ceil(D/8) <= 256, i.e. seed_mesh 'fsaverage3' in bold_inputs.json, num_clusters <= 512 (init_soft's per-lane accumulator ceiling) and n_grad_components <= 11772 (connect_u's shared memory); any other configuration is rejected at config / driver validation, so select backend_step2='cpu' for it. Its VRAM is bounded by the per-subject gradient and the (S, T, L, D) fp32 s_t_nu / X_dot_sl pair plus the packed BOLD cache (which streams when it does not fit), not by a dense (S, N, L) s_lambda. Params_Final.mat is unchanged on every backend: dense fp64 theta, compressed."
+      "notes": "Mode B only: the key follows the step2 block, so a Mode A config that carries it is rejected. 'gpu' contract: docs/step2_sparse_design.md; ~130x faster than 'cpu' at S=10 (4.1 s vs 538 s) and run-to-run deterministic. It requires num_clusters <= 512 (init_soft's per-lane accumulator ceiling) and n_grad_components <= 11772 (connect_u's shared memory); any other configuration is rejected at config validation, so select backend_step2='cpu' for it. Its VRAM is bounded by the (S, N, D_grad) gradient and the (S, T, L, D) fp32 s_t_nu / X_dot_sl pair plus the packed BOLD cache (which streams when it does not fit), not by a dense (S, N, L) s_lambda. Params_Final.mat is unchanged on every backend: dense fp64 theta, compressed."
     },
     {
       "key": "step2.max_iter_inter",
@@ -109,7 +109,7 @@
       "default": "auto",
       "source": "arealmshbm/step2_pipeline/config.py (Step2Config.bold_cache_mode)",
       "description": "How the per-subject BOLD is held (device cache on the gpu backend, host cache on cpu).",
-      "notes": "auto picks eager_bitpacked when the (S, T, N, ⌈D/8⌉) uint8 packed cache (1 bit/cell, ~72 MB per subject at T=6/fsa6) plus the resident device state fits in free device memory minus gpu_cache_safety_margin_gb, else stream (Step2SparseSession._resolve_cache_mode; 'stream' costs 2 host->device visits per subject per EM iteration). On backend_step2='cpu' the same knob picks the loader's host-side bit-packed cache ('auto' / 'eager_bitpacked') or per-call disk decode ('stream')."
+      "notes": "auto picks eager_bitpacked when the (S, T, N, ⌈D/8⌉) uint8 packed cache (1 bit/cell, ~72 MB per subject at T=6/fsa6) plus the resident device state fits in free device memory minus gpu_cache_safety_margin_gb, else stream with a RuntimeWarning (Step2SparseSession._resolve_cache_mode; 'stream' costs 2 host->device visits per subject per EM iteration). An explicit eager_bitpacked raises when the cache does not fit; every mode raises when the resident state alone does not fit. On backend_step2='cpu' the same knob picks the loader's host-side bit-packed cache ('auto' / 'eager_bitpacked') or per-call disk decode ('stream')."
     },
     {
       "key": "step2.gpu_cache_safety_margin_gb",
@@ -120,7 +120,7 @@
       "default": 4.0,
       "source": "arealmshbm/step2_pipeline/config.py (Step2Config.gpu_cache_safety_margin_gb)",
       "conditional": "backend_step2 == 'gpu'",
-      "description": "Headroom added to the GPU sizing rule in every bold_cache_mode: the resident device state plus this margin must fit in free device memory or the session raises, and the packed BOLD cache is kept on device only if it fits as well ('auto' otherwise picks stream; an explicit 'eager_bitpacked' raises)."
+      "description": "Headroom added to the GPU sizing rule: 'auto' uses it to decide whether the packed BOLD cache fits, 'eager_bitpacked' to decide whether to raise, and every mode to check that the resident state fits. Unused on backend_step2='cpu'."
     },
     {
       "key": "step2.verbose",

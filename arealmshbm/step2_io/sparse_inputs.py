@@ -49,7 +49,7 @@ class Step2SparseInputs:
     ----------
     layout      : static P-layout (``P = nnz(boundary_mask)``).
     S, T, N, D, D_grad, n_lh, n_rh : dims. ``D`` is the profile length
-                  (``mtc.shape[0]``, 1175 at fsaverage3 seeds); ``dim = D - 1``
+                  (``mtc.shape[0]``, 1175); ``dim = D - 1``
                   is the vMF dimension fed to ``Cdln`` / ``invAd``.
     mtc         : (D, L) fp64 — ``group.mat['mtc']`` verbatim.
     bold_reader : fills ``(T, N, Db)`` uint8 for subject ``s_1`` — the on-disk
@@ -111,12 +111,12 @@ class Step2SparseInputs:
 # overlap on a 4-worker pool: the inflate releases the GIL.
 
 
-def _mars_masks(mesh: str) -> Tuple[np.ndarray, np.ndarray]:
+def _mars_masks() -> Tuple[np.ndarray, np.ndarray]:
     """``(lh_mars, rh_mars)`` bool arrays — True at medial-wall vertices."""
     from arealmshbm.data_io.load_avg_mesh import load_avg_mesh
 
-    lh_inf = load_avg_mesh("lh", mesh, "inflated")
-    rh_inf = load_avg_mesh("rh", mesh, "inflated")
+    lh_inf = load_avg_mesh("lh", "inflated")
+    rh_inf = load_avg_mesh("rh", "inflated")
     lh = np.asarray(lh_inf["MARS_label"]).ravel() == 1
     rh = np.asarray(rh_inf["MARS_label"]).ravel() == 1
     return lh, rh
@@ -179,7 +179,7 @@ def load_step2_sparse_inputs(cfg: Any, *,
 
     Reads ``cohort.json``, subject 1's bit-packed ``.b2nd`` header and
     one chunk of it, subject 1's gradient dims (gMSHBM),
-    ``group/group.mat`` and ``spatial_mask/spatial_mask_<mesh>.mat``,
+    ``group/group.mat`` and ``spatial_mask/spatial_mask.mat``,
     and returns the :class:`Step2SparseInputs` the sparse Session
     consumes, whose ``bold_reader`` / ``grad_reader`` read each subject
     when the Session pulls it. See ``docs/step2_sparse_design.md`` §5.
@@ -188,8 +188,7 @@ def load_step2_sparse_inputs(cfg: Any, *,
     ----------
     cfg : :class:`~arealmshbm.step2_pipeline.config.Step2Config` (or any
         object carrying ``project_dir``, ``num_sub``, ``num_session``,
-        ``num_clusters``, ``mode``, ``mesh``, ``seed_mesh``,
-        ``n_grad_components``).
+        ``num_clusters``, ``mode``, ``n_grad_components``).
     overlap : run the four disk reads on a 4-worker pool. ``False``
         serialises them, which is what the per-item timings mean when
         you want to attribute cost.
@@ -212,7 +211,7 @@ def load_step2_sparse_inputs(cfg: Any, *,
     L_cfg = int(cfg.num_clusters)
     mode = str(cfg.mode)
 
-    # ── cohort.json — the sole discovery mechanism ──
+    # ── cohort.json — roster + per-subject artifact paths ──
     t0 = time.perf_counter()
     cohort = read_cohort(project_dir)
     if cohort.num_sub != S:
@@ -223,14 +222,6 @@ def load_step2_sparse_inputs(cfg: Any, *,
         raise ValueError(
             f"load_step2_sparse_inputs: cfg.num_session={T} != "
             f"cohort.json num_session={cohort.num_session}")
-    if cohort.mesh.get("targ") != cfg.mesh:
-        raise ValueError(
-            f"load_step2_sparse_inputs: cfg.mesh={cfg.mesh!r} != "
-            f"cohort.json mesh.targ={cohort.mesh.get('targ')!r}")
-    if cohort.mesh.get("seed") != cfg.seed_mesh:
-        raise ValueError(
-            f"load_step2_sparse_inputs: cfg.seed_mesh={cfg.seed_mesh!r} != "
-            f"cohort.json mesh.seed={cohort.mesh.get('seed')!r}")
 
     grad_loader: Optional[SubjectGradientLoader] = None
     if mode == "gMSHBM":
@@ -255,7 +246,7 @@ def load_step2_sparse_inputs(cfg: Any, *,
 
     # ── mesh (MARS labels) — lru_cached .npz, effectively free warm ──
     t0 = time.perf_counter()
-    lh_mars, rh_mars = _mars_masks(str(cfg.mesh))
+    lh_mars, rh_mars = _mars_masks()
     n_lh, n_rh = int(lh_mars.size), int(rh_mars.size)
     N = n_lh + n_rh
     timings["mesh"] = time.perf_counter() - t0
@@ -310,8 +301,7 @@ def load_step2_sparse_inputs(cfg: Any, *,
     def _task_group() -> None:
         from arealmshbm.data_io import mat5_stream
         t = time.perf_counter()
-        gp = (resolve_path(project_dir, cohort.group_mat)
-              if cohort.group_mat else project_dir / "group" / "group.mat")
+        gp = project_dir / "group" / "group.mat"
         if not gp.exists():
             raise FileNotFoundError(f"group.mat not found: {gp}")
         # The same four-key contract ``load_group_mtc`` enforces; only
@@ -341,10 +331,7 @@ def load_step2_sparse_inputs(cfg: Any, *,
         # wanted, mat5_stream must return it, not stash it.
         from arealmshbm.data_io import mat5_stream
         t = time.perf_counter()
-        mp = (resolve_path(project_dir, cohort.spatial_mask_mat)
-              if cohort.spatial_mask_mat
-              else project_dir / "spatial_mask" /
-              f"spatial_mask_{cfg.mesh}.mat")
+        mp = project_dir / "spatial_mask" / "spatial_mask.mat"
         if not mp.exists():
             raise FileNotFoundError(f"spatial mask not found: {mp}")
         lh_b = mat5_stream.read_sparse(mp, "lh_boundary")

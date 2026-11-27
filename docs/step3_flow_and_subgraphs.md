@@ -15,7 +15,7 @@ Step3Pipeline.run(cfg)                                         [arealmshbm/step3
 ├── load_inputs()
 │   │   (cpu below; gpu → load_step3_sparse_inputs in step3_pipeline/sparse_inputs — see § gpu)
 │   ├── load_group_prior(Params_Final.mat)                     data_io/load_group_prior
-│   ├── load_spatial_mask(spatial_mask_<mesh>.mat)             data_io/load_spatial_mask
+│   ├── load_spatial_mask(spatial_mask.mat)                    data_io/load_spatial_mask
 │   ├── load_avg_mesh(lh/rh, inflated)                         data_io/load_avg_mesh
 │   ├── load_avg_mesh(lh/rh, sphere)                           data_io/load_avg_mesh
 │   ├── fetch_data(profiles + gradient)                        data_io/fetch_data
@@ -36,31 +36,33 @@ Step3Pipeline.run(cfg)                                         [arealmshbm/step3
 │   └── convergence test                                       inline (small)
 │
 ├── derive_labels(s_lambda)                                    data_io/save_parcellation
+├── cMSHBM: remove_isolated_surface_components (host, both backends)  postprocessing
 └── save_parcellation(...)                                     data_io/save_parcellation
 
 
-VmfClusteringSession.run(Params, ...)
+VmfClusteringSession.run(Params, ...)                          (cpu; numpy BLAS for the matmuls)
 └── outer EM-iter loop (~3-5 per intra_em iter)
     │
     ├── M-step (~3 inner iters)                                m_step/MStepSession
-    │   ├── batched X·s_t_nu sgemm                             inside m_step (numpy/cupy BLAS)
+    │   ├── per-t Xᵀ·s_lambda sgemm (once per call)            inside m_step (np.matmul)
     │   ├── invAd(D, kappa_mean_resultant)                     m_step/_invad
-    │   └── per-(t) X·s_lambda + sigma·s_psi normalize         inside m_step
+    │   └── per-(t) κ·Xᵀ·s_lambda + sigma·s_psi normalize      m_step/_kernels
     │
     ├── ELambdaSession.prepare_em_iter(s_t_nu, kappa)          vmf_clustering/e_step_lambda
-    │   (caches X @ s_t_nu sgemm + Cdln per em_iter)
+    │   (caches X @ s_t_nu sgemm + Cdln(kappa, dim) per em_iter;
+    │    Cdln from em_stop_criterion/_cdln)
     │
-    ├── spatial_connect_prior                                  spatial_priors/ConnectSession
+    ├── spatial_connect_prior (gMSHBM) / spatial_xyz_prior (cMSHBM)  spatial_priors
     │
     ├── comp_iter loop (~10 per outer iter)
     │   ├── E-step λ-loop                                      vmf_clustering/e_step_lambda
     │   │   ├── data term + V_lambda assembly                  inside e_step_lambda
     │   │   ├── V_lambda close-form                            V_lambda/Session
-    │   │   ├── Cdln(kappa, dim)                               em_stop_criterion/_cdln
     │   │   ├── log_vmf assemble + softmax + boundary mask     inside e_step_lambda
     │   │   └── λ-loop convergence test                        inside e_step_lambda
     │   ├── check_connectedness                                check_connectedness
-    │   │   ├── compute_components_general (BFS)               check_connectedness/_kernels
+    │   │   ├── cMSHBM: remove_isolated pre-predicate          postprocessing
+    │   │   ├── compute_components_general (union-find)        check_connectedness/_kernels
     │   │   └── component_distance                             check_connectedness/component_distance
     │   └── spatial_xyz_prior                                  spatial_priors/XyzSession
     │
@@ -89,8 +91,8 @@ arealmshbm/
 │   ├── fetch_data.py                       BOLD profile + diffusion gradient (cpu)
 │   ├── mat5_stream.py                      streaming MAT v7 reader (gpu loader)
 │   ├── load_group_prior.py                 Params_Final.mat
-│   ├── load_spatial_mask.py                spatial_mask_<mesh>.mat
-│   ├── load_avg_mesh.py                    fsaverage* mesh (inflated/sphere)
+│   ├── load_spatial_mask.py                spatial_mask.mat
+│   ├── load_avg_mesh.py                    fsaverage6 mesh (inflated/sphere)
 │   └── save_parcellation.py                argmax + Ind_parcellation_*.mat
 │
 ├── initialize_concentration/               vMF kappa init (Debye expansion)
@@ -106,7 +108,7 @@ arealmshbm/
 │   └── v_lambda.py                         V_lambda Session
 │
 ├── check_connectedness/                    # connectedness BFS + distance
-│   ├── _kernels.py                         numba BFS + cdist
+│   ├── _kernels.py                         numba union-find + component distance
 │   ├── component_distance.py               public functions
 │   └── connectedness_gpu.py                ConnectednessGPU (gpu)
 │
@@ -184,11 +186,8 @@ the YS-2 outlier is an `intra_em` convergence-ratio flip at the 1e-4
 threshold (2.5e-4 vs 5.2e-5 → one extra outer round). Run-to-run
 bit-reproducible (no float atomics). All three variants (cMSHBM's
 `remove_isolated` pre-predicate runs on device inside
-`ConnectednessGPU.step`). `gpu` needs D ≤ 2048 (`ceil(D/8) ≤ 256`); the
-driver accepts only seed_mesh fsaverage3 and rejects any other seed mesh
-by name — select `backend_step3='cpu'` for it — and the per-step API
-rejects D > 2048 when it reads the packed BOLD. Every backend requires
-w > 0 (`w·log θ` is NaN outside supp(θ) at w = 0).
+`ConnectednessGPU.step`). Every backend requires w > 0 (`w·log θ` is
+NaN outside supp(θ) at w = 0).
 
 ## Wall
 
@@ -233,9 +232,12 @@ body wall is the meaningful comparison.
 | **EM total**          | **20.47** | **1.90** | **10.8×** |
 
 `e_step_lambda_loop` is the dominant EM stage on CPU (~half the EM
-wall) and benefits ~9× on GPU via the fused E-step kernel + cuBLAS
-sgemm on `X @ s_t_nu`. `m_step` wins 13× from cuBLAS + RawKernel-based
-M-step inner-loop. `em_stop_criterion`'s 51× isolated speedup is real
+wall: numba kernels + a numpy sgemm on `X @ s_t_nu`). The GPU column
+is the dense CuPy EM measured on that date, whose E-step used a fused
+kernel + cuBLAS sgemm and whose M-step used cuBLAS + RawKernels; the
+`gpu` backend (§ `gpu`) has no BLAS call — `X @ s_t_nu` (`acc_bits`)
+and `Xᵀ·s_lambda` (`x_dot_sl_bits`) are bit-sum RawKernels over the
+packed profiles. `em_stop_criterion`'s 51× isolated speedup is real
 (fp64 cost-reduction sums + Cdln vectorise well on GPU) but it runs
 only once per EM iter, so its share of total is small.
 
@@ -275,8 +277,9 @@ instead of the sum. Reference-cohort subjects 1–3 on `gpu` (2026-09-03): the
 (§ `gpu`). On the dense GPU EM (2026-05, 3-subject Mode A smoke,
 gMSHBM) it delivered 2.86 s/sub against a 3.33 s/sub serial baseline.
 
-Memory budget: queues are capped at 2 in-flight, so ~3 subjects can
-be on GPU at once. CPU backend and `K=1` runs stay on
+Memory budget: queues are capped at 2 in-flight; the structural bound
+is 7 subjects holding device buffers (1 LOAD + 2 queued + 1 EM + 2
+queued + 1 SAVE), ~3 in healthy steady state. CPU backend and `K=1` runs stay on
 the serial loop (no overlap to amortise). See
 [`arealmshbm/pipeline/_step3_stage_pipeline.py`](../arealmshbm/pipeline/_step3_stage_pipeline.py).
 

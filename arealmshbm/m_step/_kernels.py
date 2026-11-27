@@ -17,8 +17,7 @@ Non-numba pieces of the M-step:
       ``s_lambda``, ``s_psi`` run on every ``run()`` (~7 ms total on
       sub-001).
 
-Cores belong to the outer subject-level multiprocessing harness; no
-``parallel=True`` / ``prange`` here.
+Serial kernels: no ``parallel=True`` / ``prange`` here.
 
 Buffer reference (Mode A, sub-001, fsaverage6, 6 sessions, 300 ROIs):
     N = 81924  D = 1175  L = 300  T = 6.
@@ -48,12 +47,10 @@ Kernel-by-kernel I/O contract:
 | fused_lambda_X_normalize_TDL_f32 | kappa_f32,                   | s_t_nu_new      | None           |
 |                                  |   X_dot_sl (T,D,L) fp32,     |   (T,D,L) fp32, |                |
 |                                  |   sigma_psi (D,L) fp32,      |   cos (T,L)     |                |
-|                                  |   s_t_nu_old (T,D,L) fp32    |   fp32          |                |
-| convergence_flag_accumulate_T    | cos (T,L) fp32, eps_f32      | flag_acc (T,)   | None           |
+|                                  |   s_t_nu_old (T,D,L) fp32,   |   fp32,         |                |
+|                                  |   eps_f32                    |   flag_acc (T,) |                |
 |                                  |                              |   i8 (OR-acc;   |                |
 |                                  |                              |   caller zeros) |                |
-| kappa_drift_mean_f64             | kappa_old (L,) fp64,         | -               | scalar fp64    |
-|                                  |   kappa_new (L,) fp64        |                 |                |
 +----------------------------------+------------------------------+-----------------+----------------+
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>

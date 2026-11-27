@@ -8,9 +8,9 @@ GPU prewarm
 -----------
 The ``gpu`` backend compiles one ``cupy.RawModule``
 (``step2_em_iter_master/_kernels_gpu.py``) holding every step-2
-kernel. That NVRTC compile is process-global and one-shot, and until
-this module existed nothing paid it off the timed path — the first
-``run_iter`` of a fresh process paid it inside ``em_total``.
+kernel. That NVRTC compile is process-global and one-shot; left
+unpaid, the first ``run_iter`` of a fresh process pays it inside
+``em_total``.
 
 :func:`prewarm_step2_gpu` pays it on a daemon thread while step 0 runs
 (seconds of cover on any real cohort). It compiles the module and runs

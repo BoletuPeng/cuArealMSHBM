@@ -22,10 +22,10 @@ per element:
       ``ss`` from the fp32-stored value. The ≤1-ULP difference between
       the two stored values is the source of the drift.
     * L2 sum-of-squares is fp64 → fp32 sqrt on both — same path.
-    * Final per-block normalization is fp32 throughout. CPU does one
-      divide by a precomputed outer product ``mag_b @ mag_a``; GPU does
-      two sequential broadcast divides. Mathematically equivalent;
-      ≤1 ULP per element apart.
+    * Final per-block normalization is fp32 throughout. Both divide
+      each cell by the fp32 product ``mag_b[i] * mag_a[j]`` — CPU via
+      the outer product ``mag_b @ mag_a``, GPU per cell inside
+      ``fused_div_nanclamp``.
     * Matmul is fp32 throughout (cublasSgemm — no Tensor-core fp16
       implicit downcast).
 
@@ -56,12 +56,12 @@ def _demean_norm_columns(x_d: cp.ndarray) -> cp.ndarray:
     Backed by a fused RawKernel in ``_kernels_fused_gpu.py`` —
     accumulates mean + SS in fp64 registers across two passes through
     the fp32 buffer, no fp64 intermediate materialization. ~7x faster
-    than the prior ``astype(fp64).mean / .sum`` chain at the
+    than an ``astype(fp64).mean / .sum`` chain at the
     fc_similarity FC_B shape (T=240, K=7833).
 
-    Precision: ``x_d`` post-demean is bit-identical to the prior
-    impl per cell (same ``x - float(mean64)`` arithmetic). ``mag``
-    differs by ≤1 ULP fp32 due to a different reduction-tree shape;
+    Precision: ``x_d`` post-demean is bit-identical per cell to
+    ``x - float(mean64)``. ``mag`` differs by ≤1 ULP fp32 from an
+    fp64 cupy reduction due to a different reduction-tree shape;
     well within the step-0 RNG / Lanczos algorithm-class tolerance
     already documented in ``docs/step0_flow_and_subgraphs.md``.
     """

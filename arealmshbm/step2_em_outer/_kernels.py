@@ -1,6 +1,6 @@
 """_kernels.py — @njit kernels for the three step-2 outer-EM closed-form leaves.
 
-Replaces the naive numpy implementations in:
+Kernels behind the three leaf modules:
     intra_em_cost.py            → :func:`_intra_em_cost_step2_kernel`
     inter_subject_var.py        → :func:`_inter_subject_var_*_update`
     intra_subject_var_loop.py   → :func:`_intra_subject_var_loop_kernel`
@@ -16,7 +16,7 @@ family. All arrays are C-contig with ``d`` unit-stride, so the inner
     epsil    : (L,)          fp32
     cost_em  : (S,)          fp64
     theta    : (N, L)        fp32
-    s_lambda : (S, N, L)     fp64
+    s_lambda : (S, N, L)     fp32
     boundary_mask : (N, L)   fp32
 
 All kernels keep the same **fp32 storage / fp64 accumulator** contract
@@ -38,7 +38,7 @@ from arealmshbm.m_step._invad import invad_numba
 # ─────────────────────────────────────────────────────────────────────
 # intra_em_cost_step2 — outer-loop convergence cost (L16).
 #
-# Math (algebraically identical to the numpy form in intra_em_cost.py):
+# Math (as stated in intra_em_cost.py's docstring):
 #   term1_data = Σ_l σ[l] · (Σ_{s,t,d} ψ[s,l,d] · ν[s,t,l,d])    fp64
 #   term1_cdln = (S * T) · Σ_l Cdln(σ_l, dim)                    fp64
 #   term2_data = Σ_l ε[l] · (Σ_{s,d} ψ[s,l,d] · μ[l,d])          fp64
