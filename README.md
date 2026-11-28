@@ -9,11 +9,16 @@
 parcellation from resting-state fMRI, ported end-to-end to Python with
 numba (CPU) and CuPy (GPU) backends. Validated at large scale (300+
 subjects, 1,800+ fMRI sessions) against the original MATLAB
-implementation. **v2.3.0** fixes the surface scheme in code — parcels at
-the fsaverage6 vertices, RSFC seeds at the fsaverage3 vertices — and
-removes the configuration keys, file-name suffixes and rebuild path that
-only ever had one usable value; its results are bit-identical to
-v2.2.0's. Since v2.2.0 step 2 uses the reference implementation's
+implementation. **v2.4.0** hands step 0's gradients to step 3 through
+disk only — the driver no longer holds every subject's embedding in
+host memory across steps 1 and 2 (33 MB per subject) — and removes code
+nothing reached, outputs nothing read and arguments nobody passed;
+project configs and file names are untouched, and its results are
+bit-identical to v2.3.0's. Since v2.3.0 the surface scheme is fixed in
+code — parcels at the fsaverage6 vertices, RSFC seeds at the fsaverage3
+vertices — without the configuration keys, file-name suffixes and
+rebuild path that only ever had one usable value. Since v2.2.0 step 2
+uses the reference implementation's
 initialisation (the soft masked posterior with `theta_num`, on both
 backends): against the reference's own step 2 on the same inputs, the
 trained gMSHBM prior's agreement rose from 78.9 % to 94.1 % (dMSHBM:
@@ -99,7 +104,7 @@ pipeline runs **~170× faster** end-to-end.
 
 ## Status
 
-**This is the fifth release (v2.3.0)**, containing the CPU and GPU
+**This is the sixth release (v2.4.0)**, containing the CPU and GPU
 backends; the GPU backends for steps 2 and 3 are the candidate-set
 sessions, and step 3's covers all three variants. In large-scale validation — over **300 subjects
 and 1,800 fMRI sessions** to date — it shows alignment with the
@@ -123,18 +128,20 @@ All numbers measured on one Windows 11 laptop: RTX 5090 Laptop GPU
 MATLAB baseline is the CBIG reference pipeline **with its compiled MEX
 hot paths** (`mtimesx`), run on the same machine — a stronger baseline
 than a typical cluster node. Every cuArealMSHBM **wall-time** figure
-below was measured on the v2.2.0 tree (2026-11-02) — v2.3.0 changes no
-kernel and no numeric path, so they stand — and each "total" is
+below was measured on the v2.2.0 tree (2026-11-02) — v2.3.0 and v2.4.0
+change no numeric result, and same-session runs put each inside its
+predecessor's run-to-run band, so they stand — and each "total" is
 end-to-end driver wall time on a project with no caches (interpreter
 start and input validation included), with the numba and CuPy kernel
 caches warm on disk. The label-agreement rows are carried over from the
 v1.0.0 measurements. The memory rows are measured on the v2.2.0 tree:
 host is the peak resident set of the driver process (except where a row
 names another process), device is the peak `nvidia-smi` usage above the
-idle desktop. Numerically, v2.3.0 reproduces v2.2.0: on the 40-subject
-cohort below, steps 1–3 run on the v2.3.0 tree from the same step-0 output
-reproduce the packed profiles, cohort averages, spatial mask, `group.mat`,
-the trained prior and all 40 label files bit for bit. v2.2.0 in turn
+idle desktop. Numerically, v2.4.0 reproduces v2.3.0, which reproduces
+v2.2.0: on the 40-subject cohort below, steps 1–3 run on each of the two
+trees from the same step-0 output reproduce the packed profiles, cohort
+averages, spatial mask, `group.mat`, the trained prior and all 40 label
+files of the release before it bit for bit. v2.2.0 in turn
 reproduces v2.1.0 (itself bit-identical
 to v2.0.0) through step 1: on the same cohort, steps 1–3 run on
 the v2.2.0 tree from the same step-0 output reproduce the packed profiles,
@@ -167,7 +174,7 @@ drops **15.8 s → 3.9 s (4.1×)**: the step-0 Δ-stepping SSSP rewrite,
 the fused whole-subject step-1 GPU leaf, and the step-3 candidate-set
 backend (all v2.0.0); v2.1.0 holds that wall while step 1, and step 2
 in its device-resident cache mode, stop keeping host copies of the
-packed profiles, and v2.2.0 and v2.3.0 leave Mode A's numerics untouched. The
+packed profiles, and v2.2.0, v2.3.0 and v2.4.0 leave Mode A's numerics untouched. The
 6.2 s wall adds ~1.0 s of one-time package import
 (the Mode A min-input check imports the step-3 package to resolve the
 prior path) and ~0.6 s of interpreter start — fixed costs that do not grow with the cohort. Repeat runs in fresh processes land at
@@ -216,7 +223,10 @@ and a safety margin fit in free VRAM) the session keeps no host copy of the
 packed cohort — each subject is decoded straight into a two-slot
 page-locked ring and uploaded — so the host working set stops growing
 with the cohort; inside the end-to-end driver the process peak during
-step 2 is 2.7 GiB, most of it still held from steps 0–1. The `stream`
+step 2 is 1.4 GiB since v2.4.0, close to the standalone figure (through
+v2.3.0 it was 2.7 GiB: the driver was still holding the cohort's step-0
+gradients, 1.3 GB at 40 subjects, for step 3), and the whole run's host
+peak, reached in step 0, falls from 5.0–5.1 GiB to 4.3–4.4 GiB. The `stream`
 mode for cohorts that do not fit in VRAM keeps one subject on the device
 and, host RAM permitting, a host cache of the packed cohort. On
 `backend_step1: "gpu"` step 1 keeps no host copy of the packed cohort
@@ -289,7 +299,7 @@ step 3 on the candidate-set session for all three variants. The cMSHBM
 column was re-measured on it for v2.1.0; the gMSHBM and dMSHBM columns are
 the v2.0.0 measurement, whose step-3 backend is this same session under
 its earlier name. Mode A does not run step 2, so v2.2.0 leaves this table
-unchanged, and v2.3.0 changes no numeric path.
+unchanged, and neither v2.3.0 nor v2.4.0 changes a numeric result.
 
 Per-vertex label agreement over cortical vertices, medial wall excluded —
 it is label 0 on both sides and would otherwise count as free agreement.
@@ -470,8 +480,39 @@ Design notes and the measured backend-vs-backend agreement are in
 [`docs/step2_sparse_design.md`](docs/step2_sparse_design.md) and
 [`docs/step3_sparse_design.md`](docs/step3_sparse_design.md).
 
-**Upgrading a v2.2.0 project.** Results do not change; the configuration
-surface and the file names do.
+**Upgrading a v2.3.0 project.** Nothing in a project changes:
+`pipeline_config.json`, `bold_inputs.json`, the `assets-v2` bundles and
+every artifact name are the same, the results are bit-identical, and a
+project directory written by v2.3.0 re-runs in place.
+
+- Step 3 reads each subject's gradient from the two embedding files
+  `cohort.json` records
+  (`gradients/sub<S>/{lh,rh}_emb_<n>_distance_matrix.npy`) on every
+  path. Under the driver it used to be handed them in memory; the
+  per-step API already read the files.
+- A `Params_Final.mat` trained by `backend_step2: "gpu"` holds the same
+  twelve fields with the same values; `cost_em` sits at a different
+  position in the struct. Read the fields by name.
+- Callers of the per-step API: `precomputed_gradient_mat` is gone from
+  `Step3Pipeline`, `fetch_data`, `fetch_gradient` and
+  `load_step3_sparse_inputs`; `Step0Config` loses `save_artifacts` and
+  `bold_root` (`run_and_save()` always writes, `run()` computes without
+  saving); `Step0Pipeline.save()` takes the result only and returns
+  nothing; the `time_stages` arguments of `Step0Pipeline.run()` and of
+  `Step3Pipeline.run()` / `run_and_save()` are gone, as is
+  `Pipeline(progress=)`; `save_parcellation` takes `lh_labels` /
+  `rh_labels` in place of `s_lambda`; the `compute_diffusion_map*`
+  functions take no `alpha` (it is 0.5), and `compute_diffusion_map`
+  overwrites an fp64 array it is handed; the step-1 runners'
+  `threshold` / `radius_mm` are required arguments;
+  `arealmshbm.pipeline` exports `Pipeline` only (import
+  `PipelineConfig`, `BoldInputs` and `ProjectLayout` from its `config`,
+  `inputs` and `layout` modules); and the `CHECK_CONN_SERIAL`
+  environment switch no longer exists.
+
+**Upgrading a v2.2.0 project.** The v2.3.0 note above applies. Beyond
+it, results do not change; the configuration surface and the file names
+do.
 
 - `pipeline_config.json`: delete `step0.enable_tf32`, `step0.smooth_sigma`,
   `step0.K_hop`, `step1.split_flag`, `step1.profile_dtype` and
@@ -493,7 +534,7 @@ surface and the file names do.
   signature, as are `split_flag` / `profile_dtype` / `reduction_dtype`
   from the step-1 runners.
 
-| | v2.2.0 | v2.3.0 |
+| | v2.2.0 | v2.3.0 and later |
 |---|---|---|
 | per-subject profile | `sub<S>_fsaverage6_roifsaverage3.profile.b2nd` | `sub<S>.profile.b2nd` |
 | average profile | `{lh,rh}_fsaverage6_roifsaverage3_avg_profile.npy` | `{lh,rh}_avg_profile.npy` |
@@ -618,7 +659,7 @@ field, we extend our sincere greetings and deepest respect.
 
 [English](#english) | **简体中文**
 
-**CPU/GPU 加速的 Areal-MSHBM** —— 基于静息态 fMRI 的个体化皮层分区，以 numba（CPU）与 CuPy（GPU）双后端完成端到端的 Python 移植。已在大规模数据（300+ 名被试、1,800+ 个 fMRI session）上与原版 MATLAB 实现完成对照校验。**v2.3.0** 把表面方案固定在代码里 —— 在 fsaverage6 顶点上分区，RSFC 种子取 fsaverage3 顶点 —— 并删去了那些从来只有一个可用取值的配置键、文件名后缀与重建路径；其结果与 v2.2.0 逐位相同。自 v2.2.0 起，step 2 采用参考实现的初始化（带 `theta_num` 的软掩膜后验，两个后端相同）：在同一份输入上与参考实现自身的 step 2 对照，训练出的 gMSHBM 组先验一致率从 78.9 % 升至 94.1 %（dMSHBM：71.9 % → 81.2 %），速度与内存不变。自 v2.1.0 起，候选集 session 是 step 2 / step 3 唯一的 GPU 后端（step 3 覆盖全部三个变体），GPU 上的 BOLD 读入只走 nvCOMP，并且当位打包队列放得进显存时不在主机内存中保留它的副本：单被试从原始 BOLD 到分区结果，在一张笔记本 GPU 上端到端只需 **6.2 秒**；40 名被试的队列从原始 BOLD 经组先验训练到全部 40 份分区结果 **74.0–75.6 秒**完成（其中 step 2 组先验训练单独运行 16.5 秒）。
+**CPU/GPU 加速的 Areal-MSHBM** —— 基于静息态 fMRI 的个体化皮层分区，以 numba（CPU）与 CuPy（GPU）双后端完成端到端的 Python 移植。已在大规模数据（300+ 名被试、1,800+ 个 fMRI session）上与原版 MATLAB 实现完成对照校验。**v2.4.0** 让 step 0 的梯度只经磁盘交给 step 3 —— 驱动器不再在 step 1、step 2 期间把每名被试的嵌入（每人 33 MB）留在主机内存里 —— 并删去了执行不到的代码、无人读取的输出与无人传入的参数；项目配置与文件名都不变，其结果与 v2.3.0 逐位相同。自 v2.3.0 起，表面方案固定在代码里 —— 在 fsaverage6 顶点上分区，RSFC 种子取 fsaverage3 顶点 —— 那些从来只有一个可用取值的配置键、文件名后缀与重建路径不复存在。自 v2.2.0 起，step 2 采用参考实现的初始化（带 `theta_num` 的软掩膜后验，两个后端相同）：在同一份输入上与参考实现自身的 step 2 对照，训练出的 gMSHBM 组先验一致率从 78.9 % 升至 94.1 %（dMSHBM：71.9 % → 81.2 %），速度与内存不变。自 v2.1.0 起，候选集 session 是 step 2 / step 3 唯一的 GPU 后端（step 3 覆盖全部三个变体），GPU 上的 BOLD 读入只走 nvCOMP，并且当位打包队列放得进显存时不在主机内存中保留它的副本：单被试从原始 BOLD 到分区结果，在一张笔记本 GPU 上端到端只需 **6.2 秒**；40 名被试的队列从原始 BOLD 经组先验训练到全部 40 份分区结果 **74.0–75.6 秒**完成（其中 step 2 组先验训练单独运行 16.5 秒）。
 
 ---
 
@@ -651,13 +692,13 @@ cuArealMSHBM 用 Python 重新实现了全部四个流水线步骤（RSFC 梯度
 
 ## 项目状态
 
-**这是第五个发布版本（v2.3.0）**，包含 CPU 与 GPU 后端；step 2 与 step 3 的 GPU 后端即候选集 session，其中 step 3 覆盖全部三个变体。在迄今超过 **300 名被试、1,800 个 fMRI session** 的大规模校验中，它与原版实现的输出在数值所允许的极限水平上保持一致（逐顶点一致率约 98%；跨 BLAS/归约顺序边界的位级一致在数学上不可达），同时带来显著的速度与内存节约（见下方表格）。
+**这是第六个发布版本（v2.4.0）**，包含 CPU 与 GPU 后端；step 2 与 step 3 的 GPU 后端即候选集 session，其中 step 3 覆盖全部三个变体。在迄今超过 **300 名被试、1,800 个 fMRI session** 的大规模校验中，它与原版实现的输出在数值所允许的极限水平上保持一致（逐顶点一致率约 98%；跨 BLAS/归约顺序边界的位级一致在数学上不可达），同时带来显著的速度与内存节约（见下方表格）。
 
 项目仍在持续完善中。**所有预计算数据**（网格资产包、step-0 输入、预训练 HCP 组先验、空间掩膜）**将由带 GUI 的发行版（开发中）的安装程序部署。** 本源码版本刻意不包含这些资产 —— 安装程序部署的目录布局见 [`arealmshbm/data/README.md`](arealmshbm/data/README.md)。
 
 ## 基准测试
 
-所有数字均在同一台 Windows 11 笔记本上测得：RTX 5090 Laptop GPU（Blackwell，24 GB）、Python 3.13、numba 0.63.1、CuPy 13.6.0。MATLAB基线为 CBIG 参考流水线**并启用其编译 MEX 热路径**（`mtimesx`），在同一台机器上运行 —— 比典型集群节点更强的基线。下表中 cuArealMSHBM 的每一个**耗时**数字都在 v2.2.0 代码上测得（2026-11-02）—— v2.3.0 没有改动任何内核与数值路径，这些数字继续有效 —— 每一项"总计"均为无缓存项目上的端到端驱动器墙钟时间（含解释器启动与输入校验），numba 与 CuPy 的内核缓存在磁盘上已预热；标签一致率各行沿用 v1.0.0 的测量结果。内存各行在 v2.2.0 代码上实测：主机为驱动器进程的常驻内存峰值（表中另注进程者除外），设备为 `nvidia-smi` 相对空闲桌面的用量峰值。数值上，v2.3.0 与 v2.2.0 逐位相同：在下文的 40 被试队列上，用 v2.3.0 代码从同一份 step-0 输出起运行 step 1–3，得到的位打包 profile、队列均值、空间掩膜、`group.mat`、训练出的组先验与全部 40 份标签文件逐位相同。v2.2.0 则到 step 1 为止与 v2.1.0（后者与 v2.0.0 逐位相同）完全一致：在同一队列上，用 v2.2.0 代码从同一份 step-0 输出起运行 step 1–3，得到的位打包 profile、队列均值、空间掩膜与 `group.mat` 逐位相同；step 2 的组先验按设计有所不同（新的初始化，见下文"与参考实现的一致性"），其下游 40 份标签文件中有 9.4 % 的皮层顶点标签改变（逐被试 7.0–12.6 %）。
+所有数字均在同一台 Windows 11 笔记本上测得：RTX 5090 Laptop GPU（Blackwell，24 GB）、Python 3.13、numba 0.63.1、CuPy 13.6.0。MATLAB基线为 CBIG 参考流水线**并启用其编译 MEX 热路径**（`mtimesx`），在同一台机器上运行 —— 比典型集群节点更强的基线。下表中 cuArealMSHBM 的每一个**耗时**数字都在 v2.2.0 代码上测得（2026-11-02）—— v2.3.0 与 v2.4.0 都不改变任何数值结果，同一会话内的对比中两者的耗时都落在前一版的逐次波动范围之内，这些数字继续有效 —— 每一项"总计"均为无缓存项目上的端到端驱动器墙钟时间（含解释器启动与输入校验），numba 与 CuPy 的内核缓存在磁盘上已预热；标签一致率各行沿用 v1.0.0 的测量结果。内存各行在 v2.2.0 代码上实测：主机为驱动器进程的常驻内存峰值（表中另注进程者除外），设备为 `nvidia-smi` 相对空闲桌面的用量峰值。数值上，v2.4.0 与 v2.3.0 逐位相同，v2.3.0 又与 v2.2.0 逐位相同：在下文的 40 被试队列上，分别用这两版代码从同一份 step-0 输出起运行 step 1–3，得到的位打包 profile、队列均值、空间掩膜、`group.mat`、训练出的组先验与全部 40 份标签文件都与前一版逐位相同。v2.2.0 则到 step 1 为止与 v2.1.0（后者与 v2.0.0 逐位相同）完全一致：在同一队列上，用 v2.2.0 代码从同一份 step-0 输出起运行 step 1–3，得到的位打包 profile、队列均值、空间掩膜与 `group.mat` 逐位相同；step 2 的组先验按设计有所不同（新的初始化，见下文"与参考实现的一致性"），其下游 40 份标签文件中有 9.4 % 的皮层顶点标签改变（逐被试 7.0–12.6 %）。
 
 ### Mode A —— 基于预训练先验的个体化分区
 
@@ -675,7 +716,7 @@ gMSHBM，β = 5，w = 50，c = 10：
 
 GPU 一列所用后端：`backend_step0` / `backend_step1` / `backend_step3` = `gpu`。MATLAB 路径还额外需要一次 1,527 s 的 GIFTI→NIfTI 一次性格式转换；cuArealMSHBM 原生读取 `.func.gii`。
 
-与 v1.0.0 相比（同一台机器、同一配置），GPU 上 step 0–3 的计算耗时从 **15.8 s 降至 3.9 s（4.1×）**，来自 step-0 的 Δ-stepping SSSP 重写、step-1 融合的整被试 GPU 叶子算子，以及 step-3 的候选集后端（均为 v2.0.0 引入）；v2.1.0 在保持这一耗时的同时去掉了 step 1 与 step 2（显存常驻缓存模式）在主机内存中保留的位打包 profile 副本，v2.2.0 未触及 Mode A 的代码路径。6.2 s 的墙钟时间还额外包含约 1.0 s 的一次性包导入（Mode A 的最小输入检查为解析先验路径而载入 step-3 包）与约 0.6 s 的解释器启动 —— 这些是不随队列规模增长的固定开销。新进程中的重复运行稳定在 6.1–6.3 s；若 numba 缓存被删除，首次运行要多付约 7 s 的 JIT 编译；若 CuPy 内核缓存也被删除，则要先编译全部 GPU 内核（墙钟 31 s，每台机器一次）。
+与 v1.0.0 相比（同一台机器、同一配置），GPU 上 step 0–3 的计算耗时从 **15.8 s 降至 3.9 s（4.1×）**，来自 step-0 的 Δ-stepping SSSP 重写、step-1 融合的整被试 GPU 叶子算子，以及 step-3 的候选集后端（均为 v2.0.0 引入）；v2.1.0 在保持这一耗时的同时去掉了 step 1 与 step 2（显存常驻缓存模式）在主机内存中保留的位打包 profile 副本，v2.2.0、v2.3.0 与 v2.4.0 都没有改动 Mode A 的数值。6.2 s 的墙钟时间还额外包含约 1.0 s 的一次性包导入（Mode A 的最小输入检查为解析先验路径而载入 step-3 包）与约 0.6 s 的解释器启动 —— 这些是不随队列规模增长的固定开销。新进程中的重复运行稳定在 6.1–6.3 s；若 numba 缓存被删除，首次运行要多付约 7 s 的 JIT 编译；若 CuPy 内核缓存也被删除，则要先编译全部 GPU 内核（墙钟 31 s，每台机器一次）。
 
 ¹ 皮层顶点，剔除内侧壁。两个 Python 后端彼此的一致率为 98.21%。MATLAB↔Python 的位级一致本就不可达：残余分歧是多个良性来源叠加的结果——不同数值库之间的 BLAS 归约顺序差异（每个后端各有自己的数值噪声带，GPU 还存在小幅的逐次运行波动）、贝塞尔类函数所采用的不同数值路径（我们通过 `log I_ν` 的闭式解与渐近展开求值，经 mpmath 审计：CPU 上是 `arealmshbm/em_stop_criterion/_cdln.py`，设备上是 d = 3 的闭式解，两者的 fp32 输出由 `arealmshbm/em_stop_criterion/tests/test_cdln_d3_oracle.py` 钉为逐位相同），以及移植中少数几处与参考实现有意为之的细小实现差异。我们用于判断此类差异是否具有功能意义的四层评估框架见 `docs/precision_impact_analysis.md`。
 
@@ -690,7 +731,7 @@ GPU 一列所用后端：`backend_step0` / `backend_step1` / `backend_step3` = `
 | step 2 在 40 被试全队列下的设备内存 | **≈ 370–490 GB RAM**（预估²） | — | **峰值 5.6 GiB / 24 GB 显存** |
 | step 2 单独运行（独立的 `arealmshbm.step2_pipeline.profile` 进程）在 40 被试全队列下的主机内存 | （同上，≈ 370–490 GB²） | 11.1 GiB | **峰值 1.1 GiB** |
 
-step 2 的 GPU 一列取自 `gpu` 后端，即候选集 session（自 v2.0.0 起；v1.0.0 中占用该名字的稠密 CuPy 移植已不存在）。该数字为新进程中的单次运行（进程内的预热重复运行为 15.2 s）。CPU 一列同样是新进程中的单次运行、48 次 EM 迭代（v2.1.0 代码在同一形状上测得 2,945.6 s，v2.0.0 代码 2,638.7 s；三者的 CPU EM 内核代码相同，差异属于笔记本上一次 43–49 分钟全核运行的逐次波动）。初始化的改动不增加 step 2 的耗时：同一会话中用 v2.1.0 代码重跑独立的 GPU step 2，热运行为 15.0–15.1 s，v2.2.0 为 15.0–15.4 s，两者均为 48 次 EM 迭代；v2.1.0 发布时的 15.8 s / 14.1 s 是这台笔记本另一天的状态。全流程一行是三次生产运行（74.0、75.0 与 75.6 s）；最快的一次中 step 2 为 14.6 s，另有 step 0 40.4 s、step 1 8.4 s、step 3 8.1 s；最快与最慢两次相差 1.5 s，其中 step 0 占 0.8 s，step 1 与 step 3 各占 0.3 s，step 2 没有差别。主机内存一行自 v2.1.0 起列出，在独立的 step-2 进程中测得：在显存常驻缓存模式下（`eager_bitpacked`；`bold_cache_mode` 为 `auto` 时，只要位打包队列、session 的常驻状态与一段安全余量放得进空闲显存就选用它），session 不再在主机内存中保留位打包队列的副本 —— 每名被试直接解码进一个两槽页锁定环形缓冲并上传 —— 主机工作集因此不再随队列规模增长；在端到端驱动器运行中，step 2 期间的进程峰值为 2.7 GiB，其中大部分是 step 0–1 遗留的内存。放不进显存的队列走 `stream` 模式：设备上只保留一名被试，并在主机内存允许时在主机内存中缓存整个位打包队列。在 `backend_step1: "gpu"` 下，step 1 同样不在主机内存中保留位打包队列的副本，且与队列规模无关：每个 session 一打包就累加进设备端的求和。`cpu` 后端求平均时会把每名被试的 `.b2nd` 读回主机内存。
+step 2 的 GPU 一列取自 `gpu` 后端，即候选集 session（自 v2.0.0 起；v1.0.0 中占用该名字的稠密 CuPy 移植已不存在）。该数字为新进程中的单次运行（进程内的预热重复运行为 15.2 s）。CPU 一列同样是新进程中的单次运行、48 次 EM 迭代（v2.1.0 代码在同一形状上测得 2,945.6 s，v2.0.0 代码 2,638.7 s；三者的 CPU EM 内核代码相同，差异属于笔记本上一次 43–49 分钟全核运行的逐次波动）。初始化的改动不增加 step 2 的耗时：同一会话中用 v2.1.0 代码重跑独立的 GPU step 2，热运行为 15.0–15.1 s，v2.2.0 为 15.0–15.4 s，两者均为 48 次 EM 迭代；v2.1.0 发布时的 15.8 s / 14.1 s 是这台笔记本另一天的状态。全流程一行是三次生产运行（74.0、75.0 与 75.6 s）；最快的一次中 step 2 为 14.6 s，另有 step 0 40.4 s、step 1 8.4 s、step 3 8.1 s；最快与最慢两次相差 1.5 s，其中 step 0 占 0.8 s，step 1 与 step 3 各占 0.3 s，step 2 没有差别。主机内存一行自 v2.1.0 起列出，在独立的 step-2 进程中测得：在显存常驻缓存模式下（`eager_bitpacked`；`bold_cache_mode` 为 `auto` 时，只要位打包队列、session 的常驻状态与一段安全余量放得进空闲显存就选用它），session 不再在主机内存中保留位打包队列的副本 —— 每名被试直接解码进一个两槽页锁定环形缓冲并上传 —— 主机工作集因此不再随队列规模增长；在端到端驱动器运行中，自 v2.4.0 起 step 2 期间的进程峰值为 1.4 GiB，已接近独立进程的数字（v2.3.0 及之前为 2.7 GiB：驱动器当时还为 step 3 保留着整个队列的 step-0 梯度，40 名被试共 1.3 GB）；整次运行的主机内存峰值出现在 step 0，从 5.0–5.1 GiB 降到 4.3–4.4 GiB。放不进显存的队列走 `stream` 模式：设备上只保留一名被试，并在主机内存允许时在主机内存中缓存整个位打包队列。在 `backend_step1: "gpu"` 下，step 1 同样不在主机内存中保留位打包队列的副本，且与队列规模无关：每个 session 一打包就累加进设备端的求和。`cpu` 后端求平均时会把每名被试的 `.b2nd` 读回主机内存。
 
 **与 v1.0.0 的同机对比。** v1.0.0 公布的 step 2 数字是 794.0 s（CPU）/ 156.7 s（稠密 GPU），但那是在 `max_iter_inter=2` —— 短跑基准的迭代上限 —— 下测得的，并非生产默认值 10，见 [`docs/step2_flow_and_subgraphs.md`](docs/step2_flow_and_subgraphs.md) 的 § Production-cohort walls。在 v2.0.0 代码上重跑同样的形状，`gpu` 后端为 **11.1 s**：比 v1.0.0 的 GPU 数字快 **14×**，比其 CPU 数字快 **72×**。其实测显存峰值在 `max_iter_inter=2` 与 `=10` 下**同为 6.7 GiB** —— 不随外层迭代数增长，因为候选集 session 只分配一次并全程复用。v1.0.0 的稠密 GPU 后端在同一形状下实测为 **21 GiB**，在 `inter=10` 时已溢出到主机内存；v2.0.0 将其移除，除了显存原因，也因为它的 fp32 清零（flush-to-zero）E-step 是两者中精度较低的一个。
 
@@ -702,7 +743,7 @@ cuArealMSHBM 将这一切收拢到单个设备上：每份二值化 profile 在�
 
 ### Mode A —— 同一先验下的个体化分区
 
-以**未经修改的 CBIG 原版**为基准，在三个队列共 30 名被试上实测 —— K = 300、β = 5、w = 50、c = 10，目标网格 fsaverage6 / 种子网格 fsaverage3，两侧载入同一份组先验文件。后端：`backend_step0` / `backend_step1` / `backend_step3` = `gpu` —— step 3 在全部三个变体上都运行候选集 session。cMSHBM 一列已在该后端上为 v2.1.0 重新测得；gMSHBM 与 dMSHBM 两列沿用 v2.0.0 的测量结果，其 step-3 后端就是这同一个 session（当时名字不同）。Mode A 不运行 step 2，因此 v2.2.0 不改变这张表；v2.3.0 没有改动任何数值路径。
+以**未经修改的 CBIG 原版**为基准，在三个队列共 30 名被试上实测 —— K = 300、β = 5、w = 50、c = 10，目标网格 fsaverage6 / 种子网格 fsaverage3，两侧载入同一份组先验文件。后端：`backend_step0` / `backend_step1` / `backend_step3` = `gpu` —— step 3 在全部三个变体上都运行候选集 session。cMSHBM 一列已在该后端上为 v2.1.0 重新测得；gMSHBM 与 dMSHBM 两列沿用 v2.0.0 的测量结果，其 step-3 后端就是这同一个 session（当时名字不同）。Mode A 不运行 step 2，因此 v2.2.0 不改变这张表；v2.3.0 与 v2.4.0 都不改变任何数值结果。
 
 逐顶点标签一致率，仅计皮层顶点、剔除内侧壁 —— 内侧壁两侧同为标签 0，计入会白送一致率。括号内为全顶点口径。
 
@@ -809,7 +850,13 @@ Mode A 读取 `<project>/priors/<variant>/beta<B>/Params_Final.mat`（dMSHBM 为
 
 设计说明与后端之间实测的一致性数据见 [`docs/step2_sparse_design.md`](docs/step2_sparse_design.md) 与 [`docs/step3_sparse_design.md`](docs/step3_sparse_design.md)。
 
-**从 v2.2.0 升级项目。** 结果不变，变的是配置面与文件名。
+**从 v2.3.0 升级项目。** 项目本身什么都不用改：`pipeline_config.json`、`bold_inputs.json`、`assets-v2` 资产包与所有产物文件名都不变，结果逐位相同，v2.3.0 写出的项目目录可以原地重跑。
+
+- step 3 在所有路径上都从 `cohort.json` 记录的两个嵌入文件（`gradients/sub<S>/{lh,rh}_emb_<n>_distance_matrix.npy`）读取每名被试的梯度。此前在驱动器下它是从内存里直接拿到的；逐步骤 API 本来就读文件。
+- 由 `backend_step2: "gpu"` 训练出的 `Params_Final.mat` 仍是同样的十二个字段、同样的数值，只是 `cost_em` 在结构体中的位置变了。请按字段名读取。
+- 逐步骤 API 的调用方：`precomputed_gradient_mat` 已从 `Step3Pipeline`、`fetch_data`、`fetch_gradient` 与 `load_step3_sparse_inputs` 中移除；`Step0Config` 去掉了 `save_artifacts` 与 `bold_root`（`run_and_save()` 总是写盘，`run()` 只计算不保存）；`Step0Pipeline.save()` 只接收结果对象、不再有返回值；`Step0Pipeline.run()` 与 `Step3Pipeline.run()` / `run_and_save()` 的 `time_stages` 参数以及 `Pipeline(progress=)` 都已移除；`save_parcellation` 改为接收 `lh_labels` / `rh_labels` 而不是 `s_lambda`；`compute_diffusion_map*` 系列函数不再有 `alpha` 参数（固定为 0.5），`compute_diffusion_map` 会就地覆写传入的 fp64 数组；step-1 runner 的 `threshold` / `radius_mm` 成为必传参数；`arealmshbm.pipeline` 只导出 `Pipeline`（`PipelineConfig`、`BoldInputs` 与 `ProjectLayout` 请从它的 `config`、`inputs`、`layout` 模块导入）；环境变量开关 `CHECK_CONN_SERIAL` 不复存在。
+
+**从 v2.2.0 升级项目。** 上面 v2.3.0 的说明同样适用。除此之外，结果不变，变的是配置面与文件名。
 
 - `pipeline_config.json`：删除 `step0.enable_tf32`、`step0.smooth_sigma`、`step0.K_hop`、`step1.split_flag`、`step1.profile_dtype` 与 `step1.reduction_dtype`；Mode A 配置还要删除 `backend_step2`。它们现在都会作为未知键被拒绝（Mode A 中的 `backend_step2` 得到的是与 `step2` 块相同的报错）。这些键从未真正选择过任何东西：TF32 开关在驱动器下不起作用，平滑 sigma 与邻域已固化在 step-0 输入里，step 1 在两个后端上都以 fp64 归约。
 - `bold_inputs.json`：删除 `targ_mesh` 与 `seed_mesh`。读取器现在拒绝未知的顶层键。
@@ -817,7 +864,7 @@ Mode A 读取 `<project>/priors/<variant>/beta<B>/Params_Final.mat`（dMSHBM 为
 - v2.2.0 写出的项目目录可以原地重跑：运行会以下表的新文件名重写全部产物，旧文件名的文件留在原处。
 - 逐步骤 API 的调用方：`targ_mesh` / `seed_mesh` / `mesh` 参数与 `Step0Config.cbig_code_dir` 已从所有签名中移除，step-1 runner 的 `split_flag` / `profile_dtype` / `reduction_dtype` 同样如此。
 
-| | v2.2.0 | v2.3.0 |
+| | v2.2.0 | v2.3.0 及以后 |
 |---|---|---|
 | 逐被试 profile | `sub<S>_fsaverage6_roifsaverage3.profile.b2nd` | `sub<S>.profile.b2nd` |
 | 平均 profile | `{lh,rh}_fsaverage6_roifsaverage3_avg_profile.npy` | `{lh,rh}_avg_profile.npy` |
