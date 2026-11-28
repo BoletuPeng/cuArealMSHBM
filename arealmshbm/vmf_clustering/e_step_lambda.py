@@ -39,8 +39,7 @@ Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 
 from __future__ import annotations
 
-import time
-from typing import Optional, Tuple
+from typing import Tuple
 
 import numpy as np
 
@@ -48,14 +47,6 @@ from arealmshbm.V_lambda import Session as VLambdaSession
 from arealmshbm.em_stop_criterion._cdln import cdln_general_to_f32
 
 from . import _kernels
-
-
-def _bump(d: Optional[dict], key: str, t0: float) -> float:
-    """Add (perf_counter() - t0) to d[key] if d is provided. Returns now."""
-    now = time.perf_counter()
-    if d is not None:
-        d[key] = d.get(key, 0.0) + (now - t0)
-    return now
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -77,7 +68,7 @@ class ELambdaSession:
     iterates the lambda loop. Returns ``(s_lambda_new, V_temp,
     lambda_iter)``.
 
-    Mode A only (S=1).
+    Single subject only (S = 1).
     """
 
     __slots__ = (
@@ -252,7 +243,6 @@ class ELambdaSession:
     def prepare_em_iter(self,
                         s_t_nu: np.ndarray,    # (D, L, T) fp32
                         kappa: np.ndarray,     # (L,) fp64 or (1, L)
-                        sub_timings: Optional[dict] = None,
                         ) -> None:
         """Compute the em-iter-invariant cache: ``acc = X @ s_t_nu`` and
         ``Cdln(kappa, dim)``. Run once after each M-step.
@@ -263,8 +253,6 @@ class ELambdaSession:
         (typically 11-13 per em_iter on sub-001) reuse one matmul
         instead of redoing it each time.
         """
-        t0 = time.perf_counter()
-
         # s_t_nu (D, L, T) -> (T, D, L) C-contig view of pre-allocated buffer.
         st = np.ascontiguousarray(s_t_nu, dtype=np.float32)
         if st.ndim != 3 or st.shape != (self.D, self.L, self.T):
@@ -281,15 +269,12 @@ class ELambdaSession:
         np.copyto(self._kappa_f64, kap, casting="safe")
         np.copyto(self._kappa_f32, kap.astype(np.float32))
 
-        t0 = _bump(sub_timings, "stage_setup", t0)
-
         # ── acc = data_series_NxTD @ s_t_nu_TDxL (one-time per em_iter) ──
         # The dominant cost at this seam: ~6.6 GFLOP, ~370 ms via MKL sgemm.
         # Move it OUT of the lambda loop body so 79 lambda iters (with
         # invariant s_t_nu) do 6 GEMMs instead of 79.
         np.matmul(self.data_series_NxTD_view, self._s_t_nu_TDxL,
                    out=self._acc_NL)
-        t0 = _bump(sub_timings, "mtimesx_acc", t0)
 
         # ── Column-zero mask on acc (acc is em-iter-invariant) ──
         _kernels.compute_col_zero_mask_f32(self._acc_NL, self._col_zero_mask)
@@ -300,17 +285,14 @@ class ELambdaSession:
         np.multiply(self._cdln_per_k_f32, np.float32(self.T),
                      out=self._cdln_T_f32)
 
-        _bump(sub_timings, "kappa_cdln_combine", t0)
-
     def run_lambda_loop(self,
                         s_lambda: np.ndarray,                # (N, L) fp32
                         spatial_connect_vmf: np.ndarray,     # (N, L) fp32
                         spatial_xyz_vmf: np.ndarray,         # (N, L) fp32
-                        sub_timings: Optional[dict] = None,
                         ) -> Tuple[np.ndarray, np.ndarray, int]:
         """Run the inner λ-loop until convergence, using the cached acc /
-        Cdln from the most recent ``prepare_em_iter`` call. Mode A only —
-        S axis dropped from all inputs.
+        Cdln from the most recent ``prepare_em_iter`` call. Single
+        subject (S = 1): no S axis on any input.
 
         Returns ``(s_lambda_out, V_temp_full, lambda_iter)``.
 
@@ -368,11 +350,9 @@ class ELambdaSession:
             # via its row_idx_active table — eliminates the ~90 MB fancy-
             # index allocation that the prior ``compute(curr[mask, :])``
             # path paid every λ-iter.
-            t0 = time.perf_counter()
             V_lambda_active = self.v_lambda_session.compute_full(
                 self._s_lambda_curr,
             )
-            t0 = _bump(sub_timings, "v_lambda_compute", t0)
 
             # ── Steps 2+3+4+5: mega-fused (V_lambda gather + assemble +
             # softmax + drift). ``inv_active_idx[n]`` substitutes for the
@@ -401,7 +381,6 @@ class ELambdaSession:
             )
             converged = abs(checklam_update - checklam) <= self.epsilon
             checklam = checklam_update
-            _bump(sub_timings, "fused_v_lambda_assemble_softmax_drift", t0)
 
             if converged:
                 break

@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Optional
 
 from .variant import VariantSpec, VALID_PIPELINE_TYPES
+from arealmshbm.data_io.save_parcellation import fmt_num
 from arealmshbm.pipeline.config import _VALID_BACKENDS
 
 
@@ -120,14 +121,11 @@ class Step3Config:
     out_subid: Optional[str] = None
     # Optional override for the group-prior file path. When None
     # (default), :attr:`group_prior_path` is built from ``pipeline_type``
-    # and ``beta_scalar`` per the CBIG layout. Set explicitly when the
-    # native variant prior is unavailable (e.g. cMSHBM/dMSHBM validation
-    # against MATLAB GT borrows the gMSHBM ``Params_Final.mat`` — see
-    # ``docs/pipeline_variants.md``).
+    # and ``beta_scalar`` per the CBIG layout. Set explicitly to read the
+    # prior from any other ``Params_Final.mat``.
     group_prior_path_override: Optional[str | Path] = None
 
     # ── frozen / derived (filled in __post_init__) ──
-    _resolved: bool = field(default=False, init=False, repr=False)
     _variant: Optional[VariantSpec] = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -215,7 +213,7 @@ class Step3Config:
                 / f"{int(self.num_session)}_sess"
             )
             self.out_dir = (
-                base / f"beta{_fmt_num(self.beta_scalar)}"
+                base / f"beta{fmt_num(self.beta_scalar)}"
                 if self._variant.output_subdir_includes_beta
                 else base
             )
@@ -225,7 +223,6 @@ class Step3Config:
             self.out_subid = str(int(self.subid))
         if self.group_prior_path_override is not None:
             self.group_prior_path_override = Path(self.group_prior_path_override)
-        self._resolved = True
 
     # ── derived accessors ──
     @property
@@ -258,19 +255,9 @@ class Step3Config:
             return Path(self.group_prior_path_override)
         base = self.project_dir / "priors" / self.variant.name
         if self.variant.prior_path_includes_beta:
-            base = base / f"beta{_fmt_num(self.beta_scalar)}"
+            base = base / f"beta{fmt_num(self.beta_scalar)}"
         return base / "Params_Final.mat"
 
     @property
     def spatial_mask_path(self) -> Path:
         return self.project_dir / "spatial_mask" / "spatial_mask.mat"
-
-
-def _fmt_num(x: float | int | str) -> str:
-    """Match MATLAB ``num2str`` for the integer / small-float regime used
-    by these knobs (``5`` -> ``"5"``, ``0.5`` -> ``"0.5"``).
-    Strings pass through unchanged.
-    """
-    if isinstance(x, str):
-        return x
-    return f"{float(x):g}"

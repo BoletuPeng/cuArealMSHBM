@@ -230,7 +230,7 @@ def run_generate_profiles(
     project_dir: Path,
     subjects: Sequence[str],
     sessions: Sequence[str],
-    threshold: float = 0.1,
+    threshold: float,
     backend: str = "cpu",
     verbose: bool = True,
     progress: Optional["ProgressEmitter"] = None,
@@ -271,16 +271,9 @@ def run_generate_profiles(
 
     schedule, bold_paths = _read_bold_lists(project_dir, subjects, sessions)
 
-    # Per-subject session counts + canonical .b2nd output paths.
-    sess_per_sub: Dict[str, int] = {}
-    out_paths: Dict[str, Path] = {}
-    for sub in subjects:
-        sub_id = str(sub)
-        if sub_id not in sess_per_sub:
-            sess_per_sub[sub_id] = 0
-            out_paths[sub_id] = profile_path(project_dir, sub_id)
-        sess_per_sub[sub_id] = sum(
-            1 for s in schedule if s[0] == sub_id)
+    # Canonical .b2nd output paths.
+    out_paths: Dict[str, Path] = {
+        str(sub): profile_path(project_dir, str(sub)) for sub in subjects}
 
     if backend not in _VALID_BACKENDS:
         raise ValueError(f"run_generate_profiles: unknown backend {backend!r}")
@@ -306,9 +299,8 @@ def run_generate_profiles(
 
     # ── Stage pipeline — step0-style by-phase coordinator ────────────
     # GZIP (8-worker pool) → leaf (1 thread) → POST (1 thread, .T copy)
-    # → ASSEM (1 thread; submits writes to WRITE pool). Sliding
-    # lookahead = 8 sessions; queue maxsize=2 caps each inter-stage
-    # buffer.
+    # → ASSEM (1 thread; submits writes to the 1-worker WRITE pool).
+    # Queue maxsize=2 caps each inter-stage buffer.
     # The prefetcher decodes on the CPU (isal_zlib + 8 workers, the
     # saturation plateau for GIFTI gzip decode on the YS reference).
     with Step1BoldPrefetcher(n_workers=8) as prefetcher:
@@ -316,27 +308,15 @@ def run_generate_profiles(
             project_dir=project_dir,
             schedule=schedule,
             bold_paths=bold_paths,
-            sess_per_sub=sess_per_sub,
             out_paths=out_paths,
             threshold=threshold,
             prefetcher=prefetcher,
-            lookahead=8,
-            write_workers=1,
             verbose=verbose,
             progress=progress,
         )
-        completed = coord.run()
-
-    # Preserve the input ``subjects`` order in the returned list — the
-    # coordinator returns subjects in completion order, which on a
-    # multi-worker WRITE pool may interleave.
-    by_sub = {sub_id: op for (sub_id, op) in completed}
-    out: List[Tuple[str, Path]] = []
-    for sub in subjects:
-        sub_id = str(sub)
-        if sub_id in by_sub:
-            out.append((sub_id, by_sub[sub_id]))
-    return out
+        # Subjects complete in schedule order: one LEAF thread, one
+        # write in flight.
+        return coord.run()
 
 
 def _run_generate_profiles_gpu_fused(
@@ -586,8 +566,7 @@ def run_radius_mask(
     project_dir: Path,
     lh_labels: np.ndarray,
     rh_labels: np.ndarray,
-    radius_mm: float = 30.0,
-    atlas_dir: Optional[Path] = None,
+    radius_mm: float,
     backend: str = "cpu",
     verbose: bool = True,
 ) -> Path:
@@ -601,7 +580,6 @@ def run_radius_mask(
     test_knobs_field_match.test_step1_radius_mask_radius_mm_maps_to_run_radius_mask.
     """
     from arealmshbm.radius_mask import generate_radius_mask
-    atlas_str = str(atlas_dir) if atlas_dir is not None else None
     result = generate_radius_mask(
         lh_labels=lh_labels,
         rh_labels=rh_labels,
@@ -609,7 +587,6 @@ def run_radius_mask(
         out_dir=str(project_dir),
         verbose=verbose,
         backend=backend,
-        atlas_dir=atlas_str,
     )
     return Path(result["mat_path"])
 
@@ -619,57 +596,32 @@ def run_radius_mask(
 # ─────────────────────────────────────────────────────────────────────
 def resolve_group_labels(
     *,
-    schaefer_resolution: Optional[str] = None,
-    lh_labels_path: Optional[Path] = None,
-    rh_labels_path: Optional[Path] = None,
-    atlas_dir: Optional[Path] = None,
+    schaefer_resolution: str,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Return ``(lh_labels, rh_labels)`` with -1 → 0 normalisation.
+    """Return the Schaefer group parcellation ``(lh_labels, rh_labels)``
+    with -1 → 0 normalisation.
 
-    Exactly one of ``schaefer_resolution`` or the explicit
-    ``{lh,rh}_labels_path`` pair must be set. The ``.annot`` parse is
-    the numpy-only :func:`~arealmshbm.data_io.annot_io.read_annot_labels`
-    (equal to nibabel's labels vector; avoids the ~0.8 s cold
-    ``import nibabel``).
+    The ``.annot`` parse is the numpy-only
+    :func:`~arealmshbm.data_io.annot_io.read_annot_labels` (equal to
+    nibabel's labels vector; avoids the ~0.8 s cold ``import nibabel``).
     """
-    if schaefer_resolution is not None:
-        from arealmshbm.data_io.annot_io import read_annot_labels
-        from arealmshbm.data_io.load_avg_mesh import atlas_label_dir
+    from arealmshbm.data_io.annot_io import read_annot_labels
+    from arealmshbm.data_io.load_avg_mesh import atlas_label_dir
 
-        stem = (
-            f"Schaefer2018_{schaefer_resolution}Parcels_"
-            f"Kong2022_17Networks_order.annot"
+    stem = (
+        f"Schaefer2018_{schaefer_resolution}Parcels_"
+        f"Kong2022_17Networks_order.annot"
+    )
+    annot_dir = atlas_label_dir()
+    lh_p = annot_dir / f"lh.{stem}"
+    rh_p = annot_dir / f"rh.{stem}"
+    if not (lh_p.exists() and rh_p.exists()):
+        raise FileNotFoundError(
+            f"Schaefer annot not found: {lh_p} / {rh_p}"
         )
-        annot_dir = atlas_label_dir(atlas_dir)
-        lh_p = annot_dir / f"lh.{stem}"
-        rh_p = annot_dir / f"rh.{stem}"
-        if not (lh_p.exists() and rh_p.exists()):
-            raise FileNotFoundError(
-                f"Schaefer annot not found: {lh_p} / {rh_p}"
-            )
-        lh_raw = read_annot_labels(lh_p)
-        rh_raw = read_annot_labels(rh_p)
-    elif lh_labels_path is not None and rh_labels_path is not None:
-        lh_raw = _load_labels_file(lh_labels_path)
-        rh_raw = _load_labels_file(rh_labels_path)
-    else:
-        raise ValueError(
-            "resolve_group_labels: must pass schaefer_resolution OR "
-            "both lh_labels_path / rh_labels_path."
-        )
+    lh_raw = read_annot_labels(lh_p)
+    rh_raw = read_annot_labels(rh_p)
 
     lh_labels = np.where(lh_raw < 0, 0, lh_raw).astype(np.int64)
     rh_labels = np.where(rh_raw < 0, 0, rh_raw).astype(np.int64)
     return lh_labels, rh_labels
-
-
-def _load_labels_file(p: Path) -> np.ndarray:
-    """Load a group-labels file: .annot (FreeSurfer) or .npy."""
-    p = Path(p)
-    ext = p.suffix.lower()
-    if ext == ".annot":
-        from arealmshbm.data_io.annot_io import read_annot_labels
-        return read_annot_labels(p)
-    if ext == ".npy":
-        return np.load(p)
-    raise ValueError(f"unsupported group-labels file: {p}")

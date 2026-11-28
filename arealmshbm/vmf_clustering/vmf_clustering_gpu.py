@@ -97,7 +97,6 @@ class VmfClusteringSessionSparseCUDA:
 
         # ── static device state ──
         self.lay = layout_to_device(layout)
-        self.layout_host = layout
         self.p_row_m = K.p_row_m_of(self.lay)
         self.packed = cp.asarray(packed_TND)
         mw = np.ascontiguousarray(np.asarray(mw_rows).ravel(), dtype=np.int32)
@@ -252,7 +251,6 @@ class VmfClusteringSessionSparseCUDA:
         cost_prev = 0.0
         max_conn = 0.0; max_comp = 0.0
         cost_em_out: Optional[np.ndarray] = None
-        update_cost = 0.0
         iter_em = 0
         scv_estep = self.scv if v.use_connect_prior else (self.sxv if v.use_xyz_prior else self.zero_P)
         sxv_estep = self.sxv if v.use_connect_prior else self.zero_P
@@ -351,19 +349,16 @@ class VmfClusteringSessionSparseCUDA:
 
         # Publish ping-pong state.
         self.s_lambda_A, self.s_lambda_B = curr, new
-        return {"kappa": kappa, "iter_em": iter_em, "cost_em": cost_em_out,
-                "max_connectedness": max_conn, "max_components": max_comp,
-                "update_cost": update_cost}
+        return {"cost_em": cost_em_out, "max_components": max_comp}
 
     # ─────────────────────────────────────────────────────────────
     # intra_em outer loop (Step3Pipeline.run semantics)
     # ─────────────────────────────────────────────────────────────
     def run_intra_em(self, max_iter_intra_em: int) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """Run the whole outer loop on device. Returns ``(Params, info)``
-        where ``Params`` follows the CPU pipeline's output dict (dense
-        ``s_lambda``; ``s_t_nu`` as (D, L, T); flat (L,) vectors) and
-        ``info`` carries ``record``, ``iter_intra_em``, ``per_stage_em``,
-        ``per_iter_intra_em``.
+        where ``Params`` carries the dense (N, L) ``s_lambda``, ``mu`` and
+        ``max_components`` and ``info`` carries ``record``,
+        ``iter_intra_em``, ``per_stage_em``, ``per_iter_intra_em``.
         """
         per_stage = {
             "m_step": 0.0, "spatial_connect_prior": 0.0, "e_step_lambda_loop": 0.0,
@@ -376,7 +371,6 @@ class VmfClusteringSessionSparseCUDA:
         cost = 0.0
         iter_intra = 0
         em: Dict[str, Any] = {}
-        cost_intra = 0.0
         while True:
             iter_intra += 1
             t_round = time.perf_counter()
@@ -392,19 +386,16 @@ class VmfClusteringSessionSparseCUDA:
             term1 = float((self._sigma_h * pc1).sum()) + self._term1_cdln
             term2 = float((self._epsil_h * pc2).sum()) + self._term2_cdln
             ce = em["cost_em"]
-            update_cost = term1 + term2 + (float(np.asarray(ce).ravel().sum()) if ce is not None else 0.0)
+            update_cost = term1 + term2 + float(np.asarray(ce).ravel().sum())
             record.append(update_cost)
             converged = matlab_ratio_converged(update_cost, cost)
             stop = converged or iter_intra >= int(max_iter_intra_em)
             cost = update_cost
             per_iter.append(time.perf_counter() - t_round)
             if stop:
-                cost_intra = update_cost
                 break
 
         params = self._collect_params(em)
-        params["cost_intra"] = cost_intra
-        params["Record"] = np.asarray(record, dtype=np.float64)
         info = {"record": record, "iter_intra_em": iter_intra,
                 "per_stage_em": per_stage, "per_iter_intra_em": per_iter}
         return params, info
@@ -431,27 +422,8 @@ class VmfClusteringSessionSparseCUDA:
         return self._dense_host
 
     def _collect_params(self, em: Dict[str, Any]) -> Dict[str, Any]:
-        L = self.L
         p: Dict[str, Any] = {}
         p["s_lambda"] = self.dense_P_pinned(self.s_lambda_A)
-        st = self.s_t_nu.get()                                  # (T, L, D)
-        p["s_t_nu"] = np.ascontiguousarray(np.transpose(st, (2, 1, 0)))   # (D, L, T)
-        p["s_psi"] = np.ascontiguousarray(self.s_psi_LD.get().T)
-        p["kappa"] = np.full(L, float(em["kappa"]), dtype=np.float64)
-        p["sigma"] = self.sigma.get(); p["epsil"] = self.epsil.get()
         p["mu"] = self.mu_host
-        p["xyz_gamma"] = self.xyz_gamma.get()
-        p["max_connectedness"] = em["max_connectedness"]
         p["max_components"] = em["max_components"]
-        if em["cost_em"] is not None:
-            p["cost_em"] = em["cost_em"]
-        p["iter_em"] = em["iter_em"]
-        p["iter_inter"] = 1.0
-        p["candidate_layout"] = self.layout_host
-        p["spatial_xyz_vmf_P"] = self.sxv.get()
-        if self.variant.use_xyz_prior:
-            p["s_muc"] = self.s_muc.get()
-        if self.variant.use_connect_prior:
-            p["spatial_connect_vmf_P"] = self.scv.get()
-            p["u"] = self.u.get()
         return p

@@ -39,7 +39,6 @@ import cupy as cp
 
 
 _DEMEAN_BLOCK = 256
-_DEMEAN_BLOCK_MAX = 256
 
 
 _demean_l2norm_kernel = cp.RawKernel(r"""
@@ -134,13 +133,7 @@ def demean_l2norm_inplace_cupy(profile_dev: cp.ndarray,
     keep_u8 = keep_dev.astype(cp.uint8) if keep_dev.dtype != cp.uint8 else keep_dev
     if not keep_u8.flags["C_CONTIGUOUS"]:
         keep_u8 = cp.ascontiguousarray(keep_u8)
-    block = _DEMEAN_BLOCK
-    if block <= 0 or (block & (block - 1)) != 0 or block > _DEMEAN_BLOCK_MAX:
-        raise ValueError(
-            f"demean_l2norm: block size must be power-of-2 <= "
-            f"{_DEMEAN_BLOCK_MAX}; got {block}"
-        )
-    _demean_l2norm_kernel((N,), (block,),
+    _demean_l2norm_kernel((N,), (_DEMEAN_BLOCK,),
                            (profile_dev, keep_u8, cp.int32(N), cp.int32(D)))
 
 
@@ -161,7 +154,7 @@ def demean_l2norm_inplace_cupy(profile_dev: cp.ndarray,
 #     L >= 2 (checked bit-exact up to D = 100000); the degenerate
 #     L == 1 case is contiguous along d, where numpy does go pairwise
 #     and the two part ways by ~10 ulps at D = 4096.
-#     Production L is the parcel count (300-400), so the kernel keeps
+#     Production L is the parcel count (100-1000), so the kernel keeps
 #     the CPU-matching order.
 #
 # FMA contraction is disabled by hand (``__dmul_rn`` / ``__dadd_rn``)

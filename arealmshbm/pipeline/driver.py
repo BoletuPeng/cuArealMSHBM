@@ -11,27 +11,26 @@ Flow per mode::
 Min-input check is the only existence test performed: BOLD files (both
 modes), and (Mode A only) a pre-existing group prior at the
 project-local slot
-``<project>/priors/<variant>/beta<beta_scalar>/Params_Final.mat``.
-Staging that prior is the project creator's responsibility — the
-pipeline never reaches outside the project (no HCP/CBIG fallback, no
-cross-project lookup); Mode B produces the prior there itself via
-step2. The driver does NOT check for intermediate artifacts to skip
+``<project>/priors/<variant>/beta<beta_scalar>/Params_Final.mat`` (no
+``beta<beta_scalar>/`` segment for dMSHBM). Staging that prior is the
+project creator's responsibility — the pipeline never reaches outside
+the project (no HCP/CBIG fallback, no cross-project lookup); Mode B
+produces the prior there itself via step2. The driver does NOT check for intermediate artifacts to skip
 steps — every ``run()`` is naive run-and-overwrite.
 
 Step 1's four subgraphs (generate_profiles, avg_profiles, ini_params,
 radius_mask) are called directly via :mod:`pipeline.step1_runners`,
 and the cohort.json write is performed by :mod:`pipeline.cohort_writer`
-at the end of the driver's run. Step 0 / 2 / 3 are dispatched through
+right after step 1. Step 0 / 2 / 3 are dispatched through
 their respective per-step ``Pipeline`` classes — those orchestrators
 remain useful boundaries (per-subject lifecycle for step0/3,
 multi-subject EM for step2).
 
-The step0 → step3 gradient hand-off is in-memory (driver collects each
-subject's ``(N, n_components)`` gradient matrix from step0 and forwards
-it to ``Step3Pipeline(precomputed_gradient_mat=...)``); step1's avg
-profile arrays are likewise threaded subgraph 2 → 3 without a disk
-re-read. Step 2 (Mode B) reads the gradients from disk, through the
-paths ``cohort.json`` records.
+Step 0 hands its gradients over on disk: steps 2 and 3 read each
+subject's two embedding files through the paths ``cohort.json``
+records, and the driver holds no gradient in memory between steps.
+Step 1's avg profile arrays are threaded subgraph 2 → 3 without a disk
+re-read.
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """
@@ -44,8 +43,6 @@ import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-
-import numpy as np
 
 from ._progress import COHORT_SUB_ID, ProgressEmitter, build_plan_entries
 from .config import PipelineConfig, read_pipeline_config
@@ -100,24 +97,17 @@ class Pipeline:
     (user-provided). The driver discovers the rest from there.
     """
 
-    def __init__(self, project_dir: Path | str,
-                 *, progress: Optional[ProgressEmitter] = None) -> None:
+    def __init__(self, project_dir: Path | str) -> None:
         self.layout = ProjectLayout(project_dir)
         self.inputs: BoldInputs = read_bold_inputs(self.layout.bold_inputs_path)
         self.config: PipelineConfig = read_pipeline_config(
             self.layout.pipeline_config_path
         )
         self._validate_inputs_vs_config()
-        # Frontend progress sink. Default = on, writes
-        # ``<project>/logs/progress.jsonl``. The caller can pass a
-        # disabled emitter (``ProgressEmitter(..., enabled=False)``) to
-        # opt out — e.g. perf scripts that must isolate zero file I/O.
+        # Frontend progress sink: writes ``<project>/logs/progress.jsonl``.
         # Constructed last so any validation failure above short-
         # circuits before touching the logs dir.
-        self._progress: ProgressEmitter = (
-            progress if progress is not None
-            else ProgressEmitter(self.layout.logs_dir)
-        )
+        self._progress: ProgressEmitter = ProgressEmitter(self.layout.logs_dir)
 
     # ─────────────────────────────────────────────────────────────────
     # Validation
@@ -195,15 +185,12 @@ class Pipeline:
     # ─────────────────────────────────────────────────────────────────
     # Per-step runners
     # ─────────────────────────────────────────────────────────────────
-    def _run_step0_all_subjects(self) -> Dict[str, "np.ndarray"]:
-        """Step 0: gradients per subject. Each call writes
+    def _run_step0_all_subjects(self) -> None:
+        """Step 0: gradients per subject, written to
         ``project_dir/gradients/sub<id>/{lh,rh}_emb_<N>_distance_matrix.npy``
-        as cache AND returns the concatenated ``(N, n_grad_components)``
-        fp32 gradient matrix in memory.
-
-        Returns a dict ``{sub_id: gradient_mat_NxDg}`` so step3 can
-        consume gradients from memory without re-reading the .npy
-        files step0 just wrote.
+        (``.mat`` per ``step0.emb_output_format``). Those files are the
+        hand-off: ``cohort.json`` records their paths and steps 2 and 3
+        read them back.
 
         **Pipeline-parallel by subgraph (GPU backend).** The single-
         subject pipeline runs four subgraphs sequentially (A: RSFC
@@ -284,7 +271,7 @@ class Pipeline:
                 step0_knobs=self.config.step0,
                 progress=self._progress,
             )
-            gradients = coord.run(subjects)
+            coord.run(subjects)
 
         # Belt-and-braces drain after all subjects done. Each stage-D
         # thread already free_all_blocks'd per subject; this also
@@ -297,8 +284,6 @@ class Pipeline:
                 cp.get_default_pinned_memory_pool().free_all_blocks()
             except Exception:
                 pass
-
-        return gradients
 
     def _run_step1_all_subjects(self) -> List[Tuple[str, Path]]:
         """Step 1: drives the four subgraphs directly via step1_runners.
@@ -483,7 +468,8 @@ class Pipeline:
 
     def _run_step2_train_prior(self) -> Path:
         """Step 2: coupled EM across the cohort, produces Params_Final.mat
-        at ``priors/<variant>/beta<X>/Params_Final.mat``."""
+        at ``priors/<variant>/beta<X>/Params_Final.mat`` (no ``beta<X>/``
+        for dMSHBM)."""
         from arealmshbm.step2_pipeline import Step2Config, Step2Pipeline
 
         # ``**k2_kwargs`` splats every Step2Knobs field into Step2Config
@@ -540,26 +526,20 @@ class Pipeline:
         self._progress.emit_state("step2", COHORT_SUB_ID, "done")
         return prior_dst
 
-    def _run_step3_all_subjects(
-        self,
-        gradient_by_sub: Dict[str, "np.ndarray"],
-    ) -> None:
+    def _run_step3_all_subjects(self) -> None:
         """Step 3: per-subject parcellation EM. Each call writes
         ``ind_parcellation_<variant>/<T>_sess/beta<B>/Ind_parcellation_MSHBM_sub<id>_*.mat``
         (no ``beta<B>/`` segment for dMSHBM).
 
-        ``gradient_by_sub`` is the dict returned by step0 — each entry
-        is the in-memory ``(N, n_grad_components)`` fp32 gradient_mat
-        for one subject. fetch_data (``cpu``) or fetch_gradient (``gpu``)
-        uses it directly instead of re-reading the cohort's gradient .npy
-        files. After processing a subject we drop the reference so its
-        ~33 MB (81924 × 100 × 4 B at fsa6 with n_grad_components=100) is
-        reclaimable; this matters at large K.
+        Every per-subject input comes off disk through ``cohort.json``:
+        the packed profile, and for gMSHBM the two gradient files step 0
+        wrote.
 
         **Pipeline-parallel by phase (GPU backend, K ≥ 2).** The
         single-subject pipeline runs three phases sequentially (LOAD:
-        disk reads + setup + H2D, EM: intra_em outer loop, SAVE: argmax
-        + .mat write); LOAD and SAVE would otherwise serialize behind
+        disk reads + setup + H2D, EM: ``run()`` — the intra_em outer
+        loop and the labels it returns, SAVE: the cMSHBM cleanup + .mat
+        write of those labels); LOAD and SAVE would otherwise serialize behind
         EM. We pipeline by phase across subjects: one stage thread per
         phase, with cupy streams on LOAD and EM (cross-stream event sync
         on the LOAD→EM device-buffer handoff), so subject K+1's LOAD
@@ -605,7 +585,6 @@ class Pipeline:
             coord = Step3StagePipeline(
                 subject_ids=[sub.id for sub in subjects],
                 configs=configs,
-                gradients=gradient_by_sub,
                 progress=self._progress,
             )
             coord.run()
@@ -617,12 +596,9 @@ class Pipeline:
         # serial path owns the running/done/failed emits directly —
         # the stage pipeline handles them internally on the GPU path.
         for sub_idx, sub in enumerate(subjects):
-            grad_mat = gradient_by_sub.pop(sub.id, None)
             self._progress.emit_state("step3", sub.id, "running")
             try:
-                with Step3Pipeline(
-                    configs[sub_idx], precomputed_gradient_mat=grad_mat,
-                ) as pipe:
+                with Step3Pipeline(configs[sub_idx]) as pipe:
                     pipe.run_and_save()
             except BaseException as e:
                 self._progress.emit_state(
@@ -763,12 +739,10 @@ class Pipeline:
                 from .step2_runners import prewarm_step2_gpu
                 prewarm_step2_gpu(background=True)
 
-            # Step 0: gradients per subject. Returns the in-memory dict
-            # ``{sub_id: gradient_mat}`` that step3 will consume directly,
-            # skipping the disk re-read.
+            # Step 0: gradients per subject, written to disk.
             current_phase = "step0"
             t = time.perf_counter()
-            gradient_by_sub = self._run_step0_all_subjects()
+            self._run_step0_all_subjects()
             timings["step0"] = time.perf_counter() - t
 
             # Step 1: profiles + ini params + radius mask, driver-owned.
@@ -798,12 +772,10 @@ class Pipeline:
                 prior_dst = self._run_step2_train_prior()
                 timings["step2"] = time.perf_counter() - t
 
-            # Step 3: per-subject parcellation. Consumes step0's gradients
-            # directly from memory — the .npy files on disk are what
-            # step 2 and the per-step APIs read through cohort.json.
+            # Step 3: per-subject parcellation.
             current_phase = "step3"
             t = time.perf_counter()
-            self._run_step3_all_subjects(gradient_by_sub)
+            self._run_step3_all_subjects()
             timings["step3"] = time.perf_counter() - t
 
             current_phase = "done"

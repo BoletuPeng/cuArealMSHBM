@@ -12,7 +12,7 @@ One control loop, :func:`_em_loop`, serves both Session families:
   that runs every leaf of one outer-EM iter body (M-step inner
   while-loop + spatial_connect + per-subject E-step + normalize +
   theta); the wrapper refreshes the per-intra-EM-iter state on it,
-  loops, and returns the updated Params delta.
+  loops, and updates ``Params`` in place.
 * :func:`em_body_sparse` drives the ``gpu`` backend's
   ``Step2SparseSession`` (``docs/step2_sparse_design.md`` §4): no
   ``Params`` round trip — the Session keeps every bulk field on device,
@@ -34,9 +34,6 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Tuple
 import numpy as np
 
 if TYPE_CHECKING:  # pragma: no cover — typing only
-    # Imported lazily/never at runtime: this module is on the import path
-    # of every backend, and ``step2_em_iter_master`` drags in the numba
-    # master kernels a sparse-GPU run never calls.
     from arealmshbm.step2_em_iter_master import Step2EmIterSession
 
 
@@ -45,23 +42,7 @@ if TYPE_CHECKING:  # pragma: no cover — typing only
 # ─────────────────────────────────────────────────────────────────────
 @dataclass
 class VmfBatchResult:
-    """The leaf-level outputs (the Params delta) plus diagnostics."""
-    Params: Dict[str, np.ndarray]   # updated in-place but returned for clarity
-    em_iters: int                   # outer-EM iters consumed
-    m_iters_per_em: List[int]       # M-step inner-iter count per outer EM iter
-    converged: bool                 # True iff all subjects converged within cap
-
-
-@dataclass
-class SparseBatchResult:
-    """``VmfBatchResult`` without the ``Params`` slot.
-
-    The sparse Session owns every bulk field on device, so there is no
-    Params delta to hand back — only ``cost_S``, which the caller stores
-    as ``Params['cost_em']`` for the save path (the on-device L16 reads
-    the device copy, not this one).
-    """
-    cost_S: np.ndarray              # (S,) fp64 — per-subject cost, host copy
+    """Iteration diagnostics of one EM body (either backend)."""
     em_iters: int                   # outer-EM iters consumed
     m_iters_per_em: List[int]       # M-step inner-iter count per outer EM iter
     converged: bool                 # True iff all subjects converged within cap
@@ -133,8 +114,7 @@ def vmf_clustering_batch(
 ) -> VmfBatchResult:
     """Run the EM body for one intra-EM iteration via the fused master.
 
-    Mutates and returns Params with updated kappa, s_t_nu, s_lambda,
-    theta, cost_em.
+    Mutates Params in place: kappa, s_t_nu, s_lambda, theta, cost_em.
     """
     # Refresh the mutable per-intra-EM-iter state on the caller-owned
     # Session (BOLD/grad/boundary_mask + per-iter scratch buffers stay
@@ -152,7 +132,6 @@ def vmf_clustering_batch(
 
     Params["cost_em"] = cost_S
     return VmfBatchResult(
-        Params=Params,
         em_iters=em_iters,
         m_iters_per_em=m_iters_per_em,
         converged=converged,
@@ -168,7 +147,7 @@ def em_body_sparse(
     max_iter_em: int = 100,
     em_convergence_eps: float = 1e-4,
     verbose: bool = True,
-) -> SparseBatchResult:
+) -> VmfBatchResult:
     """The EM body for one intra-EM iteration on the sparse backend.
 
     Same loop as :func:`vmf_clustering_batch`, driven through the §4
@@ -185,12 +164,11 @@ def em_body_sparse(
         m_iters, cost_S = sess.run_iter()
         return m_iters, np.asarray(cost_S, dtype=np.float64)
 
-    cost_S, em_iters, m_iters_per_em, converged = _em_loop(
+    _cost_S, em_iters, m_iters_per_em, converged = _em_loop(
         _step, n_subjects=sess.S, max_iter_em=max_iter_em,
         em_convergence_eps=em_convergence_eps, verbose=verbose,
     )
-    return SparseBatchResult(
-        cost_S=cost_S,
+    return VmfBatchResult(
         em_iters=em_iters,
         m_iters_per_em=m_iters_per_em,
         converged=converged,

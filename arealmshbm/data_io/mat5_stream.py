@@ -65,7 +65,7 @@ from __future__ import annotations
 
 import struct
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 

@@ -42,10 +42,8 @@ Path conventions
 ----------------
 
 Every ``<path>`` is interpreted relative to ``project_dir`` when it's a
-relative path, and as-is when it's an absolute path (POSIX or Windows).
-Absolute paths are used by the step-2 GT builder, which points
-gradient fields at external mode-A per-subject directories instead of
-staging files into the cohort tree.
+relative path, and as-is when it's an absolute path (POSIX or Windows),
+so a hand-built cohort.json may point at files outside the project.
 
 Merge semantics
 ---------------
@@ -91,10 +89,9 @@ class CohortSubject:
 
     ``id`` is a string (the step1 runners coerce subject IDs to str).
     ``sessions`` is the per-subject session list (usually identical
-    across subjects, but the schema allows ragged cohorts for forward
-    compat). Artifact path fields are ``None`` when the corresponding
-    artifact wasn't produced (e.g. ``gradient_lh=None`` on a dMSHBM
-    cohort that doesn't need gradients).
+    across subjects, but the schema allows ragged cohorts). Artifact
+    path fields are ``None`` when the corresponding artifact is not
+    recorded.
     """
     id: str
     sessions: List[str]
@@ -129,8 +126,8 @@ class CohortManifest:
     def num_session(self) -> int:
         """Session count — required to be uniform across subjects.
 
-        Raises if the cohort has ragged session lists (forward-compat
-        possibility that today's callers don't support)."""
+        Raises if the cohort has ragged session lists, which no
+        consumer supports."""
         ts = {len(s.sessions) for s in self.subjects}
         if len(ts) > 1:
             raise ValueError(
@@ -214,9 +211,7 @@ def relpath_or_abs(project_dir: str | Path, path: str | Path) -> str:
     """Encode ``path`` for cohort.json storage.
 
     Paths under ``project_dir`` are stored relative (POSIX separators);
-    paths outside are stored as absolute. The GT builder relies on
-    this — its gradient paths point at external mode-A directories and
-    must round-trip as absolute.
+    paths outside are stored as absolute.
     """
     p = Path(path)
     base = Path(project_dir).resolve()
@@ -243,7 +238,7 @@ def read_cohort(project_dir: str | Path) -> CohortManifest:
     if not p.exists():
         raise FileNotFoundError(
             f"cohort.json not found at {p}. Run step1 to produce it, "
-            f"or build one manually (e.g. for GT cohorts)."
+            f"or build one manually."
         )
     with p.open("r", encoding="utf-8") as f:
         data = json.load(f)
@@ -311,7 +306,7 @@ def write_cohort_partial(
         partial passes ``None``; overwritten when the partial passes a
         non-None value. If the existing manifest has a subject not in
         the new roster, that subject's entry is dropped entirely (it's
-        no longer in the cohort).
+        not in the cohort).
 
     The roster-mismatch case (existing cohort differs from new) drops
     all carry-over artifacts so we don't end up with stale paths from
@@ -439,7 +434,7 @@ def _copy_subject(s: CohortSubject) -> CohortSubject:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Backfill helper — for migrating pre-cohort.json project_dirs
+# Backfill helper — cohort.json from files already on disk
 # ─────────────────────────────────────────────────────────────────────
 def backfill_cohort_json(
     project_dir: str | Path,
@@ -448,8 +443,8 @@ def backfill_cohort_json(
     sessions: Sequence[str | int],
     n_grad_components: int = 100,
 ) -> CohortManifest:
-    """One-shot migration: build ``cohort.json`` from an existing
-    project_dir laid out per the pre-cohort.json convention.
+    """Build ``cohort.json`` for a project_dir whose profile / gradient
+    files already sit at the canonical paths.
 
     Probes canonical paths to populate artifact fields:
 
@@ -460,9 +455,8 @@ def backfill_cohort_json(
     Fields whose probe target doesn't exist are left as ``None``.
     Writes the resulting manifest and returns it.
 
-    Intended for one-time migration of a cohort produced by an older
-    step1 build (or by external means). For a fresh step1 run, the
-    pipeline writes cohort.json itself — no backfill needed.
+    The test fixtures use it to stage a cohort without running step 1;
+    a pipeline run writes cohort.json itself.
     """
     pd = Path(project_dir)
     sub_ids = [str(s) for s in subjects]

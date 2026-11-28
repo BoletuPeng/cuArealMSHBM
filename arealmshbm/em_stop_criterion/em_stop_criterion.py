@@ -131,7 +131,7 @@ class EMStopSession:
                  w: float,
                  c: float,
                  beta: np.ndarray):
-        # Mode A only — S axis dropped throughout. Caller (vmf_clustering
+        # Single subject (S = 1) — no S axis anywhere. Caller (vmf_clustering
         # super-call) materializes (N, T, D) fp32 C-contig once (via
         # ``unpack_normalize_packed_NTD_host``) and shares it with us
         # and ELambdaSession — so this is always a no-op in production.
@@ -196,7 +196,7 @@ class EMStopSession:
                 cost: np.ndarray,
                 iter_em: int,
                 ) -> Tuple[float, int, Optional[np.ndarray], np.ndarray]:
-        """Run the full block. Mode A only — S axis dropped from inputs.
+        """Run the full block. Single subject (S = 1) — no S axis on inputs.
 
         Inputs:
             s_t_nu              : (D, L, T) any float dtype.
@@ -287,8 +287,8 @@ class EMStopSession:
         return np.ascontiguousarray(a, dtype=np.float32)
 
     def _stage_s_t_nu_per_t(self, s_t_nu: np.ndarray) -> np.ndarray:
-        """Permute (D, L, T) -> (T, D, L) C-contig. Mode A only — S axis
-        dropped from the external API.
+        """Permute (D, L, T) -> (T, D, L) C-contig. Single subject (S = 1)
+        — no S axis in the external API.
         """
         a = np.asarray(s_t_nu)
         if a.ndim != 3 or a.shape != (self.D, self.L, self.T):

@@ -9,12 +9,10 @@ density into a (12962, 12962) per-hemi distance matrix that step-0
 subgraph C feeds into the diffusion map.
 
 Public API:
-    gradient_geodesic_distance(verts, vertex_nbors, grad_data)
+    gradient_geodesic_distance(vertex_nbors, grad_data)
         -> (N, N) fp32 in [0, 1]
 
 External shapes:
-    verts        : (N, 3) fp32 — sphere vertex coordinates (used only
-                    for shape consistency / future graph debugging).
     vertex_nbors : (N, max_neigh) int32 1-indexed (``0`` = absent).
     grad_data    : (N,) fp32 — gradient density at each vertex.
     output       : (N, N) fp32 — ``[source, dest]`` (the GPU

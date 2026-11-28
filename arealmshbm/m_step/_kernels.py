@@ -19,7 +19,7 @@ Non-numba pieces of the M-step:
 
 Serial kernels: no ``parallel=True`` / ``prange`` here.
 
-Buffer reference (Mode A, sub-001, fsaverage6, 6 sessions, 300 ROIs):
+Buffer reference (sub-001, fsaverage6, 6 sessions, 300 ROIs):
     N = 81924  D = 1175  L = 300  T = 6.
 
 dtype contract:
@@ -70,8 +70,8 @@ def compute_sigma_psi_DL_f32(sigma_L, s_psi_DL, sigma_psi_DL):
     """sigma_psi[d, l] = sigma[l] * s_psi[d, l].
 
     Mirrors MATLAB ``bsxfun(@times, Params.sigma, Params.s_psi(:, :, s))``.
-    fp32 output (matches MATLAB's bsxfun downcast). Mode A only — single
-    subject, so the (S, D, L) → (D, L) drop is exact.
+    fp32 output (matches MATLAB's bsxfun downcast). Single subject
+    (S = 1), so the (S, D, L) → (D, L) drop is exact.
 
     Inputs:
         sigma_L        : (L,)   fp32 read-only
@@ -90,7 +90,7 @@ def compute_denom_NL_f64(num_session, s_lambda_NL):
     """denom = num_session * sum_{n, l} s_lambda[n, l].
 
     Mirrors MATLAB ``sum(num_session .* sum(sum(s_lambda, 1), 3))`` for
-    Mode A (single subject), which expands to
+    a single subject (S = 1), which expands to
     ``num_session * sum(s_lambda)`` (associativity holds at fp64). fp64
     result so the subsequent ``rbar = kappa_sum / denom`` divide inherits
     double precision; the divide feeds invAd which is fp64.
@@ -123,7 +123,7 @@ def kappa_sum_reduce_TDL_f32(s_t_nu_TDL, X_dot_sl_TDL):
         kappa_update = mtimesx(data.series, permute(s_t_nu, [1,2,4,3]));
         kappa_update = bsxfun(@times, s_lambda, kappa_update);
         kappa_sum    = sum(sum(sum(sum(kappa_update, 1), 4), 3));
-    Mode A (S=1) collapse: the (T, S, D, L) reduction degenerates to
+    Single-subject (S = 1) collapse: the (T, S, D, L) reduction degenerates to
     (T, D, L). Precomputed via the gemm trick (``X_dot_sl`` cached at
     M-step entry) so this kernel just sums the pointwise product.
 
@@ -157,7 +157,7 @@ def fused_lambda_X_normalize_TDL_f32(
     eps_f32,
     flag_T_acc,
 ):
-    """Per-t M-step body — TDL-batch shape (Mode A: S=1 dropped).
+    """Per-t M-step body — TDL-batch shape (single subject, S = 1).
 
     For each (t, l):
         col[d]            = kappa * X_dot_sl[t, d, l] + sigma_psi[d, l]

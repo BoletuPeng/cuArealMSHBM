@@ -16,8 +16,8 @@ CPU implementation's ``+inf`` sentinel.
 Layout
 ------
 Grid : ceil(N * K / 256)   — one thread per (vertex, column) pair
-Block: (256,)              — tuned for fsa6 / K=200; bound by
-                             ``data`` global-memory bandwidth.
+Block: (256,)              — bound by ``data`` global-memory
+                             bandwidth.
 
 Precision / semantics contract vs CPU
 -------------------------------------
@@ -78,45 +78,6 @@ void find_minima_kernel(
 _FIND_MINIMA_KERNEL = cp.RawKernel(_KERNEL_SRC, "find_minima_kernel")
 
 
-def prepare_K_neighbors_for_gpu(K_neighbors: np.ndarray) -> cp.ndarray:
-    """One-shot conversion of the fp64 NaN-padded 1-indexed
-    ``K_neighbors`` table into a ``(N, M-1) int32`` 0-indexed,
-    ``-1``-padded device array suitable for repeated
-    :func:`find_minima_gpu` calls.
-
-    The fsa6 step-0 pipeline calls find_minima ``iter_a=3..4`` times
-    per subject against the SAME ``ti.K_neighbors``; hoist this prep
-    out of the per-iter_a hot loop (see
-    ``arealmshbm.step0_pipeline.pipeline._subgraph_A``) so we pay the
-    NaN→int + H2D once per subject.
-
-    Parameters
-    ----------
-    K_neighbors : (N, M) fp64
-        Per-vertex neighbor table. Column 0 is self (1-indexed cortex
-        ID); columns 1..M-1 hold K-hop neighbor IDs (1-indexed; NaN for
-        absent slots). Same layout as the CPU ``find_minima``'s second
-        arg.
-
-    Returns
-    -------
-    nbors_int_d : (N, M-1) int32 on device
-        Self column dropped; ``-1`` marks absent slots.
-    """
-    # Drop column 0 (self), matching the CPU loop's ``range(1, n_cols)``.
-    # NaN sentinel is replaced with -1 in fp64 BEFORE the int32 cast —
-    # float→int on NaN is implementation-defined at the C level (numpy
-    # typically yields INT_MIN but it's not spec'd). Doing np.where in
-    # float space, then casting, keeps every astype input well-defined.
-    nb_1idx = np.ascontiguousarray(K_neighbors[:, 1:])
-    nan_mask = np.isnan(nb_1idx)
-    nb_int = np.where(nan_mask, -1, nb_1idx - 1).astype(np.int32)
-    # ``np.where(...).astype(...)`` is C-contiguous (numpy default), and
-    # ``cp.asarray`` of a contiguous host array stays contiguous — no
-    # explicit ascontiguousarray wrap needed.
-    return cp.asarray(nb_int)
-
-
 def find_minima_gpu(data: Union[np.ndarray, cp.ndarray],
                     K_neighbors_int_d: cp.ndarray) -> cp.ndarray:
     """GPU twin of :func:`.local_minima.find_minima`.
@@ -128,8 +89,9 @@ def find_minima_gpu(data: Union[np.ndarray, cp.ndarray],
         device cp.ndarray from ``cifti_smoothing_gpu``; ``cp.asarray``
         is then a no-op alias.
     K_neighbors_int_d : (N, M-1) int32 device
-        Output of :func:`prepare_K_neighbors_for_gpu`. Self column
-        dropped; ``-1`` marks absent slots.
+        ``K_neighbors`` converted by
+        :func:`arealmshbm.watershed.prepare_neighbors_for_gpu`. Self
+        column dropped; ``-1`` marks absent slots.
 
     Returns
     -------

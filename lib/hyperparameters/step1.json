@@ -22,7 +22,7 @@
       "min": 0.0,
       "max": 1.0,
       "default": 0.1,
-      "source": "arealmshbm/pipeline/step1_runners.py (run_generate_profiles.threshold)",
+      "source": "arealmshbm/pipeline/config.py (Step1Knobs.threshold)",
       "description": "Top-fraction threshold for FC profile binarization.",
       "notes": "Range [0, 1] is HARD-ENFORCED at parse time (`_validate_step1`); see the section-level `range_policy` exception clause. A value outside this range is meaningless for top-fraction binarization."
     },
@@ -33,7 +33,7 @@
       "max": 100.0,
       "unit": "mm",
       "default": 30.0,
-      "source": "arealmshbm/pipeline/step1_runners.py (run_radius_mask.radius_mm)",
+      "source": "arealmshbm/pipeline/config.py (Step1Knobs.radius_mask_radius_mm)",
       "description": "Spatial radius mask geodesic radius (CBIG canonical=30 mm).",
       "notes": "Directly bounds step3 spatial prior reachability."
     }

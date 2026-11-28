@@ -1,6 +1,6 @@
 """m_step
 
-M-step inner-while loop body of the EM (Mode A, single-subject).
+M-step inner-while loop body of the EM (single subject, S = 1).
 
 Public API:
     MStepSession — caches per-call scratch; takes ``data_series_NTD``
@@ -8,7 +8,7 @@ Public API:
     warmup       — pre-compile every numba kernel in this module.
                    Idempotent; useful before benchmarking.
 
-External shapes (S axis dropped — Mode A always has S=1):
+External shapes (no S axis — one subject, S = 1):
     data_series_NTD : (N, T, D) fp32 — caller-owned, shared by reference
                       across the super-call's ELambda + EMStop + MStep
                       sub-Sessions (single BOLD copy per pipeline).

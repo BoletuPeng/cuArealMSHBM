@@ -54,7 +54,6 @@ def run_subject(sub: str, args) -> Optional[dict]:
         project_dir=project_dir,
         sub_id=sub,
         sess_list=tuple(args.sess_list),
-        save_artifacts=False,
         backend=args.backend,
     )
     timings = {}
@@ -63,7 +62,7 @@ def run_subject(sub: str, args) -> Optional[dict]:
         t0 = time.perf_counter()
         inputs = pipe.load_inputs()
         timings["load_inputs"] = time.perf_counter() - t0
-        result = pipe.run(inputs=inputs, time_stages=True)
+        result = pipe.run(inputs=inputs)
     timings["wall_total"] = time.perf_counter() - t_total
     timings["per_stage"] = result.timings.get("per_stage", {})
     timings["meta"] = {

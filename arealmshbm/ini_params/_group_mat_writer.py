@@ -12,10 +12,7 @@ file (:mod:`arealmshbm.step2_io`'s ``load_group_mtc`` and
 no reason for the caller's critical path to wait on it. Handing the
 write to a background thread removes it from the step-1 wall; the
 caller joins with ``result.writer.wait()``.
-
-The supercalls always write compressed;
-``compress`` stays a parameter of this writer because both settings
-round-trip identically through ``scipy.io.loadmat`` / ``load_group_mtc``.
+The file is always written compressed.
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """
@@ -46,13 +43,12 @@ class IniParamsResult(dict):
     writer: Optional[BackgroundWriteHandle] = None
 
 
-def _savemat_group(out_path: str, payload: dict, compress: bool) -> None:
+def _savemat_group(out_path: str, payload: dict) -> None:
     """``sio.savemat`` with the project's pinned format options."""
-    sio.savemat(out_path, payload, do_compression=compress, format="5")
+    sio.savemat(out_path, payload, do_compression=True, format="5")
 
 
 def write_group_mat(out_dir: str, payload: dict, *,
-                    compress: bool = True,
                     background: bool = False
                     ) -> Optional[BackgroundWriteHandle]:
     """Write ``<out_dir>/group/group.mat``.
@@ -68,11 +64,11 @@ def write_group_mat(out_dir: str, payload: dict, *,
     Path(os.path.dirname(out_path)).mkdir(parents=True, exist_ok=True)
     snapshot = dict(payload)
     if not background:
-        _savemat_group(out_path, snapshot, compress)
+        _savemat_group(out_path, snapshot)
         return None
     return submit_background_write(
         Path(out_path), f"group.mat write to {out_path}",
-        partial(_savemat_group, out_path, snapshot, compress),
+        partial(_savemat_group, out_path, snapshot),
     )
 
 

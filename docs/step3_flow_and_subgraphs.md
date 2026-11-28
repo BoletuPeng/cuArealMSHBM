@@ -159,29 +159,24 @@ mask). Session:
 `check_connectedness/connectedness_gpu.py`.
 
 sub-001 (fsaverage6, T=6, L=300), RTX 5090 Laptop, warm process,
-2026-09-03. The middle column is the dense CuPy EM (`gpu_full`)
-measured alongside:
+2026-09-03:
 
-| | `cpu` | dense GPU EM | `gpu` |
-|---|---:|---:|---:|
-| load_inputs + session_init | 2.09 s | 0.62 s | 0.19 s |
-| EM (3 intra rounds, 10 em_iters, 115 λ-iters) | 23.6 s | 3.07 s | **0.10 s** |
-| per-subject total | 25.7 s | 3.70 s | **0.30 s** |
+| | `cpu` | `gpu` |
+|---|---:|---:|
+| load_inputs + session_init | 2.09 s | 0.19 s |
+| EM (3 intra rounds, 10 em_iters, 115 λ-iters) | 23.6 s | **0.10 s** |
+| per-subject total | 25.7 s | **0.30 s** |
 
 Per-stage EM wall (sub-001, `gpu`, 2026-09-03): m_step 0.028 s ·
 e_step_lambda_loop 0.030 s (115 λ-iters at 0.15 ms + 10 × 1 ms `acc`) ·
 check_connectedness 0.020 s (105 × 0.16 ms) · spatial_connect 0.006 s ·
 spatial_xyz 0.004 s · em_stop 0.001 s. Reference-cohort subjects 1–3 (Mode B
-prior): 0.45–0.61 s/sub vs 2.9–3.1 s on the dense GPU EM; the
-3-subject stage pipeline ran in 1.8 s vs 9.8 s.
+prior): 0.45–0.61 s/sub; the 3-subject stage pipeline ran in 1.8 s.
 
 Numerics: V_lambda is bit-identical to the CPU kernel, the E-step
 softmax agrees to ≤ 1e-15, EM-stop / intra costs agree to 16 digits on
-identical inputs; the bit-sum `acc` / `X·s_lambda` differ from the
-dense GPU EM's fp32 sgemms by ~1e-4 relative on small entries (they are
-*closer* to an fp64 truth than the sgemms). Labels: gpu↔cpu 3 / 35 /
-1334 / 122 vertices on sub-001 / YS 1 / 2 / 3, vs dense-GPU↔cpu 6 / 51 /
-84 / 140 —
+identical inputs. Labels: gpu↔cpu 3 / 35 / 1334 / 122 vertices on
+sub-001 / YS 1 / 2 / 3 —
 the YS-2 outlier is an `intra_em` convergence-ratio flip at the 1e-4
 threshold (2.5e-4 vs 5.2e-5 → one extra outer round). Run-to-run
 bit-reproducible (no float atomics). All three variants (cMSHBM's
@@ -195,65 +190,48 @@ Mode-B end-to-end on the YS cohort (**40 subjects × 6 sessions ×
 fsaverage6 × L=300, gMSHBM**). RTX 5090 Laptop, 24 GB. 2026-05-20.
 Source: internal 40-subject × 6-session cohort run; raw timing log
 archived internally.
-Every GPU number in this section (through § Cohort scaling) is the
-dense CuPy EM (`gpu_full`) of 2026-05-20; current `gpu` walls are in
+This section holds the `cpu` backend's walls; `gpu` walls are in
 § `gpu`.
-
-End-to-end wall on the GPU path: step 0 — 227.41 s ·
-step 1 — 223.85 s · step 2 — 373.94 s · step 3 — **129.35 s** ·
-**total 954.84 s (15.91 min)**. Step 3 is 14 % of the end-to-end
-total — per-subject independent, 40 subjects run sequentially through
-the driver at ~3.23 s/sub.
 
 ### Per-subject wall (3 representative subjects, gMSHBM)
 
-| sub        | CPU wall (s) | GPU wall (s) | GPU EM only (s) | GPU speedup |
-|------------|-------------:|-------------:|----------------:|------------:|
-| sub-001    |   24.73      |    3.33      |    2.38         |    7.4×     |
-| sub-002    |   22.96      |    3.45      |    2.50         |    6.7×     |
-| sub-003    |   23.47      |    3.31      |    2.40         |    7.1×     |
-| **median** | **23.47**    | **3.33**     | **2.40**        | **7.1×**    |
+| sub        | CPU wall (s) |
+|------------|-------------:|
+| sub-001    |   24.73      |
+| sub-002    |   22.96      |
+| sub-003    |   23.47      |
+| **median** | **23.47**    |
 
-Setup wall (`load_total` + `session_init`) is ~3.7 s on CPU /
-~0.9 s on GPU per subject; the bulk of CPU's overhead is fp32 weight
-matrix construction + numba JIT warmup on the first subject. The EM
-body wall is the meaningful comparison.
+Setup wall (`load_total` + `session_init`) is ~3.7 s on CPU per
+subject; the bulk of it is fp32 weight matrix construction + numba JIT
+warmup on the first subject.
 
 ### Per-EM-stage breakdown (median across 3 subjects)
 
-| EM stage              | CPU (s) | GPU (s) | GPU speedup |
-|-----------------------|--------:|--------:|------------:|
-| `m_step`              |   3.24  |   0.24  |   13.5×     |
-| `spatial_connect_prior` |  0.31  |   0.04  |    7.8×     |
-| `e_step_lambda_loop`  |   9.69  |   1.05  |    9.2×     |
-| `check_connectedness` |   3.43  |   0.31  |   11.1×     |
-| `spatial_xyz_prior`   |   1.23  |   0.21  |    5.9×     |
-| `em_stop_criterion`   |   2.57  |   0.05  |   51.4×     |
-| **EM total**          | **20.47** | **1.90** | **10.8×** |
+| EM stage              | CPU (s) |
+|-----------------------|--------:|
+| `m_step`              |   3.24  |
+| `spatial_connect_prior` |  0.31  |
+| `e_step_lambda_loop`  |   9.69  |
+| `check_connectedness` |   3.43  |
+| `spatial_xyz_prior`   |   1.23  |
+| `em_stop_criterion`   |   2.57  |
+| **EM total**          | **20.47** |
 
 `e_step_lambda_loop` is the dominant EM stage on CPU (~half the EM
-wall: numba kernels + a numpy sgemm on `X @ s_t_nu`). The GPU column
-is the dense CuPy EM measured on that date, whose E-step used a fused
-kernel + cuBLAS sgemm and whose M-step used cuBLAS + RawKernels; the
-`gpu` backend (§ `gpu`) has no BLAS call — `X @ s_t_nu` (`acc_bits`)
-and `Xᵀ·s_lambda` (`x_dot_sl_bits`) are bit-sum RawKernels over the
-packed profiles. `em_stop_criterion`'s 51× isolated speedup is real
-(fp64 cost-reduction sums + Cdln vectorise well on GPU) but it runs
-only once per EM iter, so its share of total is small.
+wall: numba kernels + a numpy sgemm on `X @ s_t_nu`). The `gpu`
+backend (§ `gpu`) has no BLAS call — `X @ s_t_nu` (`acc_bits`) and
+`Xᵀ·s_lambda` (`x_dot_sl_bits`) are bit-sum RawKernels over the
+packed profiles.
 
 Iteration counts at convergence on these subjects:
 `iter_intra_em = 2–3`, `iter_count_em_total = 8–9`,
-`iter_count_lambda_total ≈ 101`, `iter_count_m_total = 32–127` (CPU)
-or `34–75` (GPU; the M-step inner loop convergence test diverges
-slightly between backends — see precision contract notes upstream).
+`iter_count_lambda_total ≈ 101`, `iter_count_m_total = 32–127`.
 
 ### Cohort scaling
 
-End-to-end step 3 wall on GPU is **129.35 s for S=40** (~3.23 s/sub),
-matching the per-subject profile median (3.33 s) within 4 %. The
-extra 0.13 s/sub in the e2e run is `Step3Pipeline` construct/teardown
-+ `.mat` write per subject. Extrapolating from the median CPU
-per-subject wall: 40 × 23.47 ≈ **939 s (~15.6 min) if step 3 ran CPU**.
+Extrapolating from the median CPU per-subject wall:
+40 × 23.47 ≈ **939 s (~15.6 min) if step 3 ran CPU**.
 
 ### Pipeline-parallel by phase (GPU, K ≥ 2)
 
@@ -274,8 +252,7 @@ cutting ~79 ms off each subject's `load_step3_sparse_inputs`
 Steady-state per-subject wall becomes `max(t_LOAD, t_EM, t_SAVE)`
 instead of the sum. Reference-cohort subjects 1–3 on `gpu` (2026-09-03): the
 3-subject stage pipeline ran in 1.8 s against 0.45–0.61 s/sub serial
-(§ `gpu`). On the dense GPU EM (2026-05, 3-subject Mode A smoke,
-gMSHBM) it delivered 2.86 s/sub against a 3.33 s/sub serial baseline.
+(§ `gpu`).
 
 Memory budget: queues are capped at 2 in-flight; the structural bound
 is 7 subjects holding device buffers (1 LOAD + 2 queued + 1 EM + 2

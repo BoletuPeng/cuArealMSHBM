@@ -10,20 +10,7 @@ w > 0 (`w·log θ` is NaN outside supp(θ) at w = 0).
 
 ## 0. Why
 
-Measured 2026-09-03 on sub-001 (fsaverage6, T=6, L=300, D=1175) on the
-dense CuPy EM (`gpu_full`, every (N, L) buffer dense, fp32 BOLD):
-
-| stage | wall | calls | per call |
-|---|---:|---:|---:|
-| e_step_lambda_loop | 2.18 s | 115 λ-iters | 19 ms |
-| m_step | 0.50 s | 90 iter_m | 5.5 ms |
-| check_connectedness (CPU) | 0.46 s | 108 | 4.3 ms |
-| spatial_xyz_prior | 0.41 s | 108 | 3.8 ms |
-| em_stop + connect | 0.19 s | 10 | — |
-| **EM total** | **4.0–4.3 s** | | |
-| load_inputs + session_init | 1.43 s | | |
-
-Structure: `N=81924, L=300`, active rows `M=74947`, `P = nnz(θ) = 251 502`
+Structure (sub-001: fsaverage6, T=6, L=300, D=1175): `N=81924, L=300`, active rows `M=74947`, `P = nnz(θ) = 251 502`
 (≤ 9 per row), `nnz(boundary_mask) = 586 522`. `supp(s_lambda) ⊆ supp(θ)`
 holds for the whole EM (proof in `sparse_layout.py`), so every (N, L)
 buffer is 99 % zeros. BOLD is binary (bit density ≈ 9.5 %), so
@@ -204,23 +191,14 @@ which its pairwise summation starts blocking.
 * Determinism: two `gpu` runs must be `np.array_equal` on labels
   and on `s_lambda`.
 
-The ground-truth records below are dated; arms named `gpu_full` are the
-dense CuPy EM measured alongside `gpu` on the same inputs. Pooled over
-cohorts the two are fidelity-equivalent, not uniformly ordered (of the
-cells below, the dense arm is ahead on cMSHBM YS and on the Mode-B
-prior).
+The ground-truth records below are dated.
 
 * Cohort ground truth: on an internal 10-subject cohort, `gpu`
   labels agree with the stock-MATLAB reference (produced by an
   internal MATLAB-alignment oracle) at **gMSHBM 95.19 %** and
-  **dMSHBM 99.988 %** cortex-only (measured 2026-09-04 on this tree,
-  GPU step 0/1). Same run, `gpu_full`: 95.12 % / 99.984 %; clean
-  8cb68a0 `gpu_full`: 95.13 % / 99.984 %. Label delta `gpu` vs
-  `gpu_full`: dMSHBM 50 vertices over 10 subjects; gMSHBM 3 115, of
-  which 2 074 sit in the one subject that also dominates the step-0
-  GPU run-to-run band (2 297 of 2 614 between two clean-HEAD runs).
-  On a Mode-B prior trained by step-2 `gpu`, the GT agreement
-  is 74.90 % vs 74.92 % for `gpu_full` on the same prior.
+  **dMSHBM 99.988 %** cortex-only (measured 2026-09-04,
+  GPU step 0/1). On a Mode-B prior trained by step-2 `gpu`, the GT
+  agreement is 74.90 %.
   `lib/hyperparameters/step3.json` points here for it.
 * cMSHBM (2026-09-20, the device `remove_isolated` pre-predicate; same
   step-0/1 caches for every arm, scored by the internal cohort-comparison
@@ -228,26 +206,25 @@ prior).
   cohorts; stock cMSHBM itself crashes
   on 3 of the 30 subjects, so those cells are 9 / 8): cortex agreement
   `gpu` **99.35 / 98.42 / 98.13 %** (YS / ds004466 / ds000221) vs
-  `gpu_full` 99.42 / 98.26 / 98.08 % and `cpu` 99.25 / 98.28 / 98.17 %.
+  `cpu` 99.25 / 98.28 / 98.17 %.
   Label delta `gpu` vs `cpu`: 2 093 / 3 820 / 4 542 vertices over
-  the 10 subjects (`gpu_full` vs `cpu` on the same inputs: 2 264 / 2 309 /
-  5 079); `gpu` vs `gpu_full`: 1 883 / 3 155 / 1 584. Sub-001 of
-  YS and ds004466 is identical on all three backends. The device
+  the 10 subjects. Sub-001 of
+  YS and ds004466 is identical on both backends. The device
   pre-pass itself is bit-identical to the host function
   (`check_connectedness/tests/test_connectedness_gpu.py`, 4 thresholds on
   grids + 9 sub-001 label fields with up to 1 643 relabelled vertices).
 
 ## 4. Results (sub-001, RTX 5090 Laptop; 2026-09-03 unless dated)
 
-| | dense GPU EM (`gpu_full`) | `gpu` |
-|---|---:|---:|
-| load_inputs | 0.57 s | 0.16–0.20 s (streaming MAT parse via `data_io/mat5_stream.py`, θ→CSR, no dense mask, no BOLD transpose) |
-| session_init (warm) | 0.86 s | 0.02–0.04 s |
-| EM | 4.0 s | 0.10 s |
-| λ-iteration | 19 ms | 0.15 ms |
-| check_connectedness | 4.3 ms | 0.16 ms |
-| check_connectedness, cMSHBM (with the `remove_isolated` pre-pass; 2026-09-24) | 18-27 ms (host pre-pass 14-23 ms) | 0.27 ms (pre-pass 0.12 ms at 400-1 600 small components) |
-| M-step call (incl. X·s_λ; mean per `MStepGPU.run` over a full EM run; 2026-09-03, staged `x_dot_sl_bits`) | 50 ms | 2.5 ms |
+| | `gpu` |
+|---|---:|
+| load_inputs | 0.16–0.20 s (streaming MAT parse via `data_io/mat5_stream.py`, θ→CSR, no dense mask, no BOLD transpose) |
+| session_init (warm) | 0.02–0.04 s |
+| EM | 0.10 s |
+| λ-iteration | 0.15 ms |
+| check_connectedness | 0.16 ms |
+| check_connectedness, cMSHBM (with the `remove_isolated` pre-pass; 2026-09-24) | 0.27 ms (pre-pass 0.12 ms at 400-1 600 small components) |
+| M-step call (incl. X·s_λ; mean per `MStepGPU.run` over a full EM run; 2026-09-03, staged `x_dot_sl_bits`) | 2.5 ms |
 
 `x_dot_sl_bits` (2026-09-20): the kernel text is the one shared with step 2
 (`m_step/_xdot_kernel.py` — member bytes are read straight from global memory

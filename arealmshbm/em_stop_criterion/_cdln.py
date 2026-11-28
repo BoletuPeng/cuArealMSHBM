@@ -22,7 +22,7 @@ from __future__ import annotations
 import math
 
 import numpy as np
-from numba import njit, float64, int64, void
+from numba import njit, float64, void
 
 
 _LOG_2PI = 1.8378770664093454835606594728112

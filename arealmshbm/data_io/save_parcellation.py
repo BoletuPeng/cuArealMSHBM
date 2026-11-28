@@ -1,15 +1,15 @@
 """save_parcellation.py
 
-Step-3 output writer. Builds ``lh_labels`` / ``rh_labels`` from the
-converged ``Params.s_lambda`` (argmax over parcels at active vertices)
-and saves to
+Step-3 output writer. ``lh_labels`` / ``rh_labels`` are the argmax of
+the converged ``Params.s_lambda`` over parcels at active vertices; they
+are saved to
 ``Ind_parcellation_MSHBM_sub<id>_w<W>_MRF<C>_beta<B>.mat`` in MATLAB
 v7 format so the existing comparison tools and the MATLAB reference
 pipeline can read it.
 
 Public API:
     derive_labels     — argmax(s_lambda) → (lh_labels, rh_labels).
-    save_parcellation — derive labels and write the .mat artifact.
+    save_parcellation — write the labels as the .mat artifact.
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """
@@ -60,7 +60,7 @@ def derive_labels(s_lambda: np.ndarray,
     return labels[:n_lh], labels[n_lh:]
 
 
-def _fmt_num(x: float | int | str) -> str:
+def fmt_num(x: float | int | str) -> str:
     """MATLAB ``num2str`` semantics for filename interpolation: integers
     render as bare digits (``100`` -> ``"100"``); non-integers keep their
     significant digits (``0.5`` -> ``"0.5"``); strings pass through
@@ -74,24 +74,22 @@ def _fmt_num(x: float | int | str) -> str:
     return f"{float(x):g}"
 
 
-def save_parcellation(s_lambda: np.ndarray,
+def save_parcellation(lh_labels: np.ndarray,
+                      rh_labels: np.ndarray,
                       out_dir: str | Path,
                       subid: str | int,
                       w: float,
                       c: float,
                       beta: float | str | None = None,
-                      n_lh: int | None = None,
                       out_path: str | Path | None = None,
-                      lh_labels_override: np.ndarray | None = None,
-                      rh_labels_override: np.ndarray | None = None,
                       ) -> Path:
     """Write the standard CBIG ``Ind_parcellation_*.mat`` artifact.
 
     Parameters
     ----------
-    s_lambda : (N, L) — converged soft posterior. Used to derive
-               ``lh_labels`` / ``rh_labels`` via :func:`derive_labels`,
-               unless explicit override arrays are provided.
+    lh_labels, rh_labels : per-hemisphere labels to write — the
+               :func:`derive_labels` argmax of the converged ``s_lambda``
+               (cMSHBM: after :func:`remove_isolated_surface_components`).
     out_dir  : target directory; created if missing. Ignored when
                ``out_path`` is given.
     subid    : subject id (string or int) — interpolated into filename.
@@ -102,7 +100,6 @@ def save_parcellation(s_lambda: np.ndarray,
                  ``_beta`` suffix). Each may be int / float / pre-
                  stringified; non-integers are preserved (no truncation).
                  MATLAB ``num2str`` semantics.
-    n_lh     : optional LH vertex count, forwarded to :func:`derive_labels`.
     out_path : optional full destination path. When provided, ``out_dir``
                and ``w/c/beta`` are NOT used to build a filename — the
                file is written exactly to this path (parents created on
@@ -112,15 +109,6 @@ def save_parcellation(s_lambda: np.ndarray,
                IDENTICAL on-disk content; consolidating here keeps the
                two destinations bit-equal if the .mat schema ever
                changes.
-    lh_labels_override / rh_labels_override : if both are provided,
-               skip the :func:`derive_labels` call on ``s_lambda`` and
-               write these directly. cMSHBM must use it (its labels
-               undergo :func:`remove_isolated_surface_components`
-               post-processing AFTER argmax), and so must the step-3
-               ``gpu`` backend (its ``s_lambda`` aliases a reusable
-               pinned host buffer). Every other variant / backend also
-               passes it, to skip a redundant second (N, L) argmax over
-               the same ``s_lambda``.
 
     Returns
     -------
@@ -128,11 +116,8 @@ def save_parcellation(s_lambda: np.ndarray,
     """
     from scipy.io import savemat
 
-    if lh_labels_override is not None and rh_labels_override is not None:
-        lh_labels = np.ascontiguousarray(lh_labels_override).ravel()
-        rh_labels = np.ascontiguousarray(rh_labels_override).ravel()
-    else:
-        lh_labels, rh_labels = derive_labels(s_lambda, n_lh=n_lh)
+    lh_labels = np.ascontiguousarray(lh_labels).ravel()
+    rh_labels = np.ascontiguousarray(rh_labels).ravel()
 
     if out_path is None:
         out_dir = Path(out_dir)
@@ -140,12 +125,12 @@ def save_parcellation(s_lambda: np.ndarray,
         if beta is None:
             fname = (
                 f"Ind_parcellation_MSHBM_sub{subid}"
-                f"_w{_fmt_num(w)}_MRF{_fmt_num(c)}.mat"
+                f"_w{fmt_num(w)}_MRF{fmt_num(c)}.mat"
             )
         else:
             fname = (
                 f"Ind_parcellation_MSHBM_sub{subid}"
-                f"_w{_fmt_num(w)}_MRF{_fmt_num(c)}_beta{_fmt_num(beta)}.mat"
+                f"_w{fmt_num(w)}_MRF{fmt_num(c)}_beta{fmt_num(beta)}.mat"
             )
         out_path = out_dir / fname
     else:

@@ -108,9 +108,9 @@ from numba import njit
 # about top-level orchestration.
 #
 # Five kernels are on the parallel-dispatch path:
-#   * Phase 1 (cc + count, slow path only):
+#   * compute_components_general:
 #         cc_from_edges, count_per_parcel
-#   * Phase 2 (always-on):
+#   * component_distance:
 #         zero_singles_lh, zero_singles_and_reindex_rh, fused_hemi_distance
 @njit(cache=True, nogil=True, fastmath=False)
 def cc_from_edges(src, dst, labels, parent, rank, comp_map, ci, n_comp_out):

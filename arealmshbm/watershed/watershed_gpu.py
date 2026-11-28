@@ -37,15 +37,16 @@ import cupy as cp
 
 
 def prepare_neighbors_for_gpu(neighbors: np.ndarray) -> cp.ndarray:
-    """One-time conversion of the (N, R+1) fp64 1-indexed-with-NaN-pad
-    neighbor table into a (N, R) int32 0-indexed-with-(-1)-pad device
-    array suitable for repeated calls to
-    :func:`watershed_edge_count_gpu`.
+    """One-time conversion of an (N, R+1) fp64 1-indexed-with-NaN-pad
+    neighbor table (column 0 = self) into an (N, R) int32
+    0-indexed-with-(-1)-pad device array, self column dropped.
 
-    The fsa6 step-0 pipeline calls watershed ``iter_a=3..4`` times per
-    subject against the SAME ``ti.neighbors_table``; lifting this
-    preprocessing out of the per-iter_a call hides ~3 ms/sub of host
-    work (the np.isnan + astype(int32) chain).
+    Serves both device neighbor tables of step-0 subgraph A: the ring-1
+    ``ti.neighbors_table`` for :func:`watershed_edge_count_gpu` and the
+    K-hop ``ti.K_neighbors`` for
+    :func:`arealmshbm.local_minima.local_minima_gpu.find_minima_gpu`.
+    The pipeline calls both leaves ``iter_a`` times per subject against
+    the SAME tables, so it converts each once per subject.
     """
     # NaN sentinel is replaced with -1 in fp64 BEFORE the int32 cast —
     # float→int on NaN is implementation-defined at the C level (numpy
@@ -60,11 +61,10 @@ def prepare_neighbors_for_gpu(neighbors: np.ndarray) -> cp.ndarray:
 def watershed_edge_count_gpu(
         edge_metrics: Union[np.ndarray, cp.ndarray],
         minima: Union[np.ndarray, cp.ndarray],
-        neighbors: np.ndarray,
         stepnum: int,
         fracmaxh: float,
         *,
-        neighbors_int_d: cp.ndarray = None) -> np.ndarray:
+        neighbors_int_d: cp.ndarray) -> np.ndarray:
     """Device-side fused watershed + edge-count.
 
     Runs the same threshold-sweep watershed kernel as the CPU
@@ -86,14 +86,11 @@ def watershed_edge_count_gpu(
     ----------
     edge_metrics : (N, K) fp32 host or device
     minima : (N, K) bool host or device
-    neighbors : (N, R+1) fp64 numpy
-        Used only if ``neighbors_int_d`` is None.
     stepnum : int
     fracmaxh : float
-    neighbors_int_d : (N, R) int32 cupy.ndarray, optional
+    neighbors_int_d : (N, R) int32 cupy.ndarray
         Pre-converted neighbor table from
-        :func:`prepare_neighbors_for_gpu`. If given, skips the per-call
-        host preprocessing of ``neighbors``.
+        :func:`prepare_neighbors_for_gpu`.
 
     Returns
     -------
@@ -113,14 +110,10 @@ def watershed_edge_count_gpu(
     # opaquely inside the kernel call.
     assert minima.dtype == np.bool_, (
         f"minima must be bool; got {minima.dtype}")
-    N, _K = int(edge_metrics.shape[0]), int(edge_metrics.shape[1])
+    N = int(edge_metrics.shape[0])
 
-    if neighbors_int_d is None:
-        assert neighbors is not None and neighbors.shape[0] == N
-        nb_d = prepare_neighbors_for_gpu(neighbors)
-    else:
-        assert neighbors_int_d.shape[0] == N
-        nb_d = neighbors_int_d
+    assert neighbors_int_d.shape[0] == N
+    nb_d = neighbors_int_d
 
     # H2D (if host) + transpose. cp.asarray with explicit dtype is the
     # alias-friendly path: a device fp32 input becomes a no-op alias;

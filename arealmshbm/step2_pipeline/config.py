@@ -171,7 +171,7 @@ class Step2Config:
         if self.num_clusters <= 0:
             raise ValueError(f"Step2Config: num_clusters must be positive (got {self.num_clusters})")
         if self.mode == "gMSHBM" and self.beta_scalar is None:
-            raise ValueError(f"Step2Config: beta_scalar required for gMSHBM")
+            raise ValueError("Step2Config: beta_scalar required for gMSHBM")
         if self.backend not in _VALID_BACKENDS:
             raise ValueError(
                 f"Step2Config: backend must be one of {sorted(_VALID_BACKENDS)} "

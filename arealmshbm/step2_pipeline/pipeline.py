@@ -54,7 +54,7 @@ import numpy as np
 
 from arealmshbm.pipeline._progress import COHORT_SUB_ID, ProgressEmitter
 
-from arealmshbm.data_io.cohort import read_cohort, resolve_path
+from arealmshbm.data_io.cohort import read_cohort
 from arealmshbm.data_io.load_avg_mesh import load_avg_mesh
 from arealmshbm.data_io.load_spatial_mask import load_spatial_mask
 from arealmshbm.initialize_concentration import initialize_concentration
@@ -67,13 +67,13 @@ from arealmshbm.step2_init import (
     build_step2_boundary_mask,
     compose_init_state,
 )
-# ``step2_em_outer`` and ``step2_em_iter_master`` are imported LAZILY,
-# inside the CPU path's ``run_em`` — importing ``step2_em_outer``
-# eagerly costs ~0.2 s of numba work at import time
-# (``em_stop_criterion._cdln`` declares explicit ``float64(...)``
-# signatures, so its @njit kernels compile/cache-load at import rather
-# than at first call), and the ``gpu`` backend never calls a single one
-# of them — L16/L17/L18 and both resets run on-device there.
+# ``step2_em_outer`` is imported inside the CPU path's ``run_em`` and
+# ``step2_em_iter_master`` inside each backend's EM stage: the ``gpu``
+# backend never calls a ``step2_em_outer`` leaf (L16/L17/L18 and both
+# resets run on-device there). Importing ``step2_em_iter_master`` (which
+# either backend does) loads its numba master, and with it
+# ``em_stop_criterion._cdln``, whose explicit ``float64(...)`` signatures
+# compile/cache-load at import time.
 # Note: ``reset_s_t_nu_from_mtc_STLD`` is not called directly here at all —
 # the CPU Session wraps it as ``reset_s_t_nu_from_mtc()``.
 from .config import Step2Config
@@ -97,10 +97,7 @@ class Step2Inputs:
     slab (2.31 GB BOLD + ~200 MB grad at fsa6/T=6) independent of S.
     """
     # Mesh
-    lh_mars: np.ndarray            # (N_lh,) bool — 1 for medial wall
-    rh_mars: np.ndarray            # (N_rh,) bool
     n_lh: int
-    n_rh: int
 
     # Per-subject loaders.
     bold_loader: SubjectProfileLoader
@@ -194,10 +191,7 @@ class Step2Pipeline:
         # reuse by default; nvidia-smi shows the peak even after the
         # Pipeline goes out of scope). CPU backend: import is skipped.
         if self.cfg.backend == "gpu":
-            try:
-                import cupy as cp  # type: ignore[import-not-found]
-            except ImportError:
-                return
+            import cupy as cp  # type: ignore[import-not-found]
             cp.get_default_memory_pool().free_all_blocks()
             cp.get_default_pinned_memory_pool().free_all_blocks()
 
@@ -322,7 +316,7 @@ class Step2Pipeline:
             cfg.project_dir / "spatial_mask" / "spatial_mask.mat"
         )
         boundary_mask = build_step2_boundary_mask(
-            lh_boundary=lh_b, rh_boundary=rh_b, mode=cfg.mode,
+            lh_boundary=lh_b, rh_boundary=rh_b,
         )
         t_boundary = time.perf_counter() - t_boundary
 
@@ -342,7 +336,7 @@ class Step2Pipeline:
         )
 
         return Step2Inputs(
-            lh_mars=lh_mars, rh_mars=rh_mars, n_lh=n_lh, n_rh=n_rh,
+            n_lh=n_lh,
             bold_loader=bold_loader, grad_loader=grad_loader,
             N=N_peeked, T=T_peeked, D=D_peeked, D_grad=D_grad,
             mtc=mtc, dim=dim,
@@ -357,7 +351,6 @@ class Step2Pipeline:
         S = cfg.num_sub
         L = cfg.num_clusters
         T = cfg.num_session
-        N = inputs.boundary_mask.shape[0]
 
         ini_val = float(initialize_concentration(dim))
         self._log(f"  ini_val (vMF init concentration) = {ini_val:.2f}")
@@ -408,10 +401,8 @@ class Step2Pipeline:
         # CPU path only. The 'gpu' backend runs ``_run_em_sparse``
         # instead — see :meth:`run`.
         #
-        # Lazy leaf imports: keeping them here (rather than at module
-        # scope) is what makes a GPU-backend process skip the ~0.2 s
-        # eager-numba ``em_stop_criterion._cdln`` import chain that
-        # ``step2_em_outer`` drags in.
+        # Leaf imports kept here: a GPU-backend process never imports
+        # ``step2_em_outer``.
         from arealmshbm.step2_em_outer import (
             intra_subject_var_loop,
             inter_subject_var,
@@ -422,8 +413,6 @@ class Step2Pipeline:
         cfg = self.cfg
         dim = inputs.dim
         L = cfg.num_clusters
-        S = cfg.num_sub
-        T = cfg.num_session
 
         stop_inter = False
         cost_inter = 0.0
@@ -671,7 +660,6 @@ class Step2Pipeline:
         host-side is the scalar ``ini_val`` and the bookkeeping keys the
         outer loop and the save path read (``iter_inter``, ``Record``).
         """
-        cfg = self.cfg
         t0 = time.perf_counter()
         ini_val = float(initialize_concentration(inputs.dim))
         self._log(f"  ini_val (vMF init concentration) = {ini_val:.2f}")
@@ -795,7 +783,6 @@ class Step2Pipeline:
                 )
                 em_wall_accum += (time.perf_counter() - t_em)
                 em_iters_total += int(batch.em_iters)
-                Params["cost_em"] = batch.cost_S
 
                 # L17 (intra_subject_var_loop) + L16 (intra_em_cost_step2),
                 # both on device, one host scalar out.
@@ -858,14 +845,12 @@ class Step2Pipeline:
         self._save_params(Params_save, final_path)
         self.timings["save"] = time.perf_counter() - t_save
 
-        sess_timings = getattr(sess, "timings", None)
-        if sess_timings:
-            # Forwarded VERBATIM under ``session.<name>``: four host
-            # wall entries in SECONDS (``session_ctor``,
-            # ``initialize_state``, ``intra_closure``, ``inter_closure``),
-            # each cumulative over every call in the run.
-            for k, v in sess_timings.items():
-                self.timings[f"session.{k}"] = float(v)
+        # Forwarded VERBATIM under ``session.<name>``: four host
+        # wall entries in SECONDS (``session_ctor``,
+        # ``initialize_state``, ``intra_closure``, ``inter_closure``),
+        # each cumulative over every call in the run.
+        for k, v in sess.timings.items():
+            self.timings[f"session.{k}"] = float(v)
 
         return Step2Result(
             Params_final_path=final_path,

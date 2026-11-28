@@ -6,7 +6,7 @@ Covers:
     schema (plan / state / iter).
   - Concurrent emits from multiple threads never interleave mid-line
     (Lock serialises the file append).
-  - ``enabled=False`` is a true no-op — no file is created.
+  - ``ProgressEmitter.disabled()`` is a true no-op — no file is created.
   - A broken sink (read-only logs dir) doesn't propagate exceptions
     into the caller — the stage thread must never crash on a sink
     failure.
@@ -84,7 +84,7 @@ def test_emit_plan_truncates_stale_file(tmp_path: Path) -> None:
     previous run's ``done``/``failed`` records as if they belonged to
     the current run.
 
-    The reviewer concern (P2 #1): without truncate, append-mode
+    Without truncate, append-mode
     preservation + reused ``(step, sub_id)`` keys would let stale
     rows render subjects as complete before this run reaches them.
     """
@@ -221,19 +221,20 @@ def test_concurrent_emit_does_not_interleave(tmp_path: Path) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# enabled=False — true no-op
+# disabled() — true no-op
 # ─────────────────────────────────────────────────────────────────────
-def test_disabled_emitter_creates_no_file(tmp_path: Path) -> None:
-    logs_dir = tmp_path / "logs_should_not_exist"
-    em = ProgressEmitter(logs_dir, enabled=False)
+def test_disabled_emitter_creates_no_file(tmp_path: Path,
+                                          monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    em = ProgressEmitter.disabled()
     em.emit_plan([{"step": "step0", "sub_id": "1"}])
     em.emit_state("step0", "1", "running")
     em.emit_iter("step2", iter_inter=1, max_inter=10)
     em.close()
 
-    # The logs dir itself must not be created — the disabled emitter
-    # is a true no-op, including no mkdir.
-    assert not logs_dir.exists()
+    # Nothing may be created — the disabled emitter is a true no-op,
+    # including no mkdir.
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_disabled_classmethod_attribute_parity(tmp_path: Path) -> None:
@@ -243,14 +244,10 @@ def test_disabled_classmethod_attribute_parity(tmp_path: Path) -> None:
     silently missing on disabled instances, and the first method to
     read it would ``AttributeError``. This parity test pins the
     invariant — every attribute set by ``__init__`` must also be set
-    by ``disabled()``.
-
-    Reviewer note: this is the "fragile factory" risk flagged on PR
-    #66 R2. The alternative (calling ``cls("", enabled=False)``)
-    would not need this test, but loses the ``_logs_dir=None``
-    defence-in-depth (an accidental ``_write`` on a disabled emitter
-    would silently scribble to ``./progress.jsonl`` instead of
-    exploding).
+    by ``disabled()``. The ``__new__`` route keeps the
+    ``_logs_dir=None`` defence-in-depth: an accidental ``_write`` on a
+    disabled emitter explodes instead of scribbling to
+    ``./progress.jsonl``.
     """
     real_attrs = set(ProgressEmitter(tmp_path).__dict__.keys())
     disabled_attrs = set(ProgressEmitter.disabled().__dict__.keys())
@@ -258,10 +255,7 @@ def test_disabled_classmethod_attribute_parity(tmp_path: Path) -> None:
     assert not missing, (
         f"ProgressEmitter.disabled() is missing attributes that "
         f"__init__ sets: {sorted(missing)}. Update the classmethod "
-        f"to assign each new attribute, or switch the factory to "
-        f"``cls(<path>, enabled=False)`` (and remove the "
-        f"``_logs_dir=None`` defence). Either way, keep this test "
-        f"green."
+        f"to assign each new attribute."
     )
 
 
@@ -429,8 +423,6 @@ def test_emit_plan_rejects_non_json_meta(tmp_path: Path) -> None:
     should raise ValueError on the driver thread, NOT be swallowed
     by ``_write``'s broad except clause (which would leave the file
     truncated-but-empty and the frontend with no plan to render).
-
-    Reviewer P1 #1 contract pin.
     """
     em = ProgressEmitter(tmp_path)
     # Path objects are NOT json.dumps-able by default.
@@ -446,7 +438,7 @@ def test_emit_plan_rejects_non_json_meta(tmp_path: Path) -> None:
 
 
 def test_emit_plan_rejects_non_json_entries(tmp_path: Path) -> None:
-    """Symmetric with meta validation (R3-I4): direct callers
+    """Symmetric with meta validation: direct callers
     bypassing ``build_plan_entries`` could hand emit_plan a list with
     non-JSON values (e.g. ``Path`` for sub_id, or a raw
     ``BoldInputSubject`` dataclass). The validation runs eagerly so
@@ -499,8 +491,7 @@ def test_emit_plan_rejects_non_json_meta_preserves_prior_file(
 # ─────────────────────────────────────────────────────────────────────
 # Structural pins — each stage pipeline + driver must contain the
 # expected emit_state / emit_plan calls. Brittle against renames but
-# cheap, and catches outright removal that no unit test would notice
-# (reviewer R1-P2-4 / R2 future-friendliness).
+# cheap, and catches outright removal that no unit test would notice.
 # ─────────────────────────────────────────────────────────────────────
 def _read_module_source(module_relpath: str) -> str:
     """Read a project-relative module source as text. Used by the
@@ -514,7 +505,7 @@ def test_driver_contains_plan_emit() -> None:
     A copy-paste refactor removing the call would leave the frontend
     blind to the slot roster.
 
-    Also pins R3-I1: the ``current_phase = "emit_plan"`` sentinel
+    Also pins the ``current_phase = "emit_plan"`` sentinel, which
     sits next to the call, proving emit_plan lives INSIDE the try
     block (so the finally that writes the run log + closes the
     progress sink still runs if emit_plan raises ValueError on a
@@ -534,13 +525,12 @@ def test_driver_contains_plan_emit() -> None:
     assert phase_idx != -1, (
         "Pipeline.run lost its ``current_phase = \"emit_plan\"`` "
         "sentinel — the emit_plan call should sit inside the try "
-        "block so its ValueError doesn't bypass the run-log write "
-        "(R3-I1)."
+        "block so its ValueError doesn't bypass the run-log write."
     )
     assert phase_idx < emit_idx, (
         "``current_phase = \"emit_plan\"`` must precede the emit_plan "
         "call so failed_at_step is correctly labelled on a "
-        "meta-validation failure (R3-I1)."
+        "meta-validation failure."
     )
 
 
@@ -572,7 +562,7 @@ def test_step1_stage_pipeline_emits_running_and_terminal() -> None:
 
 
 def test_step1_stage_pipeline_pops_buffer_on_failure() -> None:
-    """Reviewer R3-P3: when a per-session failure arrives for a sub
+    """When a per-session failure arrives for a sub
     that already has a partial bucket in ``buffers``, the bucket
     must be popped so its bitpacked slabs (~4 MB per session on
     fsa6 K=400, unbounded across failures in one run) become
@@ -582,17 +572,16 @@ def test_step1_stage_pipeline_pops_buffer_on_failure() -> None:
     # branch and the assembly-exception branch.
     assert src.count("buffers.pop(work.sub_id, None)") >= 2, (
         "step1 _stage_ASSEM lost one of its buffer.pop calls — the "
-        "failure path now leaks the partial slab bucket (R3-P3)"
+        "failure path leaks the partial slab bucket"
     )
 
 
 def test_step1_stage_pipeline_suppresses_failed_then_done() -> None:
-    """Reviewer R1-P2-3: a pre-existing buffer-logic edge case
-    means a per-session failure followed by later sessions of the
-    same subject assembling + writing successfully could emit
-    ``failed`` then ``done`` in that order. Pin the "first terminal
-    wins" suppression in ``_stage_ASSEM`` so a future refactor
-    doesn't silently re-introduce out-of-order terminals."""
+    """A per-session failure followed by later sessions of the same
+    subject assembling + writing successfully could emit ``failed``
+    then ``done`` in that order. Pin the "first terminal wins"
+    suppression in ``_stage_ASSEM`` so a refactor cannot silently
+    allow out-of-order terminals."""
     src = _read_module_source("arealmshbm/pipeline/_step1_stage_pipeline.py")
     # Sentinel: the ``terminated`` set is the carrier of the
     # suppression invariant. Removing or renaming it should fail
@@ -600,7 +589,7 @@ def test_step1_stage_pipeline_suppresses_failed_then_done() -> None:
     # "first terminal wins."
     assert "terminated: set[str]" in src or "terminated = set()" in src, (
         "step1 _stage_ASSEM lost its per-subject ``terminated`` set — "
-        "failed→done ordering is no longer suppressed (R1-P2-3 regression)"
+        "failed→done ordering is not suppressed"
     )
     # _finish's idempotency guard must also be present.
     assert "if sub_id in terminated:" in src, (
@@ -624,9 +613,7 @@ def test_step3_stage_pipeline_emits_running_and_terminal() -> None:
 # Step2Pipeline contract — must NOT auto-emit ``done`` (driver owns it)
 # ─────────────────────────────────────────────────────────────────────
 def test_step2_run_emits_running_but_not_done(tmp_path: Path) -> None:
-    """Contract pin for reviewer P2 #2.
-
-    ``Step2Pipeline.run()`` emits ``running`` at entry and ``failed``
+    """``Step2Pipeline.run()`` emits ``running`` at entry and ``failed``
     on exception but deliberately does NOT emit ``done`` at success.
     The done emit lives in ``Pipeline._run_step2_train_prior`` AFTER
     the ``prior_dst.exists()`` check — otherwise a silent early-exit
@@ -646,7 +633,7 @@ def test_step2_run_emits_running_but_not_done(tmp_path: Path) -> None:
     # ``SimpleNamespace`` over an ad-hoc class for readability — both
     # AttributeError on missing attrs, so if Step2Pipeline.run grows
     # another ``self.cfg.X`` access this test fails loudly with the
-    # missing attr name in the traceback (R3-nit).
+    # missing attr name in the traceback.
     pipe = Step2Pipeline.__new__(Step2Pipeline)
     em = ProgressEmitter(tmp_path)
     pipe.progress = em
@@ -669,8 +656,7 @@ def test_step2_run_emits_running_but_not_done(tmp_path: Path) -> None:
         "Step2Pipeline.run must still emit 'running' at entry"
     assert not any(r["state"] == "done" for r in states), (
         "Step2Pipeline.run emitted 'done' — that emit belongs in the "
-        "driver wrapper AFTER the prior_dst.exists() check "
-        "(reviewer P2 #2). Move it back to "
+        "driver wrapper AFTER the prior_dst.exists() check, in "
         "driver._run_step2_train_prior."
     )
 

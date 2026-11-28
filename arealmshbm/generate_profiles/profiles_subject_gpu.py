@@ -154,7 +154,8 @@ def compute_subject_profiles_gpu(sessions: Iterable,
                                   out: Optional[np.ndarray] = None,
                                   on_session=None,
                                   on_packed=None):
-    """Fused per-subject FC-profile compute, one D2H for the subject.
+    """Fused per-subject FC-profile compute into one host array: one
+    whole-subject D2H, or one per session with ``on_session``.
 
     Parameters
     ----------
@@ -176,7 +177,7 @@ def compute_subject_profiles_gpu(sessions: Iterable,
         device; uploaded once.
     mw_mask : array-like
         ``(n_full,)`` truthy at medial-wall vertices. Host or device.
-    threshold : float or str
+    threshold : float
         Top fraction admitted by the binarize (production: ``0.1``).
     censor : dict, optional
         ``{sess_index: [keep_int32_or_None, ...]}`` -- one entry per

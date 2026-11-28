@@ -45,12 +45,9 @@ class Step0Config:
     downsample: float = 3.2
     num_components: int = 100
 
-    bold_root: Optional[Path] = None
-    save_artifacts: bool = True
-
     # Explicit (lh, rh) path tuples per session, in 1-indexed order. When
     # set, ``bold_paths(sess_idx)`` returns directly from here and ignores
-    # ``bold_root`` / ``sub_id``-derived naming. Used by the
+    # the ``sub_id``-derived naming. Used by the
     # unified pipeline driver (``arealmshbm.pipeline``) so the BOLD
     # list in ``bold_inputs.json`` is the single source of truth without
     # imposing a filename convention on the user.
@@ -71,7 +68,7 @@ class Step0Config:
 
     # ── emb output format ──
     # The 100-component embedding ``emb`` is the per-subject artifact
-    # downstream step-2 reads once per (subject, session) pair. .npy is
+    # steps 2 and 3 read back from disk. .npy is
     # ~6× faster to read than scipy.io.loadmat on the same dense fp32
     # array (no MATLAB header parse, no struct overhead) and is
     # self-describing about shape/dtype.
@@ -93,10 +90,9 @@ class Step0Config:
     # ``{lh,rh}_gradient_distance_matrix.npy`` are step0 *intermediate*
     # outputs (subgraph B → C handoff). They are large (~672 MB per
     # hemi per subject, ~53.6 GB for a 40-subject cohort on fsaverage6)
-    # and no production downstream step reads them — step3's fetch_data
-    # consumes only the much smaller ``{lh,rh}_emb_<nc>_distance_matrix``
-    # embedding, and the driver passes the embedding in memory anyway
-    # (``precomputed_gradient_mat`` keyword).
+    # and no production downstream step reads them — steps 2 and 3
+    # consume only the much smaller ``{lh,rh}_emb_<nc>_distance_matrix``
+    # embedding.
     #
     # Default OFF. No in-tree consumer; toggle on for
     # ad-hoc archaeological probes (cohort-level CPU/GPU drift comparison
@@ -137,8 +133,6 @@ class Step0Config:
                     f"import failed ({e}). Use backend='cpu' or install cupy."
                 ) from e
         self.project_dir = Path(self.project_dir)
-        if self.bold_root is not None:
-            self.bold_root = Path(self.bold_root)
         if not isinstance(self.sess_list, tuple):
             self.sess_list = tuple(self.sess_list)
         if len(self.sess_list) == 0:
@@ -167,7 +161,7 @@ class Step0Config:
 
         Priority:
           1. ``bold_paths_override`` (driver-injected explicit list);
-          2. ``bold_root`` + ``sub_id`` + ``sess`` naming —
+          2. ``project_dir/converted_bold`` + ``sub_id`` + ``sess`` naming —
              synthesizes the canonical DeepPrep / fmriprep filename
              ``{sub}_{ses}_task-rest_hemi-{L,R}_space-fsaverage6_bold.func.gii``.
              Read by :func:`arealmshbm.bold_io.read_surface_bold`, which
@@ -176,9 +170,7 @@ class Step0Config:
         if self.bold_paths_override is not None:
             return self.bold_paths_override[sess_idx - 1]
         sess = self.sess_list[sess_idx - 1]
-        root = self.bold_root if self.bold_root is not None else (
-            self.project_dir / "converted_bold"
-        )
+        root = self.project_dir / "converted_bold"
         lh = root / (
             f"{self.sub_id}_{sess}_task-rest_hemi-L_"
             f"space-fsaverage6_bold.func.gii"

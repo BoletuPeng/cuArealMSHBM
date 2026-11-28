@@ -445,7 +445,7 @@ def _open_and_verify(path: str | Path):
 def open_subject_profile_packed_tnd(path: str | Path):
     """Lazy-decode handle for the bitpacked bytes.
 
-    Returns the underlying ``blosc2.NDArray`` (or a thin wrapper) with
+    Returns the underlying ``blosc2.NDArray`` with
     ``shape = (T, N, ⌈D/8⌉)``, ``dtype = uint8``. Each ``arr[t]`` returns
     a fresh ``(N, ⌈D/8⌉) uint8`` chunk decode — no fp32 cost.
 
@@ -453,12 +453,7 @@ def open_subject_profile_packed_tnd(path: str | Path):
     recover the exact cell count.
     """
     a = _open_and_verify(path)
-    try:
-        a.D_unpacked = _get_vlmeta_D_unpacked(a)  # type: ignore[attr-defined]
-    except AttributeError:
-        # Cython class that prohibits dynamic attribute assignment —
-        # wrap in a thin pass-through.
-        a = _PackedHandle(a, _get_vlmeta_D_unpacked(a))
+    a.D_unpacked = _get_vlmeta_D_unpacked(a)  # type: ignore[attr-defined]
     return a
 
 
@@ -491,36 +486,11 @@ def decode_subject_profile_packed_into(handle, out: np.ndarray) -> None:
     subject (72 MB at fsaverage6 / T=6) and, measured over the
     40-subject reference cohort, decodes at 63 vs 47 ms per subject.
     """
-    a = handle._a if isinstance(handle, _PackedHandle) else handle
-    shape = tuple(int(x) for x in a.shape)
+    shape = tuple(int(x) for x in handle.shape)
     if (tuple(out.shape) != shape or out.dtype != np.uint8
             or not out.flags["C_CONTIGUOUS"]):
         raise ValueError(
             f"decode_subject_profile_packed_into: out must be a C-contiguous "
             f"uint8 {shape} array; got {out.dtype} {out.shape}"
         )
-    a.get_slice_numpy(out, ((0,) * len(shape), shape))
-
-
-class _PackedHandle:
-    """Minimal wrapper carrying ``D_unpacked`` if ``blosc2.NDArray`` bans
-    dynamic attribute assignment. Mirrors ``shape``, ``dtype``,
-    ``__getitem__`` so callers can use it just like the raw NDArray.
-    """
-
-    __slots__ = ("_a", "D_unpacked")
-
-    def __init__(self, a, D_unpacked: int):
-        self._a = a
-        self.D_unpacked = D_unpacked
-
-    @property
-    def shape(self):
-        return self._a.shape
-
-    @property
-    def dtype(self):
-        return self._a.dtype
-
-    def __getitem__(self, t):
-        return self._a[t]
+    handle.get_slice_numpy(out, ((0,) * len(shape), shape))

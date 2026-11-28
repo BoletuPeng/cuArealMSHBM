@@ -43,6 +43,9 @@ from arealmshbm.step2_io.tests._synthetic_project import (  # noqa: E402
     load_project, make_project,
 )
 from arealmshbm.step2_em_iter_master.tests import _bench_fixture as BF  # noqa: E402
+from arealmshbm.step2_em_iter_master.tests._device_state import (  # noqa: E402
+    sync_to_host,
+)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -69,7 +72,7 @@ def _synthetic(seed, root):
         for row in blk:
             k = int(rng.integers(1, 5))
             row[rng.choice(L_LH, size=k, replace=False)] = 1.0
-    bm = build_step2_boundary_mask(lh_b, rh_b, "gMSHBM")
+    bm = build_step2_boundary_mask(lh_b, rh_b)
 
     mtc = rng.standard_normal((D, L))
     mtc /= np.linalg.norm(mtc, axis=0, keepdims=True)
@@ -154,9 +157,9 @@ def test_one_em_iter_matches_cpu(mode, tmp_path):
 
     g = _gpu_session(inputs, mode, dim, ini_val, beta)
     g.initialize_state()
-    gh0 = g.sync_to_host(("s_lambda", "theta"))
+    gh0 = sync_to_host(g, ("s_lambda", "theta"))
     m_gpu, cost_gpu = g.run_iter()
-    gh = g.sync_to_host(("s_t_nu", "s_lambda", "theta"))
+    gh = sync_to_host(g, ("s_t_nu", "s_lambda", "theta"))
 
     Params, m_cpu, init0 = _cpu_one_iter(mode, bm, mtc, bold, grad_STND, dim,
                                          ini_val, beta)
@@ -265,7 +268,7 @@ def test_sync_to_host_rejects_an_unknown_field(tmp_path):
     g = _gpu_session(inputs, "dMSHBM", dim,
                      float(initialize_concentration(dim)), 0.0)
     with pytest.raises(ValueError, match="unknown field"):
-        g.sync_to_host(("not_a_field",))
+        sync_to_host(g, ("not_a_field",))
 
 
 @pytest.mark.parametrize("ini_val_case", ["natural", "underflow"])
@@ -285,7 +288,7 @@ def test_init_state_matches_compose_init_state(ini_val_case, tmp_path):
                else 500.0)
     g = _gpu_session(inputs, "gMSHBM", dim, ini_val, 5000.0)
     g.initialize_state()
-    h = g.sync_to_host(("s_lambda", "theta"))
+    h = sync_to_host(g, ("s_lambda", "theta"))
     s_lambda, theta = compose_init_state(
         bold_loader=InMemoryProfileLoader(bold, T), group_mtc=mtc,
         boundary_mask=bm, num_clusters=L, ini_val=ini_val)
@@ -313,7 +316,7 @@ def test_determinism(tmp_path):
         costs = [g.run_iter()[1] for _ in range(3)]
         g.intra_closure()
         g.inter_closure()
-        h = g.sync_to_host(fields)
+        h = sync_to_host(g, fields)
         h["cost"] = np.concatenate(costs)
         h["kappa"] = np.float64(g.kappa)
         runs.append(h)
@@ -362,7 +365,7 @@ def test_bold_cache_mode_stream_matches_eager(tmp_path, monkeypatch):
         g.initialize_state()
         for _ in range(2):
             g.run_iter()
-        out.append(g.sync_to_host(("s_lambda_P", "theta_P", "s_t_nu")))
+        out.append(sync_to_host(g, ("s_lambda_P", "theta_P", "s_t_nu")))
     for k in out[0]:
         for o in out[1:]:
             assert np.array_equal(out[0][k].view(np.uint32),
@@ -442,7 +445,7 @@ def test_export_params_shapes(tmp_path):
     assert sp.issparse(p["theta"]) and p["theta"].shape == (N, L)
     dense = np.asarray(p["theta"].todense())
     assert np.all(dense[bm == 0] == 0.0)
-    h = g.sync_to_host(("theta",))
+    h = sync_to_host(g, ("theta",))
     assert np.allclose(dense, h["theta"], rtol=0, atol=0)
 
 
@@ -478,7 +481,7 @@ def test_bench_matches_cpu_structurally():
         max_iter_intra_var=int(cfg.max_iter_intra_var))
     g.initialize_state()
     m_gpu = [g.run_iter()[0] for _ in range(3)]
-    gh = g.sync_to_host(("theta", "s_lambda"))
+    gh = sync_to_host(g, ("theta", "s_lambda"))
 
     P = {k: (fx.Params[k].copy() if isinstance(fx.Params[k], np.ndarray)
              else copy.deepcopy(fx.Params[k])) for k in fx.Params}

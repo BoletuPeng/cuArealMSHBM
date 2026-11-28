@@ -84,9 +84,7 @@ import queue
 import threading
 import traceback
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
-
-import numpy as np
+from typing import Any, List, Optional
 
 from arealmshbm.step3_pipeline import (
     Step3Config, Step3Pipeline, Step3Result,
@@ -113,7 +111,6 @@ class _StageWork:
     """
     sub_id: str
     cfg: Step3Config
-    grad_mat: Optional[np.ndarray]
     pipe: Optional[Step3Pipeline] = None
     # Cupy event recorded at the end of LOAD on stream L; EM waits on
     # it on stream E before running. ``None`` when LOAD failed first.
@@ -130,7 +127,6 @@ class Step3StagePipeline:
         coord = Step3StagePipeline(
             subject_ids=[...],          # subject ids, same order as configs
             configs=[Step3Config, ...], # one per subject, backend='gpu'
-            gradients={sub_id: NxDg, ...},
         )
         coord.run()
 
@@ -143,7 +139,6 @@ class Step3StagePipeline:
         self, *,
         subject_ids: List[str],
         configs: List[Step3Config],
-        gradients: Dict[str, np.ndarray],
         progress: Optional[ProgressEmitter] = None,
     ):
         if len(subject_ids) != len(configs):
@@ -155,10 +150,6 @@ class Step3StagePipeline:
             raise ValueError("Step3StagePipeline: empty subject list")
         self.subject_ids = subject_ids
         self.configs = configs
-        # Per-subject gradient .npy ownership is transferred to this
-        # coordinator; we pop entries as we dispatch to free memory
-        # after each subject's LOAD.
-        self.gradients = gradients
         # Optional frontend progress sink. Per-subject ``step3``
         # running fires from _stage_LOAD on subject entry; done/failed
         # fires from _stage_SAVE before qDone.put. ``None`` →
@@ -268,10 +259,7 @@ class Step3StagePipeline:
         try:
             for sub_idx, sub_id in enumerate(self.subject_ids):
                 cfg = self.configs[sub_idx]
-                grad = self.gradients.pop(sub_id, None)
-                work = _StageWork(
-                    sub_id=sub_id, cfg=cfg, grad_mat=grad,
-                )
+                work = _StageWork(sub_id=sub_id, cfg=cfg)
                 # Subject enters the pipeline at LOAD — emit before
                 # any disk I/O so the frontend shows "now working on
                 # X" the instant the worker picks the subject up.
@@ -281,10 +269,7 @@ class Step3StagePipeline:
                     qLE.put(work)
                     continue
                 try:
-                    pipe = Step3Pipeline(
-                        cfg, precomputed_gradient_mat=grad,
-                        sparse_cohort=cohort,
-                    )
+                    pipe = Step3Pipeline(cfg, sparse_cohort=cohort)
                     # Stash the pipe handle on the work item BEFORE
                     # the H2D / setup work below, so that if
                     # build_session() raises mid-construction the

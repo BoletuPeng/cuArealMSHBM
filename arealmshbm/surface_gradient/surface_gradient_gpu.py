@@ -265,7 +265,7 @@ void hemi_gradient_kernel(
 _GRADIENT_KERNEL = cp.RawKernel(_GRADIENT_KERNEL_SRC, "hemi_gradient_kernel")
 
 
-GradientMeshGPU = Tuple[cp.ndarray, cp.ndarray, cp.ndarray, cp.ndarray, cp.ndarray]
+GradientMeshGPU = Tuple[cp.ndarray, cp.ndarray, cp.ndarray, cp.ndarray]
 
 
 def prepare_gradient_mesh_gpu(cpu_prep) -> GradientMeshGPU:
@@ -298,8 +298,9 @@ def prepare_gradient_mesh_gpu(cpu_prep) -> GradientMeshGPU:
 
 
 def _hemi_gradient_gpu(verts_d, deg_d, nbors_d, vn_d, va_d,
-                       data_full_d, roi_d, K_thr: int = 256) -> cp.ndarray:
+                       data_full_d, roi_d) -> cp.ndarray:
     """Per-hemisphere kernel launch. Returns (n_verts, K) fp32 device array."""
+    K_thr = 256
     n_verts = int(verts_d.shape[0])
     K = int(data_full_d.shape[1])
     out_d = cp.zeros((n_verts, K), dtype=cp.float32)

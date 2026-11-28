@@ -32,7 +32,6 @@ from arealmshbm.step2_io.sparse_inputs import Step2SparseInputs
 from .config import Step2Config
 from .pipeline import Step2Pipeline, Step2Inputs, Step2Result
 from .vmf_clustering_batch import (
-    SparseBatchResult,
     VmfBatchResult,
     em_body_sparse,
     vmf_clustering_batch,
@@ -47,5 +46,4 @@ __all__ = [
     "vmf_clustering_batch",
     "VmfBatchResult",
     "em_body_sparse",
-    "SparseBatchResult",
 ]

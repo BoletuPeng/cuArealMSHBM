@@ -68,7 +68,6 @@ class BoldInputSubject:
 
 @dataclass(frozen=True)
 class BoldInputs:
-    schema_version: str
     dataset_name: str
     subjects: Tuple[BoldInputSubject, ...]
 
@@ -180,7 +179,6 @@ def read_bold_inputs(path: Path | str) -> BoldInputs:
         ))
 
     return BoldInputs(
-        schema_version=sv,
         dataset_name=str(raw["dataset_name"]),
         subjects=tuple(parsed_subjects),
     )

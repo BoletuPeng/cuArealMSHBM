@@ -37,7 +37,7 @@ from __future__ import annotations
 import os
 from functools import lru_cache
 from pathlib import Path
-from typing import Dict, Literal, Optional
+from typing import Dict, Literal
 
 import numpy as np
 
@@ -58,12 +58,10 @@ def _atlas_dir() -> Path:
     return Path(env)
 
 
-def atlas_label_dir(atlas_dir: Optional[str | Path] = None) -> Path:
-    """``<atlas>/fsaverage6/label`` — the FreeSurfer subject layout the
-    live ``.annot`` reads use. ``atlas_dir`` overrides
-    ``MSHBM_ATLAS_DIR``."""
-    base = Path(atlas_dir) if atlas_dir else _atlas_dir()
-    return base / "fsaverage6" / "label"
+def atlas_label_dir() -> Path:
+    """``$MSHBM_ATLAS_DIR/fsaverage6/label`` — the FreeSurfer subject
+    layout the live ``.annot`` reads use."""
+    return _atlas_dir() / "fsaverage6" / "label"
 
 
 # ─────────────────────────────────────────────────────────────────────

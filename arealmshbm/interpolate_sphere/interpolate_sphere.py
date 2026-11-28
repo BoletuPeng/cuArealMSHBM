@@ -76,40 +76,9 @@ Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 
 from __future__ import annotations
 
-from typing import Optional
-
 import numpy as np
 from numba import njit, prange
 from scipy.spatial import cKDTree
-
-
-# ─────────────────────────────────────────────────────────────────────
-# Vertex→faces table (counting/scatter)
-# ─────────────────────────────────────────────────────────────────────
-@njit(cache=True)
-def build_vertex_faces(faces: np.ndarray, num_vertices: int) -> np.ndarray:
-    """Build a (N, max_faces_per_vert) 1-indexed table of incident faces.
-
-    Mirrors MATLAB ``mesh.vertexFaces``. Slot value ``0`` denotes
-    "no face".
-    """
-    F = faces.shape[0]
-    counts = np.zeros(num_vertices, dtype=np.int32)
-    for f in range(F):
-        for k in range(3):
-            counts[faces[f, k]] += 1
-    max_faces = 0
-    for i in range(num_vertices):
-        if counts[i] > max_faces:
-            max_faces = counts[i]
-    out = np.zeros((num_vertices, max_faces), dtype=np.int32)
-    cursor = np.zeros(num_vertices, dtype=np.int32)
-    for f in range(F):
-        for k in range(3):
-            v = faces[f, k]
-            out[v, cursor[v]] = f + 1   # 1-indexed
-            cursor[v] += 1
-    return out
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -277,7 +246,7 @@ def _score_and_interp_batch(p_arr,           # (M, 3) fp32
 def linear_interpolate_sphere(target_points: np.ndarray,
                               source_verts: np.ndarray,
                               source_faces: np.ndarray,
-                              source_vertex_faces: Optional[np.ndarray],
+                              source_vertex_faces: np.ndarray,
                               data: np.ndarray,
                               ) -> np.ndarray:
     """Barycentric linear interpolation from a source mesh onto target
@@ -288,9 +257,8 @@ def linear_interpolate_sphere(target_points: np.ndarray,
     target_points : (M, 3) fp32
     source_verts : (N, 3) fp32
     source_faces : (F, 3) int32, 0-indexed
-    source_vertex_faces : (N, max_faces_per_vert) int32 or None
-        1-indexed; ``0`` marks an absent slot. Built on the fly if
-        ``None``.
+    source_vertex_faces : (N, max_faces_per_vert) int32
+        1-indexed; ``0`` marks an absent slot.
     data : (..., N) any float
         Vertex-attached values; leading dims preserved.
 
@@ -314,14 +282,11 @@ def linear_interpolate_sphere(target_points: np.ndarray,
     src32 = np.ascontiguousarray(source_verts, dtype=np.float32)
     faces32 = np.ascontiguousarray(source_faces, dtype=np.int32)
 
-    if source_vertex_faces is None:
-        vertex_faces = build_vertex_faces(faces32, N)
-    else:
-        if source_vertex_faces.shape[0] != N:
-            raise ValueError(
-                f"source_vertex_faces row count {source_vertex_faces.shape[0]}"
-                f" != num verts {N}")
-        vertex_faces = np.ascontiguousarray(source_vertex_faces, dtype=np.int32)
+    if source_vertex_faces.shape[0] != N:
+        raise ValueError(
+            f"source_vertex_faces row count {source_vertex_faces.shape[0]}"
+            f" != num verts {N}")
+    vertex_faces = np.ascontiguousarray(source_vertex_faces, dtype=np.int32)
 
     # KD-tree nearest-vertex query (tech-stack exception: scipy/C).
     tree = cKDTree(src32.astype(np.float64, copy=False))

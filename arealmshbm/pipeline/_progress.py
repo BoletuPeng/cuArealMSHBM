@@ -95,11 +95,13 @@ numba JIT bodies) never see an emit.
 
 Failure isolation
 -----------------
-Every public method swallows its own exceptions (and prints to stderr
-once on first failure) — a broken progress sink must never propagate
-into a stage thread and abort a real subject. ``enabled=False``
-constructor flag makes every method a true no-op, so old perf scripts
-and unit tests that don't care about progress can keep zero file I/O.
+Every write swallows its own exceptions (and prints to stderr once on
+first failure) — a broken progress sink must never propagate into a
+stage thread and abort a real subject. The one deliberate raise is
+:meth:`ProgressEmitter.emit_plan`'s ``ValueError`` on a non-JSON
+payload, on the driver thread, before any file I/O.
+:meth:`ProgressEmitter.disabled` builds an emitter whose every method
+is a true no-op, for callers that do not report progress.
 
 Thread safety
 -------------
@@ -142,16 +144,14 @@ class ProgressEmitter:
         emitter.emit_state("step0", "1", "done")
         emitter.close()
 
-    Pass ``enabled=False`` to disable all I/O (every method becomes a
-    no-op). Used by pure-CPU perf scripts and unit tests that don't
-    want to assert on file output. The :meth:`disabled` classmethod is
-    the idiomatic way to construct one when there's no meaningful
-    logs_dir to hand it (e.g. stage-pipeline fallback defaults).
+    The :meth:`disabled` classmethod constructs an emitter with all I/O
+    off (every method a no-op), for callers that have no logs_dir to
+    hand it (e.g. stage-pipeline fallback defaults).
     """
 
-    def __init__(self, logs_dir: Path | str, *, enabled: bool = True):
+    def __init__(self, logs_dir: Path | str):
         self._logs_dir = Path(logs_dir)
-        self._enabled = bool(enabled)
+        self._enabled = True
         self._lock = threading.Lock()
         self._fh: Optional[Any] = None
         # Set once the first emit fails so subsequent failures don't
@@ -164,9 +164,8 @@ class ProgressEmitter:
     def disabled(cls) -> "ProgressEmitter":
         """Construct an emitter whose every method is a true no-op.
 
-        Equivalent to ``ProgressEmitter(<any-path>, enabled=False)`` but
-        avoids the awkward "pass a dummy path you never write to"
-        idiom at stage-pipeline construction sites. Returns an instance
+        Takes no path, so stage-pipeline construction sites need no
+        dummy one. Returns an instance
         with ``_logs_dir=None`` so accidentally calling ``_write`` on
         it would raise rather than silently writing to the wrong place
         — defence in depth on top of the ``_enabled`` short-circuit.
@@ -309,7 +308,7 @@ class ProgressEmitter:
     def close(self) -> None:
         """Close the underlying file handle if it was opened.
 
-        Safe to call even when ``enabled=False`` or when no emit ever
+        Safe to call on a :meth:`disabled` emitter or when no emit ever
         opened the file. Errors are swallowed.
         """
         # When disabled the file was never opened — skip the lock
@@ -385,15 +384,6 @@ class ProgressEmitter:
                     f"this run may be incomplete",
                     file=sys.stderr,
                 )
-
-    # Context manager support — convenience for the tests + ad-hoc CLI.
-    # The driver owns the emitter for the lifetime of ``Pipeline``, so
-    # it uses ``close()`` directly rather than ``with``.
-    def __enter__(self) -> "ProgressEmitter":
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        self.close()
 
 
 # ─────────────────────────────────────────────────────────────────────

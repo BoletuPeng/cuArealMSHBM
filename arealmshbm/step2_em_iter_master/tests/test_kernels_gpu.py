@@ -22,6 +22,50 @@ cp = pytest.importorskip("cupy")
 
 from arealmshbm.step2_em_iter_master import _kernels_gpu as K  # noqa: E402
 from arealmshbm.step2_em_iter_master.tests import _bench_fixture as BF  # noqa: E402
+from arealmshbm.step2_em_iter_master.tests._device_state import (  # noqa: E402
+    sync_to_host,
+)
+from arealmshbm.step2_io.tests._layout_oracle import gather  # noqa: E402
+
+
+# One-thread-per-element wrappers around the module's ``__device__`` helpers,
+# compiled against ``K._SRC_HELPERS`` with the production options.
+_PROBE_SRC = r"""
+extern "C" __global__
+void probe_invad(const double* rbar, double* out, double D, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    out[i] = dev_invad(D, rbar[i]);
+}
+extern "C" __global__
+void probe_cdln(const double* k, double* out, double v, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    out[i] = dev_cdln_single(k[i], v);
+}
+extern "C" __global__
+void probe_f32_rn(const double* x, float* out, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    out[i] = f32_rn(x[i]);
+}
+extern "C" __global__
+void probe_f32_to_f64(const float* x, double* out, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    out[i] = f32_to_f64(x[i]);
+}
+"""
+_PROBE_MODULE = None
+
+
+def _probe(name: str):
+    global _PROBE_MODULE
+    if _PROBE_MODULE is None:
+        _PROBE_MODULE = cp.RawModule(code=K._SRC_HELPERS + _PROBE_SRC,
+                                     options=K.COMPILE_OPTIONS,
+                                     backend="nvrtc")
+    return _PROBE_MODULE.get_function(name)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -30,9 +74,7 @@ from arealmshbm.step2_em_iter_master.tests import _bench_fixture as BF  # noqa: 
 def test_device_invad_matches_invad_numba():
     """Device ``invad`` vs ``invad_numba(1174, .)`` over a randomized sweep.
 
-    The port is bit-exact on the **asymptotic** branch only; the 7-point
-    ``array_equal`` this test replaced happened to sample only round numbers
-    that agree.  On the secant branch it inherits device-vs-msvcrt ``log``
+    The port is bit-exact on the **asymptotic** branch only.  On the secant branch it inherits device-vs-msvcrt ``log``
     ULP differences through the iteration.  Measured over this fixed 4000-point
     sweep at ``dim = 1174`` (and reproduced on two other seeds):
 
@@ -42,16 +84,15 @@ def test_device_invad_matches_invad_numba():
     * about **1 in 4000** lands on a secant *early-exit* divergence, where one
       side takes an extra iteration and the roots differ by ~3e-4 relative
       (here ``rbar = 0.34147`` -> 453.5874 vs 453.7225, and that one point is
-      also the only ``np.float32(kappa)`` mismatch).  This is looser than the
-      "invad verified bit-exact" the design's 1.9/9 still claim, and it is
-      what the bars below pin.  It stays 67x inside design 7.3's
+      also the only ``np.float32(kappa)`` mismatch).  This is the tolerance
+      design 1.9 / 8 states, and what the bars below pin.  It stays 67x inside design 7.3's
       ``|kappa - kappa_cpu| / kappa_cpu <= 2e-2``.
     """
     from arealmshbm.m_step._invad import invad_numba
     rng = np.random.default_rng(20260903)
     rb = rng.uniform(1e-9, 1.0 - 1e-9, 4000).astype(np.float64)
     out = cp.empty(rb.size, dtype=cp.float64)
-    K.module().get_function("probe_invad")(
+    _probe("probe_invad")(
         (K.grid(rb.size, 256),), (256,),
         (cp.asarray(rb), out, np.float64(1174.0), np.int32(rb.size)))
     got = cp.asnumpy(out)
@@ -116,7 +157,7 @@ def test_device_cdln_bitexact():
     k = np.array([403.6113960568694, 553.0, 900.0, 1200.0, 2464.0],
                  dtype=np.float64)
     out = cp.empty(k.size, dtype=cp.float64)
-    K.module().get_function("probe_cdln")(
+    _probe("probe_cdln")(
         (1,), (32,), (cp.asarray(k), out, np.float64(586.0), np.int32(k.size)))
     ref = np.array([_cdln_single(float(x), 586.0) for x in k], dtype=np.float64)
     assert np.array_equal(cp.asnumpy(out).view(np.uint64), ref.view(np.uint64))
@@ -128,8 +169,7 @@ def test_f32_rn_subnormal_bit_patterns():
                    0.0, 1.0, 1.17549435e-38, 1.1754943e-38, 3.4e38],
                   dtype=np.float64)
     out = cp.empty(xs.size, dtype=cp.float32)
-    mod = K.module()
-    mod.get_function("probe_f32_rn")(
+    _probe("probe_f32_rn")(
         (1,), (64,), (cp.asarray(xs), out, np.int32(xs.size)))
     got = cp.asnumpy(out)
     ref = xs.astype(np.float32)
@@ -138,7 +178,7 @@ def test_f32_rn_subnormal_bit_patterns():
         "the fixture must actually contain subnormals"
 
     back = cp.empty(xs.size, dtype=cp.float64)
-    mod.get_function("probe_f32_to_f64")(
+    _probe("probe_f32_to_f64")(
         (1,), (64,), (cp.asarray(ref), back, np.int32(xs.size)))
     assert np.array_equal(cp.asnumpy(back), ref.astype(np.float64))
 
@@ -209,12 +249,12 @@ def ctx():
         eps_intra_var=float(cfg.epsilon),
         max_iter_intra_var=int(cfg.max_iter_intra_var))
     sess.initialize_state()
-    init_state = sess.sync_to_host(("s_lambda", "theta"))
+    init_state = sync_to_host(sess, ("s_lambda", "theta"))
     sess.run_iter()                       # iteration 1 -- runs K7
-    k7 = sess.sync_to_host(("rmax_dense", "s_t_nu", "u", "u_sq", "grad_sq",
-                            "n_alive"))
+    k7 = sync_to_host(sess, ("rmax_dense", "s_t_nu", "u", "u_sq", "grad_sq",
+                             "n_alive"))
     k7["kappa"] = sess.kappa
-    used = sess.sync_to_host(("theta_P", "log_theta"))   # theta iteration 2 reads
+    used = sync_to_host(sess, ("theta_P", "log_theta"))   # theta iteration 2 reads
     _m2, cost2 = sess.run_iter()          # iteration 2 -- no K7 (theta_out == 0)
     return {"fx": fx, "sess": sess, "init": init_state, "k7": k7,
             "theta_used": used, "bold": fx.bold_f32(0),
@@ -225,7 +265,7 @@ def test_row_stats_exact(ctx):
     """K0: the reconstructed ``(bit - mean) * inv`` is bit-equal to the CPU widen."""
     fx, sess = ctx["fx"], ctx["sess"]
     bold = ctx["bold"]
-    h = sess.sync_to_host(("row_mean", "row_inv", "n_alive"))
+    h = sync_to_host(sess, ("row_mean", "row_inv", "n_alive"))
     rm, ri = h["row_mean"][0], h["row_inv"][0]
     rng = np.random.default_rng(0)
     rows = rng.choice(fx.N, 512, replace=False)
@@ -270,13 +310,13 @@ def test_x_dot_sl_bits_vs_fp64(ctx):
     mod = K.module()
     lay = fx.layout
     T, N, D, Db, L = fx.T, fx.N, fx.D, fx.Db, fx.L
-    sl = cp.asarray(fx.layout.gather(
-        np.abs(np.random.default_rng(3).standard_normal((N, L))
+    sl = cp.asarray(gather(
+        fx.layout, np.abs(np.random.default_rng(3).standard_normal((N, L))
                ).astype(np.float32) * (fx.boundary_mask != 0)))
     dev = {k: cp.asarray(getattr(lay, k)) for k in
            ("col_ptr", "csc_row", "csc_pidx")}
     out = cp.zeros((T, L, D), dtype=cp.float32)
-    h = sess.sync_to_host(("row_mean", "row_inv"))
+    h = sync_to_host(sess, ("row_mean", "row_inv"))
     rm = cp.asarray(h["row_mean"][0])
     ri = cp.asarray(h["row_inv"][0])
     packed = cp.asarray(fx.packed[0])
@@ -347,7 +387,7 @@ def test_connect_matches_cpu(ctx):
     fx, sess = ctx["fx"], ctx["sess"]
     mod = K.module()
     L, Dg, T = fx.L, fx.D_grad, fx.T
-    h = sess.sync_to_host(("s_lambda", "s_lambda_P", "grad_sq"))
+    h = sync_to_host(sess, ("s_lambda", "s_lambda_P", "grad_sq"))
     sl_NL = h["s_lambda"][0]
     # Force one empty parcel so the 0/0 -> NaN path is exercised.
     lay = fx.layout
@@ -355,7 +395,7 @@ def test_connect_matches_cpu(ctx):
     dead_l = int(np.flatnonzero(np.diff(lay.col_ptr) > 0)[dead_l])
     sl_NL = sl_NL.copy()
     sl_NL[:, dead_l] = 0.0
-    sl_P = cp.asarray(lay.gather(sl_NL))
+    sl_P = cp.asarray(gather(lay, sl_NL))
 
     dev = {k: cp.asarray(getattr(lay, k)) for k in
            ("col_ptr", "csc_row", "csc_pidx", "p_row", "col")}
@@ -376,7 +416,7 @@ def test_connect_matches_cpu(ctx):
          np.int32(lay.P), np.int32(Dg), np.int32(T)))
 
     ref = _cpu_spatial_connect(fx, sl_NL, fx.grad[0])
-    ref_P = lay.gather(ref)
+    ref_P = gather(lay, ref)
     got = cp.asnumpy(lc)
 
     sl_ref = sl_NL.sum(axis=0, dtype=np.float32)   # ascending-n fp32 serial
@@ -402,7 +442,7 @@ def test_connect_matches_cpu(ctx):
 def test_acc_P_vs_fp64(ctx):
     """K6: lv_sum on the active support vs an fp64 ``X @ s_t_nu``."""
     fx, sess = ctx["fx"], ctx["sess"]
-    h = sess.sync_to_host(("lv_sum", "s_t_nu", "active"))
+    h = sync_to_host(sess, ("lv_sum", "s_t_nu", "active"))
     lay = fx.layout
     bold = ctx["bold"]
     act = h["active"].astype(bool)
@@ -558,8 +598,8 @@ def test_estep_rows_match_cpu(ctx):
     """
     fx, sess = ctx["fx"], ctx["sess"]
     lay = fx.layout
-    h = sess.sync_to_host(("lv_sum", "log_connect", "n_alive", "scr",
-                           "rmax", "log_vmf", "s_lambda_P"))
+    h = sync_to_host(sess, ("lv_sum", "log_connect", "n_alive", "scr",
+                            "rmax", "log_vmf", "s_lambda_P"))
     theta_P = ctx["theta_used"]["theta_P"]
     kappa = sess.kappa
     from arealmshbm.em_stop_criterion._cdln import _cdln_single
@@ -619,15 +659,15 @@ def test_estep_survives_an_emptied_parcel(ctx):
     mod = K.module()
     lay = fx.layout
     N, L, P, T, Dg = fx.N, fx.L, lay.P, fx.T, fx.D_grad
-    h = sess.sync_to_host(("s_lambda", "grad_sq", "n_alive", "lv_sum"))
+    h = sync_to_host(sess, ("s_lambda", "grad_sq", "n_alive", "lv_sum"))
 
     sizes = np.diff(lay.col_ptr)
     dead_l = int(np.flatnonzero(sizes > 0)[int(np.argmin(sizes[sizes > 0]))])
     sl_NL = h["s_lambda"][0].copy()
     sl_NL[:, dead_l] = 0.0
     theta_NL = (sl_NL != 0).astype(np.float32) * np.float32(0.5)
-    theta_P = lay.gather(theta_NL)
-    sl_P = cp.asarray(lay.gather(sl_NL))
+    theta_P = gather(lay, theta_NL)
+    sl_P = cp.asarray(gather(lay, sl_NL))
     active_P = theta_P > 0
     act_col_ptr, act_csc_row, act_csc_pidx = _active_csc(lay, active_P)
     act_p = np.flatnonzero(active_P).astype(np.int32)
@@ -702,7 +742,7 @@ def test_theta_e2_and_active_support(ctx):
     """K12: emulated fp32 mean, log_theta and the rebuilt active lists."""
     fx, sess = ctx["fx"], ctx["sess"]
     lay = fx.layout
-    h = sess.sync_to_host(("s_lambda_P", "theta_P", "log_theta", "active"))
+    h = sync_to_host(sess, ("s_lambda_P", "theta_P", "log_theta", "active"))
     sl = h["s_lambda_P"]
     ref = np.zeros(lay.P, dtype=np.float32)
     for s in range(fx.S):
@@ -837,8 +877,8 @@ def test_outer_leaves_match_numba(ctx):
     )
     fx, sess = ctx["fx"], ctx["sess"]
     cfg = fx.cfg
-    h = sess.sync_to_host(("s_t_nu", "s_psi", "sigma", "epsil", "mu",
-                           "cost_em"))
+    h = sync_to_host(sess, ("s_t_nu", "s_psi", "sigma", "epsil", "mu",
+                            "cost_em"))
     P = {"s_t_nu": h["s_t_nu"], "s_psi": h["s_psi"],
          "sigma": h["sigma"].reshape(1, -1), "epsil": h["epsil"].reshape(1, -1),
          "mu": h["mu"], "cost_em": h["cost_em"]}
@@ -853,9 +893,9 @@ def test_outer_leaves_match_numba(ctx):
         ini_val=fx.ini_val)
 
     cost_gpu = sess.intra_closure()
-    g1 = sess.sync_to_host(("s_psi", "sigma"))
+    g1 = sync_to_host(sess, ("s_psi", "sigma"))
     sess.inter_closure()
-    g2 = sess.sync_to_host(("mu", "epsil"))
+    g2 = sync_to_host(sess, ("mu", "epsil"))
 
     assert np.array_equal(g1["s_psi"], psi_new)
     assert _rel(g1["sigma"], np.asarray(sigma_new).ravel()) <= 1e-9

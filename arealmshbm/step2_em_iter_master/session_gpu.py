@@ -24,7 +24,7 @@ import math
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import cupy as cp
 import numpy as np
@@ -109,7 +109,6 @@ class Step2SparseSession:
         if mode not in ("gMSHBM", "dMSHBM"):
             raise ValueError(f"unsupported mode {mode!r}")
 
-        self.mode = mode
         self.has_spatial = 1 if mode == "gMSHBM" else 0
         self.S = int(inputs.S)
         self.T = int(inputs.T)
@@ -283,7 +282,6 @@ class Step2SparseSession:
         self._theta_out = 0.0
         self._kappa_seed = float(np.float32(ini_val))
         self._kappa_final = float(ini_val)
-        self._m_iters = 0
         self._warned_kappa = False
         self._log_eps20 = float(K.LOG_EPS20_F32)
         self._init_dt = K.init_dt()
@@ -552,7 +550,7 @@ class Step2SparseSession:
     # active support (design §2.3)
     # ─────────────────────────────────────────────────────────────
     def _rebuild_active(self, fold_slot: Optional[int]) -> None:
-        P, L = self.P, self.L
+        P = self.P
         self._incl_p[0] = 0
         cp.cumsum(self._active, dtype=cp.int32, out=self._incl_p[1:])
         self._call("compact_scatter", (K.grid(P, 256),), (256,),
@@ -615,7 +613,6 @@ class Step2SparseSession:
         # ── Phase B — M-step ──
         self._mstate[0] = self._kappa_seed
         m_iters = self._mstep_loop()
-        self._m_iters = m_iters
         if self._kappa_final >= 2308.0 and not self._warned_kappa:
             self._warned_kappa = True
             warnings.warn(
@@ -881,7 +878,7 @@ class Step2SparseSession:
         :func:`step2_pipeline._save.save_params_final` writes: ``sigma``
         / ``epsil`` / ``kappa`` ``(1, L)``, ``mu`` ``(L, D)``,
         ``cost_em`` ``(S,)``, ``theta`` an ``(N, L)`` fp64 scipy
-        ``csc_matrix``, ``ini_val`` a float. Pure read — callable more
+        ``csc_matrix``. Pure read — callable more
         than once, and it does not disturb the device state."""
         import scipy.sparse as sp
         lay = self._inputs.layout
@@ -899,79 +896,7 @@ class Step2SparseSession:
             "mu": cp.asnumpy(self._mu),
             "cost_em": self._cost_host[:self.S].copy(),
             "theta": csc,
-            "ini_val": float(self.ini_val),
         }
-
-    def sync_to_host(self, fields: Iterable[str]) -> Dict[str, np.ndarray]:
-        """Copy the named device arrays to fresh host arrays.
-
-        Recognised names are the device state fields (see the
-        dispatch below); ``theta`` / ``s_lambda`` come back scattered to
-        dense ``(N, L)``, their ``*_P`` twins in P layout. An unknown
-        name raises ``ValueError``. Diagnostics only — the pipeline reads
-        ``export_params`` instead."""
-        lay = self._inputs.layout
-        out: Dict[str, np.ndarray] = {}
-        for f in fields:
-            if f == "s_t_nu":
-                out[f] = cp.asnumpy(self._s_t_nu)
-            elif f == "s_psi":
-                out[f] = cp.asnumpy(self._s_psi)
-            elif f == "sigma_psi":
-                out[f] = cp.asnumpy(self._sigma_psi)
-            elif f == "X_dot_sl":
-                out[f] = cp.asnumpy(self._X_dot_sl)
-            elif f == "sigma":
-                out[f] = cp.asnumpy(self._sigma)
-            elif f == "epsil":
-                out[f] = cp.asnumpy(self._epsil)
-            elif f == "mu":
-                out[f] = cp.asnumpy(self._mu)
-            elif f == "s_lambda":
-                out[f] = lay.scatter(cp.asnumpy(self._s_lambda))
-            elif f == "s_lambda_P":
-                out[f] = cp.asnumpy(self._s_lambda)
-            elif f == "theta":
-                out[f] = lay.scatter(cp.asnumpy(self._theta))
-            elif f == "theta_P":
-                out[f] = cp.asnumpy(self._theta)
-            elif f == "log_theta":
-                out[f] = cp.asnumpy(self._log_theta)
-            elif f == "lv_sum":
-                out[f] = cp.asnumpy(self._lv_sum)
-            elif f == "log_vmf":
-                out[f] = cp.asnumpy(self._log_vmf)
-            elif f == "log_connect":
-                out[f] = cp.asnumpy(self._log_connect)
-            elif f == "scr":
-                out[f] = cp.asnumpy(self._scr)
-            elif f == "rmax":
-                out[f] = cp.asnumpy(self._rmax)
-            elif f == "rmax_dense":
-                out[f] = cp.asnumpy(self._rmax_dense)
-            elif f == "sum_lambda":
-                out[f] = cp.asnumpy(self._sum_lambda)
-            elif f == "u":
-                out[f] = cp.asnumpy(self._u_LD)
-            elif f == "u_sq":
-                out[f] = cp.asnumpy(self._u_sq)
-            elif f == "grad_sq":
-                out[f] = cp.asnumpy(self._grad_sq)
-            elif f == "n_alive":
-                out[f] = cp.asnumpy(self._n_alive)
-            elif f == "row_mean":
-                out[f] = cp.asnumpy(self._row_mean)
-            elif f == "row_inv":
-                out[f] = cp.asnumpy(self._row_inv)
-            elif f == "active":
-                out[f] = cp.asnumpy(self._active)
-            elif f == "cost_em":
-                out[f] = self._cost_host[:self.S].copy()
-            elif f == "kappa":
-                out[f] = np.float64(self._kappa_final)
-            else:
-                raise ValueError(f"sync_to_host: unknown field {f!r}")
-        return out
 
 
 __all__ = ["Step2SparseSession"]

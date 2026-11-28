@@ -2,7 +2,7 @@
 
 CuPy mirror of :mod:`arealmshbm.diffusion_map.diffusion_map`.
 Same algorithm class — alpha-normalized random-walk Lanczos for top-k
-diffusion components — executed on the GPU via ``cupy.linalg`` and
+diffusion components — executed on the GPU via CuPy array ops and
 ``cupyx.scipy.sparse.linalg.eigsh``.
 
 Precision: fp32. The geodesic distance matrix is fp32, the affinity
@@ -29,7 +29,7 @@ subspace, not on its basis orientation), but anything that consumes
 the raw embedding should not assume byte equality between backends.
 
 Public API:
-    compute_diffusion_map_gpu(affinity, alpha, n_components) -> emb_f32
+    compute_diffusion_map_gpu(affinity, n_components) -> emb_f32
 
 Wall on RTX 5090 Laptop (N=12962, k=101): ~0.3 s/hemi warm.
 
@@ -37,11 +37,12 @@ Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """
 from __future__ import annotations
 
+from .diffusion_map import _ALPHA
+
 
 def compute_diffusion_map_gpu(
     affinity,
     *,
-    alpha: float = 0.5,
     n_components: int = 100,
 ):
     """GPU partial-Lanczos diffusion-map embedding of a precomputed
@@ -53,10 +54,8 @@ def compute_diffusion_map_gpu(
     ----------
     affinity : (N, N) ndarray or cupy.ndarray
         Symmetric, non-negative affinity matrix. Host arrays are
-        copied to device; fp32 device arrays are aliased (no extra
-        copy).
-    alpha : float
-        α-normalization power.
+        copied to device; an fp32 device array is aliased (no extra
+        copy) and overwritten in place.
     n_components : int
         Number of diffusion components to return.
 
@@ -77,12 +76,11 @@ def compute_diffusion_map_gpu(
     # 1. Push to device as fp32 (aliases if already there as fp32).
     L_alpha = cp.asarray(affinity, dtype=cp.float32)
 
-    # 2. Alpha-normalization.
-    if alpha > 0:
-        d = L_alpha.sum(axis=1)
-        d_alpha = cp.power(d, -alpha).astype(cp.float32)
-        L_alpha *= d_alpha[:, cp.newaxis]
-        L_alpha *= d_alpha[cp.newaxis, :]
+    # 2. Alpha-normalization (alpha = ``_ALPHA``, the CPU path's constant).
+    d = L_alpha.sum(axis=1)
+    d_alpha = cp.power(d, -_ALPHA).astype(cp.float32)
+    L_alpha *= d_alpha[:, cp.newaxis]
+    L_alpha *= d_alpha[cp.newaxis, :]
 
     # 3. Symmetric similar matrix S = D2^-1/2 L_alpha D2^-1/2.
     d2 = L_alpha.sum(axis=1)

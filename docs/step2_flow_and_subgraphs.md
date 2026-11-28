@@ -83,8 +83,10 @@ host reads back only the `(S,)` fp64 `cost_S` (plus the active-support
 count) and, once per `iter_m`, a `(2 + S·T)` fp64 slot (drift, kappa,
 convergence flags); `'stream'` mode with `S > 1` adds two H2D copies of
 each subject's packed bytes. A `'gpu'` run never imports
-`step2_em_outer` at all (the pipeline's leaf imports are lazy — worth
-~0.2 s of eager numba at import time).
+`step2_em_outer` at all (the pipeline imports it inside the CPU
+`run_em`). It does import the `step2_em_iter_master` package, whose
+numba master pulls in `em_stop_criterion._cdln` (explicit signatures,
+compiled / cache-loaded at import).
 
 `theta` reaches the writer as a scipy `csc_matrix` straight out of
 `export_params()`; the densify is the writer's job, not this path's, so
@@ -166,7 +168,7 @@ Step2Pipeline.run(cfg)                                                [arealmshb
 │   │   (gMSHBM only; sniffs .npy / .mat by suffix)
 │   ├── load_group_mtc(group.mat)                                     step2_io/load_group_mtc
 │   ├── load_spatial_mask                                             data_io/load_spatial_mask
-│   └── build_step2_boundary_mask(mode)                               step2_init/boundary_mask
+│   └── build_step2_boundary_mask                                     step2_init/boundary_mask
 │
 ├── initialize_params()                                               inline + initialize_concentration
 │   ├── initialize_concentration(D)                                   initialize_concentration
@@ -341,7 +343,7 @@ arealmshbm/
 │
 ├── step2_init/                            # init-phase leaves
 │   ├── _kernels.py                        numba init kernels
-│   ├── boundary_mask.py                   L9 — block-diagonal (g/dMSHBM)
+│   ├── boundary_mask.py                   L9 — block-diagonal
 │   └── compose_init_state.py              L8 — stock init: per-subject soft
 │                                          masked posterior + theta_num theta
 │

@@ -25,7 +25,6 @@ lib/spatial_mask*/
 # projects/<name>/ are user inputs (bold_inputs.json,
 # pipeline_config.json); everything else is a per-run cache the
 # driver re-creates.
-projects/*/_smoke_*/
 projects/*/data_list/
 projects/*/gradients/
 projects/*/profiles/
@@ -40,4 +39,3 @@ projects/*/ind_parcellation_*_profile/
 projects/*/priors_profile/
 projects/*/cohort.json
 projects/*/logs/
-projects/*/pipeline_run_*.log

@@ -58,31 +58,18 @@ class ProjectLayout:
     def pipeline_config_path(self) -> Path:
         return self.project_dir / "pipeline_config.json"
 
-    # ── driver-maintained cache record ──
-    @property
-    def cohort_json_path(self) -> Path:
-        return self.project_dir / "cohort.json"
-
-    # ── step1 outputs ──
-    @property
-    def group_mat_path(self) -> Path:
-        return self.project_dir / "group" / "group.mat"
-
     # ── group prior (step2 output for Mode B; creator-staged for Mode A) ──
     # ``include_beta`` mirrors the step3 VariantSpec.prior_path_includes_beta
     # policy: gMSHBM/cMSHBM carry a ``beta<X>`` segment, dMSHBM does NOT.
-    # Callers that know the variant's policy (the driver) must pass it so
-    # this matches where step2 writes (Step2Config.out_dir) and where step3
-    # reads (Step3Config.group_prior_path). Defaults True for the common
-    # gMSHBM case.
-    def prior_dir(self, variant: str, beta_scalar: int,
-                  include_beta: bool = True) -> Path:
-        base = self.project_dir / "priors" / variant
-        return base / f"beta{beta_scalar}" if include_beta else base
-
+    # The caller passes the variant's policy so this matches where step2
+    # writes (Step2Config.out_dir) and where step3 reads
+    # (Step3Config.group_prior_path).
     def prior_path(self, variant: str, beta_scalar: int,
-                   include_beta: bool = True) -> Path:
-        return self.prior_dir(variant, beta_scalar, include_beta) / "Params_Final.mat"
+                   include_beta: bool) -> Path:
+        base = self.project_dir / "priors" / variant
+        if include_beta:
+            base = base / f"beta{beta_scalar}"
+        return base / "Params_Final.mat"
 
     # ── logs ──
     @property

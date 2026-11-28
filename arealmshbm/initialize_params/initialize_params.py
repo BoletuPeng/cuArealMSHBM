@@ -12,7 +12,7 @@ consumes (single-subject — no S axis):
     s_t_nu            : init = mu broadcast over T, (D, L, T)
     s_lambda          : init = theta, (N, L)
     xyz_gamma         : init = zeros, (L,) — distributed-parcel accumulator
-    max_connectedness, max_components = 0
+    max_components    : 0
     spatial_xyz_vmf   : init = zeros, (N, L)
 
 1-D vectors are stored flat as ``(L,)`` rather than MATLAB's ``(1, L)``.
@@ -32,7 +32,7 @@ def initialize_params(group_prior: Dict[str, np.ndarray],
                       num_session: int,
                       num_clusters: int,
                       num_verts: int) -> Dict[str, Any]:
-    """Build the initial ``Params`` dict (Mode A).
+    """Build the initial ``Params`` dict (single subject).
 
     Parameters
     ----------
@@ -47,7 +47,7 @@ def initialize_params(group_prior: Dict[str, np.ndarray],
 
     Returns
     -------
-    Params : dict — keys listed above. Mode A — no S axis.
+    Params : dict — keys listed above. Single subject — no S axis.
     """
     mu = np.ascontiguousarray(group_prior["mu"], dtype=np.float32)
     theta = np.ascontiguousarray(group_prior["theta"], dtype=np.float32)
@@ -90,12 +90,9 @@ def initialize_params(group_prior: Dict[str, np.ndarray],
     # xyz_gamma: init = zeros(L,) — fp64 (accumulator gets +1000 per call).
     Params["xyz_gamma"] = np.zeros(L, dtype=np.float64)
 
-    Params["max_connectedness"] = 0.0
     Params["max_components"] = 0.0
 
     # spatial_xyz_vmf: init = zeros(N, L).
     Params["spatial_xyz_vmf"] = np.zeros((N, L), dtype=np.float32)
-
-    Params["iter_inter"] = 1.0   # MATLAB sets this before EM; carried for parity.
 
     return Params

@@ -27,7 +27,6 @@ Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 
 from __future__ import annotations
 
-import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
@@ -53,12 +52,6 @@ from . import _kernels
 # without it the worker would block on the GIL and the two hemis would
 # serialize anyway.
 #
-# Disable via ``CHECK_CONN_SERIAL=1`` for batch jobs that already saturate
-# CPU cores with outer subject-level multiprocessing. The env var is read ONCE at module
-# import — changing it later has no effect; embedded callers that want to
-# toggle at runtime should set ``_PARALLEL_HEMI = False`` on this module
-# (which makes ``_get_rh_worker`` return None on every subsequent call).
-#
 # Worker thread is created lazily on the first ``_dispatch_lh_rh`` call,
 # not at import. Subprocesses spawned by an outer multiprocessing layer
 # that never invoke check_connectedness pay no OS-thread cost; the first
@@ -71,27 +64,21 @@ from . import _kernels
 # ``component_distance`` calls from multiple application threads — they
 # would race on workspace slots and serialize on the one-worker pool. The
 # in-tree pipeline is single-threaded at the call site; future multi-
-# threaded outer loops must give each thread its own workspace + worker
-# or fall back to ``CHECK_CONN_SERIAL=1``.
+# threaded outer loops must give each thread its own workspace + worker.
 # ─────────────────────────────────────────────────────────────────────────
-_PARALLEL_HEMI = os.environ.get("CHECK_CONN_SERIAL", "0") != "1"
 _RH_WORKER: ThreadPoolExecutor | None = None
 _RH_WORKER_LOCK = threading.Lock()
 
 
-def _get_rh_worker() -> ThreadPoolExecutor | None:
+def _get_rh_worker() -> ThreadPoolExecutor:
     """Lazy accessor for the persistent RH worker.
 
-    Returns ``None`` when ``CHECK_CONN_SERIAL=1`` was set at module
-    import — callers fall back to in-thread serial dispatch. Otherwise
-    creates the worker on first call and caches it for the lifetime of
+    Creates the worker on first call and caches it for the lifetime of
     the process. Double-checked locking keeps the fast path branch-free
     (one None-check + one return) while still serializing concurrent
     first-call contenders.
     """
     global _RH_WORKER
-    if not _PARALLEL_HEMI:
-        return None
     if _RH_WORKER is not None:
         return _RH_WORKER
     with _RH_WORKER_LOCK:
@@ -104,7 +91,7 @@ def _get_rh_worker() -> ThreadPoolExecutor | None:
 
 def _dispatch_lh_rh(lh_fn, rh_fn) -> None:
     """Run ``lh_fn()`` on the main thread and ``rh_fn()`` on the persistent
-    worker, then join. Falls back to serial when threading is disabled.
+    worker, then join.
 
     Either function may raise; the worker's exception propagates from
     ``fut.result()``. We wait on RH even if LH raised, so a half-finished
@@ -113,10 +100,6 @@ def _dispatch_lh_rh(lh_fn, rh_fn) -> None:
     ``__context__`` per the standard try/finally chaining semantics).
     """
     worker = _get_rh_worker()
-    if worker is None:
-        lh_fn()
-        rh_fn()
-        return
     fut = worker.submit(rh_fn)
     try:
         lh_fn()
@@ -206,7 +189,7 @@ def clear_mesh_caches() -> None:
 # call and reused on every subsequent call with the same mesh.
 #
 # Memory cost per workspace (fsaverage6, num_parcel=300):
-#   ≈ 2 × (N · int64 × 8 buffers + N · float32 × 4 buffers) ≈ 4.6 MB
+#   ≈ 2 × (N · int64 × 7 buffers + N · float32 × 4 buffers) ≈ 5.9 MB
 #   plus tiny outputs (300 floats etc.). Negligible vs the existing mesh
 #   caches and well within L3.
 # ─────────────────────────────────────────────────────────────────────────
@@ -221,20 +204,7 @@ class _Workspace:
         N                 : int — vertices per hemisphere
         n_lh              : int — parcels per hemisphere = num_parcel // 2
 
-    Per-hemi CC scratch (×2: lh_, rh_):
-        parent       (N,)            int64
-        rank         (N,)            int8
-        comp_map     (N,)            int64
-        ci           (N,)            int64
-        n_comp       (1,)            int64    — written by kernel; read with ``int(arr[0])``
-
-    Per-hemi count_per_parcel scratch (×2):
-        comp_to_label (N+1,)         int64    — sized to upper bound on n_comp+1
-        parcel_seen   (n_lh,)        bool_
-        count         (n_lh,)        float64
-
-    Top-level outputs:
-        parcel_components (num_parcel,)  float64  — eventually concatenated lh/rh count
+    Top-level output:
         eucli_dist        (num_parcel,)  float32  — final result
 
     Single-comp lookup + zeroed labels:
@@ -262,16 +232,8 @@ class _Workspace:
 
     __slots__ = (
         "N", "n_lh", "num_parcel",
-        # CC LH
-        "lh_parent", "lh_rank", "lh_comp_map", "lh_ci", "lh_n_comp",
-        # CC RH
-        "rh_parent", "rh_rank", "rh_comp_map", "rh_ci", "rh_n_comp",
-        # count LH
-        "lh_comp_to_label", "lh_parcel_seen", "lh_count",
-        # count RH
-        "rh_comp_to_label", "rh_parcel_seen", "rh_count",
         # Top-level
-        "parcel_components", "eucli_dist",
+        "eucli_dist",
         "is_single", "lh_labels64", "rh_labels64",
         "lh_zeroed", "rh_zeroed_local",
         # fused_hemi_distance LH
@@ -293,23 +255,8 @@ class _Workspace:
 
         n_lh = self.n_lh
 
-        # CC scratch + output (×2)
-        for h in ("lh", "rh"):
-            setattr(self, f"{h}_parent",   np.empty(N, dtype=np.int64))
-            setattr(self, f"{h}_rank",     np.empty(N, dtype=np.int8))
-            setattr(self, f"{h}_comp_map", np.empty(N, dtype=np.int64))
-            setattr(self, f"{h}_ci",       np.empty(N, dtype=np.int64))
-            setattr(self, f"{h}_n_comp",   np.empty(1, dtype=np.int64))
-
-        # count scratch + output (×2)
-        for h in ("lh", "rh"):
-            setattr(self, f"{h}_comp_to_label", np.empty(N + 1, dtype=np.int64))
-            setattr(self, f"{h}_parcel_seen",   np.empty(n_lh, dtype=np.bool_))
-            setattr(self, f"{h}_count",         np.empty(n_lh, dtype=np.float64))
-
-        # Top-level outputs + intermediate caches
-        self.parcel_components = np.empty(num_parcel, dtype=np.float64)
-        self.eucli_dist        = np.zeros(num_parcel, dtype=np.float32)
+        # Top-level output + intermediate caches
+        self.eucli_dist       = np.zeros(num_parcel, dtype=np.float32)
         self.is_single         = np.zeros(num_parcel + 1, dtype=np.bool_)
         self.lh_labels64       = np.empty(N, dtype=np.int64)
         self.rh_labels64       = np.empty(N, dtype=np.int64)
@@ -370,14 +317,13 @@ def compute_components_general(lh_labels: np.ndarray,
                                rh_labels: np.ndarray,
                                lh_vertex_nbors: np.ndarray,
                                rh_vertex_nbors: np.ndarray,
-                               num_parcel: int,
-                               return_ci: bool = False):
+                               num_parcel: int):
     """Per-parcel component count.
 
-    Returns ``parcel_components`` (num_parcel,) float64 with NaN for empty
-    parcels. With ``return_ci=True``, also returns ``(lh_ci, rh_ci)`` so the
-    caller can pass them to ``component_distance(..., lh_ci_full=, rh_ci_full=)``
-    to reuse work.
+    Returns ``(parcel_components, lh_ci, rh_ci)``: ``parcel_components``
+    (num_parcel,) float64 with NaN for empty parcels, and the per-hemi
+    component ids the caller passes on to
+    ``component_distance(..., lh_ci_full=, rh_ci_full=)``.
 
     LH and RH cc + count chains are dispatched on parallel threads (see the
     ``_dispatch_lh_rh`` block at module top); ``cc_from_edges`` /
@@ -385,10 +331,7 @@ def compute_components_general(lh_labels: np.ndarray,
 
     Internal cc invocation is inlined here (rather than via a separate
     components helper) so we skip the ``np.bincount`` sizes step — sizes
-    are unused here; n_comp comes from the kernel's out buffer. The
-    cc-calling sites here and in ``component_distance`` maintain the
-    cc_from_edges argument list independently; if the kernel signature
-    changes, both need to update in lockstep.
+    are unused here; n_comp comes from the kernel's out buffer.
     """
     n_lh = num_parcel // 2
     lh_labels64 = np.ascontiguousarray(lh_labels, dtype=np.int64)
@@ -438,9 +381,7 @@ def compute_components_general(lh_labels: np.ndarray,
     _dispatch_lh_rh(_lh_chain, _rh_chain)
 
     out = np.concatenate([lh_counts, rh_counts])
-    if return_ci:
-        return out, lh_ci, rh_ci
-    return out
+    return out, lh_ci, rh_ci
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -451,10 +392,9 @@ def component_distance(lh_labels: np.ndarray,
                        lh_mesh: dict,
                        rh_mesh: dict,
                        num_parcel: int,
-                       parcel_components: np.ndarray | None = None,
-                       lh_ci_full: np.ndarray | None = None,
-                       rh_ci_full: np.ndarray | None = None,
-                       copy_output: bool = True) -> np.ndarray:
+                       parcel_components: np.ndarray,
+                       lh_ci_full: np.ndarray,
+                       rh_ci_full: np.ndarray) -> np.ndarray:
     """Mirror of CBIG_ArealMSHBM_component_distance.
 
     Parameters
@@ -466,21 +406,14 @@ def component_distance(lh_labels: np.ndarray,
         matching MATLAB's ``CBIG_ReadNCAvgMesh(..., 'sphere', 'cortex')``.
         Internally cached as float32 and int64 contiguous.
     num_parcel : int.
-    parcel_components : (num_parcel,) optional. If given, skips the internal
-        count step (CC still re-runs unless ``lh_ci_full`` / ``rh_ci_full``
-        are also supplied). The fast path is the default — leave this None.
-    lh_ci_full, rh_ci_full : (N,) optional. Sibling shortcut to ``parcel_components``.
-    copy_output : bool. If True (default), the returned array is a fresh copy
-        the caller can keep around. If False, returns a view into the workspace
-        — *the next call to component_distance with the same mesh will overwrite
-        it*. Use ``copy_output=False`` only inside a tight EM loop where you
-        consume eucli_dist before the next call.
+    parcel_components : (num_parcel,) — per-parcel component count from
+        :func:`compute_components_general`.
+    lh_ci_full, rh_ci_full : (N,) — per-hemi component ids from the same
+        :func:`compute_components_general` call.
 
     Returns
     -------
-    eucli_dist : (num_parcel,) float32. (Note: previous versions returned
-        float64. Audited against MATLAB GT before the MATLAB-decoupling
-        cleanup: <1 ULP drift end-to-end.)
+    eucli_dist : (num_parcel,) float32, a fresh copy the caller can keep.
     """
     ws = _get_workspace(lh_mesh, rh_mesh, num_parcel)
     n_lh = num_parcel // 2
@@ -489,8 +422,6 @@ def component_distance(lh_labels: np.ndarray,
     rh_nbors64 = _get_nbors64(rh_mesh["vertexNbors"])
     lh_xyz_T   = _get_xyz_T(lh_mesh["vertices"])    # (N, 3) float32
     rh_xyz_T   = _get_xyz_T(rh_mesh["vertices"])
-    lh_src, lh_dst, _ = _get_mesh_edges(lh_mesh["vertexNbors"])
-    rh_src, rh_dst, _ = _get_mesh_edges(rh_mesh["vertexNbors"])
 
     # Stage labels into the workspace as int64 (no-op if already int64 & contiguous).
     # casting="safe" tripwire: accepts widening int casts (int8/16/32 → int64) but
@@ -499,83 +430,18 @@ def component_distance(lh_labels: np.ndarray,
     np.copyto(ws.lh_labels64, lh_labels, casting="safe")
     np.copyto(ws.rh_labels64, rh_labels, casting="safe")
 
-    # ----- Phase 1 (slow path only): cc + count per hemi, dispatched parallel.
-    # Hot path from vmf_clustering_*.py supplies both ``parcel_components`` and
-    # ``lh_ci_full`` / ``rh_ci_full`` — Phase 1 is skipped entirely. The slow
-    # path pays one fork-join here; cc+count is ~1.0 ms/hemi serial → ~1.0 ms
-    # parallel.
-    need_cc = lh_ci_full is None or rh_ci_full is None
-    need_count = parcel_components is None
-    # ``count_per_parcel`` reads ws.lh_ci / ws.lh_n_comp, which are only
-    # written by ``cc_from_edges`` against the workspace. If the caller
-    # supplied lh_ci_full / rh_ci_full (external buffers) but not pc, count
-    # would otherwise read stale workspace data — must re-run cc so the
-    # workspace slots are populated for the current labels. This matches
-    # the pre-PR semantics (cc unconditional whenever pc was missing) and
-    # only fires on the (pc=None, ci=given) sibling-shortcut path; in-tree
-    # callers pass both, so the hot path is unaffected.
-    #
-    # Forward pointer: if the shortcut path ever becomes hot, the cleaner
-    # fix is to teach ``count_per_parcel`` to accept external (ci, n_comp)
-    # rather than reading the workspace slots — eliminates the ~50 µs of
-    # redundant cc work here (cc result then unused; fhd still consumes
-    # the caller's lh_ci_full). Kernel signature change is out of scope
-    # for this fixup.
-    if need_count:
-        need_cc = True
-    if need_cc or need_count:
-        def _lh_cc_count():
-            if need_cc:
-                _kernels.cc_from_edges(
-                    lh_src, lh_dst, ws.lh_labels64,
-                    ws.lh_parent, ws.lh_rank, ws.lh_comp_map,
-                    ws.lh_ci, ws.lh_n_comp,
-                )
-            if need_count:
-                _kernels.count_per_parcel(
-                    ws.lh_labels64, ws.lh_ci, int(ws.lh_n_comp[0]), n_lh, 0,
-                    ws.lh_comp_to_label, ws.lh_parcel_seen, ws.lh_count,
-                )
-
-        def _rh_cc_count():
-            if need_cc:
-                _kernels.cc_from_edges(
-                    rh_src, rh_dst, ws.rh_labels64,
-                    ws.rh_parent, ws.rh_rank, ws.rh_comp_map,
-                    ws.rh_ci, ws.rh_n_comp,
-                )
-            if need_count:
-                _kernels.count_per_parcel(
-                    ws.rh_labels64, ws.rh_ci, int(ws.rh_n_comp[0]), n_lh, n_lh,
-                    ws.rh_comp_to_label, ws.rh_parcel_seen, ws.rh_count,
-                )
-
-        _dispatch_lh_rh(_lh_cc_count, _rh_cc_count)
-
-        if need_cc:
-            if lh_ci_full is None:
-                lh_ci_full = ws.lh_ci
-            if rh_ci_full is None:
-                rh_ci_full = ws.rh_ci
-        if need_count:
-            ws.parcel_components[:n_lh] = ws.lh_count
-            ws.parcel_components[n_lh:] = ws.rh_count
-            pc = ws.parcel_components
-        else:
-            pc = np.asarray(parcel_components, dtype=np.float64)
-    else:
-        pc = np.asarray(parcel_components, dtype=np.float64)
+    pc = np.asarray(parcel_components, dtype=np.float64)
 
     # Early-out if no parcel is distributed.
     if not np.any(pc > 1):
         ws.eucli_dist[:] = np.float32(0.0)
-        return ws.eucli_dist.copy() if copy_output else ws.eucli_dist
+        return ws.eucli_dist.copy()
 
     # ----- Build is_single lookup (serial, main thread; cheap).
     ws.is_single[0] = False
     np.equal(pc, 1, out=ws.is_single[1:])
 
-    # ----- Phase 2: zero_singles + fused_hemi_distance per hemi, parallel.
+    # ----- zero_singles + fused_hemi_distance per hemi, parallel.
     # This is the hot phase — each hemi chain is ~0.94 ms (0.025 zero +
     # 0.92 fhd) serial; running in parallel collapses to ~0.94 ms wall, the
     # main saving over the 1.85 ms serial total.
@@ -607,4 +473,4 @@ def component_distance(lh_labels: np.ndarray,
     # ----- Concatenate into the workspace's eucli_dist buffer.
     ws.eucli_dist[:n_lh] = ws.lh_eucli
     ws.eucli_dist[n_lh:] = ws.rh_eucli
-    return ws.eucli_dist.copy() if copy_output else ws.eucli_dist
+    return ws.eucli_dist.copy()

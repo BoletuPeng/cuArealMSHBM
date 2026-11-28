@@ -6,8 +6,8 @@ What is pinned here
 1. **Bit-equality of the fast CPU route** — ``read_surface_gifti``
    (numba base64 + isal + staged transpose) against a reference route
    (per-chunk decode + strided column write), byte-for-byte on the
-   ``uint32`` view, for the serial and the chunk-parallel entry points
-   and for a payload of NaN / ±inf / -0.0 / subnormals.
+   ``uint32`` view, including a payload of NaN / ±inf / -0.0 /
+   subnormals.
    The oracle is ``_head_parse`` / ``_reference_read``, frozen copies
    in this file — NOT the live ``_scan_gifti_spans``, which would
    otherwise be compared with itself.
@@ -21,14 +21,12 @@ What is pinned here
    raises instead of leaking recycled device memory; no fixed
    timepoint ceiling; and the pipelined mode's device memory does not
    grow with the session count.
-4. **No nested-pool deadlock** — ``pool=<the caller's own pool>`` from
-   inside one of its workers demotes to the serial path.
-5. **The GPU base64 contract** — a ``'='`` outside the payload's final
+4. **The GPU base64 contract** — a ``'='`` outside the payload's final
    quad is an error (the decode table maps it to 0, so only the kernel's
    placement guard catches it) while every legal tail pad still decodes.
-6. **The tag scan emits int64 offsets** — matching a host bytescan
+5. **The tag scan emits int64 offsets** — matching a host bytescan
    exactly, so there is no byte-span ceiling on a pipeline group.
-7. **The shared pinned staging block is not duplicated** — a regrown
+6. **The shared pinned staging block is not duplicated** — a regrown
    buffer replaces the old one instead of holding both, a request
    inside the pool's rounded capacity reuses it, and a failure to pin
    the whole subject is reported as a host-staging limit, not as a
@@ -44,7 +42,6 @@ from __future__ import annotations
 import base64
 import re
 import zlib
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -207,19 +204,6 @@ def test_cpu_reader_bit_equal_on_exotic_floats(tmp_path: Path):
                           vals[0].view(np.uint32))
 
 
-def test_cpu_reader_chunk_parallel_matches_serial(tmp_path: Path):
-    """The chunk-range split must not perturb a single byte — the
-    ranges are disjoint writes into a shared staging buffer, so this
-    is the test that would catch an off-by-one in the split bounds."""
-    p = tmp_path / "b.func.gii"
-    p.write_bytes(_make_gifti(300, 37))
-    ref = read_surface_gifti(p)
-    for nw in (2, 3, 8, 64):
-        assert _bit_equal(read_surface_gifti(p, n_workers=nw), ref), nw
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        assert _bit_equal(read_surface_gifti(p, pool=pool, n_workers=4), ref)
-
-
 def test_cpu_reader_padding_lengths(tmp_path: Path):
     """``dim0`` chosen so the compressed payload hits each of the three
     base64 padding cases across timepoints — the strict kernel's ``=``
@@ -235,9 +219,8 @@ def test_cpu_reader_padding_lengths(tmp_path: Path):
 
 def test_cpu_reader_time_major_is_the_transpose(tmp_path: Path):
     """``time_major=True`` hands back the decode's own ``(T, N)`` layout:
-    the default output transposed, bit for bit, on every route (serial,
-    chunk-parallel, and the wrapped-b64 fallback). Step 1 reads this
-    way."""
+    the default output transposed, bit for bit, on both the strict
+    kernel and the wrapped-b64 fallback. Step 1 reads this way."""
     rng = np.random.default_rng(9)
     vals = rng.standard_normal((5, 96)).astype(np.float32)
     p = tmp_path / "tm.func.gii"
@@ -246,8 +229,6 @@ def test_cpu_reader_time_major_is_the_transpose(tmp_path: Path):
     got = read_surface_gifti(p, time_major=True)
     assert got.shape == (5, 96) and got.flags["C_CONTIGUOUS"]
     assert _bit_equal(got, want)
-    assert _bit_equal(read_surface_gifti(p, time_major=True, n_workers=3),
-                      want)
     w = tmp_path / "tmw.func.gii"
     w.write_bytes(_make_gifti(96, 5, values=vals, wrap=True))
     assert _bit_equal(read_surface_gifti(w, time_major=True), want)
@@ -292,24 +273,6 @@ def test_cpu_reader_accepts_wrapped_b64_by_default(tmp_path: Path):
         p = tmp_path / f"{name}.func.gii"
         p.write_bytes(b"".join(out))
         assert _bit_equal(read_surface_gifti(p), _reference_read(p)), name
-
-
-def test_cpu_reader_nested_pool_does_not_deadlock(tmp_path: Path):
-    """Passing the caller's OWN pool from inside one of its workers is
-    the obvious integration mistake (the prefetchers own exactly such a
-    pool). It must demote to the serial path, not hang."""
-    import concurrent.futures as cf
-
-    p = tmp_path / "nest.func.gii"
-    p.write_bytes(_make_gifti(128, 9))
-    ref = read_surface_gifti(p)
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        futs = [pool.submit(read_surface_gifti, p, pool=pool, n_workers=2)
-                for _ in range(2)]
-        done, pending = cf.wait(futs, timeout=30)
-        assert not pending, "read_surface_gifti(pool=own pool) deadlocked"
-        for f in done:
-            assert _bit_equal(f.result(), ref)
 
 
 def test_cpu_reader_still_rejects_off_contract(tmp_path: Path):

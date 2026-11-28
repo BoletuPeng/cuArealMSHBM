@@ -127,6 +127,76 @@ def _renumber_labels(labels: np.ndarray) -> np.ndarray:
     return out
 
 
+def _mw_zeroed_labels(lh_labels: np.ndarray, rh_labels: np.ndarray):
+    """Both backends' label prologue: ``(lh_labels, rh_labels,
+    medial_mask)`` as int64 vectors with the medial wall set to 0, and
+    the concatenated lh+rh medial-wall mask."""
+    lh_labels = np.asarray(lh_labels, dtype=np.int64).ravel()
+    rh_labels = np.asarray(rh_labels, dtype=np.int64).ravel()
+    n_lh = lh_labels.size
+    n_rh = rh_labels.size
+
+    medial_mask = _load_medial_mask()
+    if medial_mask.shape[0] != n_lh + n_rh:
+        raise ValueError(
+            f"medial_mask size ({medial_mask.shape[0]}) != lh+rh labels "
+            f"({n_lh + n_rh})"
+        )
+
+    lh_labels = lh_labels.copy()
+    rh_labels = rh_labels.copy()
+    lh_labels[medial_mask[:n_lh]] = 0
+    rh_labels[medial_mask[n_lh:]] = 0
+    return lh_labels, rh_labels, medial_mask
+
+
+def _merged_labels(lh_labels: np.ndarray, rh_labels: np.ndarray,
+                   keep_mask: np.ndarray):
+    """``(labels, rh_labels_offset, L)``: the lh+rh labels merged with rh
+    offset by ``max(lh_labels)``, renumbered to ``1..L`` and zeroed on
+    the rows the keep-detector rejected, so the kernels can use
+    ``label > 0`` as the unified "row contributes" guard."""
+    max_lh = int(lh_labels.max()) if lh_labels.size else 0
+    rh_labels_offset = rh_labels.copy()
+    rh_labels_offset[rh_labels_offset != 0] += max_lh
+    labels = _renumber_labels(
+        np.concatenate([lh_labels, rh_labels_offset]).astype(np.int64)
+    )
+    labels[~keep_mask] = 0
+    L = int(labels.max()) if labels.size else 0
+    if L == 0:
+        raise RuntimeError("ini_params: no non-zero labels — empty parcellation")
+    return labels, rh_labels_offset, L
+
+
+def _ini_params_result(out_dir: str, mtc: np.ndarray, epsil: float,
+                       labels: np.ndarray, keep_mask: np.ndarray,
+                       n_keep: int, L: int, lh_labels: np.ndarray,
+                       rh_labels_offset: np.ndarray, *, save: bool,
+                       save_async: bool) -> IniParamsResult:
+    """Both backends' epilogue: materialize the dense one-hot lambda for
+    the saved ``group.mat`` (the reductions never need it), assemble the
+    result and, when ``save``, write it."""
+    keep_idx = np.flatnonzero(keep_mask)
+    lam = np.zeros((n_keep, L), dtype=np.uint8)
+    keep_labels = labels[keep_idx]
+    has_label = keep_labels > 0
+    lam[np.flatnonzero(has_label), keep_labels[has_label] - 1] = 1
+
+    out = IniParamsResult({
+        "mtc": mtc,
+        "epsil": np.array([[epsil]], dtype=np.float64),
+        "lambda": lam,
+        "lh_labels": lh_labels.reshape(-1, 1),
+        "rh_labels": rh_labels_offset.reshape(-1, 1),
+    })
+
+    if save:
+        out.writer = write_group_mat(out_dir, out, background=save_async)
+
+    return out
+
+
 def generate_ini_params(
     lh_labels: np.ndarray,
     rh_labels: np.ndarray,
@@ -192,22 +262,10 @@ def generate_ini_params(
             "buffers and are only accepted by backend='gpu'. Pass "
             "precomputed_{lh,rh}_avg (host arrays) on the CPU backend."
         )
-    lh_labels = np.asarray(lh_labels, dtype=np.int64).ravel()
-    rh_labels = np.asarray(rh_labels, dtype=np.int64).ravel()
+    lh_labels, rh_labels, medial_mask = _mw_zeroed_labels(
+        lh_labels, rh_labels)
     n_lh = lh_labels.size
     n_rh = rh_labels.size
-
-    medial_mask = _load_medial_mask()
-    if medial_mask.shape[0] != n_lh + n_rh:
-        raise ValueError(
-            f"medial_mask size ({medial_mask.shape[0]}) != lh+rh labels "
-            f"({n_lh + n_rh})"
-        )
-
-    lh_labels = lh_labels.copy()
-    rh_labels = rh_labels.copy()
-    lh_labels[medial_mask[:n_lh]] = 0
-    rh_labels[medial_mask[n_lh:]] = 0
 
     if precomputed_lh_avg is not None and precomputed_rh_avg is not None:
         profile_mat = _concat_precomputed_avg(
@@ -233,19 +291,8 @@ def generate_ini_params(
 
     _demean_l2norm_inplace_kernel(profile_mat, keep_mask)
 
-    # Merge labels with rh offset by max(lh_labels); zero-out rows that
-    # the keep-detector rejected so the kernels can use ``label > 0`` as
-    # the unified "row contributes" guard.
-    max_lh = int(lh_labels.max()) if lh_labels.size else 0
-    rh_labels_offset = rh_labels.copy()
-    rh_labels_offset[rh_labels_offset != 0] += max_lh
-    labels = _renumber_labels(
-        np.concatenate([lh_labels, rh_labels_offset]).astype(np.int64)
-    )
-    labels[~keep_mask] = 0
-    L = int(labels.max()) if labels.size else 0
-    if L == 0:
-        raise RuntimeError("ini_params: no non-zero labels — empty parcellation")
+    labels, rh_labels_offset, L = _merged_labels(
+        lh_labels, rh_labels, keep_mask)
 
     mtc = np.empty((d_orig, L), dtype=np.float64)
     _groupsum_kernel(profile_mat, labels, L, mtc)
@@ -257,25 +304,7 @@ def generate_ini_params(
     epsil_input = float(_epsil_input_kernel(inner, labels) / n_keep)
     epsil = invAd(d_orig - 1, epsil_input)
 
-    # Materialize the dense one-hot lambda for the saved group.mat
-    # (the kernels above never needed it).
-    keep_idx = np.flatnonzero(keep_mask)
-    lam = np.zeros((n_keep, L), dtype=np.uint8)
-    keep_labels = labels[keep_idx]
-    has_label = keep_labels > 0
-    lam[np.flatnonzero(has_label), keep_labels[has_label] - 1] = 1
-
-    out = IniParamsResult({
-        "mtc": mtc,
-        "epsil": np.array([[epsil]], dtype=np.float64),
-        "lambda": lam,
-        "lh_labels": lh_labels.reshape(-1, 1),
-        "rh_labels": rh_labels_offset.reshape(-1, 1),
-    })
-
-    if save:
-        out.writer = write_group_mat(
-            out_dir, out, compress=True, background=save_async,
-        )
-
-    return out
+    return _ini_params_result(
+        out_dir, mtc, epsil, labels, keep_mask, n_keep, L,
+        lh_labels, rh_labels_offset, save=save, save_async=save_async,
+    )

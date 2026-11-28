@@ -61,9 +61,8 @@ def test_bit_exact_vs_cpu(N, K, M, seed):
     """GPU output is bit-identical to CPU on synthetic Gaussian data
     with a random K-NN table (NaN padding included)."""
     import cupy as cp
-    from arealmshbm.local_minima import (
-        find_minima_gpu, prepare_K_neighbors_for_gpu,
-    )
+    from arealmshbm.local_minima import find_minima_gpu
+    from arealmshbm.watershed import prepare_neighbors_for_gpu
 
     rng = np.random.default_rng(seed)
     data = rng.standard_normal((N, K)).astype(np.float32)
@@ -71,7 +70,7 @@ def test_bit_exact_vs_cpu(N, K, M, seed):
 
     out_cpu = find_minima(data, K_neighbors)
 
-    nb_d = prepare_K_neighbors_for_gpu(K_neighbors)
+    nb_d = prepare_neighbors_for_gpu(K_neighbors)
     out_gpu_d = find_minima_gpu(data, nb_d)
     out_gpu = cp.asnumpy(out_gpu_d)
 
@@ -92,15 +91,14 @@ def test_device_input_alias():
     alias (no copy) and the result matches the host-input path.
     """
     import cupy as cp
-    from arealmshbm.local_minima import (
-        find_minima_gpu, prepare_K_neighbors_for_gpu,
-    )
+    from arealmshbm.local_minima import find_minima_gpu
+    from arealmshbm.watershed import prepare_neighbors_for_gpu
 
     rng = np.random.default_rng(7)
     N, K, M = 512, 32, 16
     data = rng.standard_normal((N, K)).astype(np.float32)
     K_neighbors = _synth_K_neighbors(N, M, rng)
-    nb_d = prepare_K_neighbors_for_gpu(K_neighbors)
+    nb_d = prepare_neighbors_for_gpu(K_neighbors)
 
     out_host_input_d = find_minima_gpu(data, nb_d)
     out_dev_input_d = find_minima_gpu(cp.asarray(data), nb_d)

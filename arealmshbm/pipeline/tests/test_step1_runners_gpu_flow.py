@@ -130,7 +130,7 @@ def test_single_subject_in_memory_chain_matches_disk(tmp_path, monkeypatch):
     handles: list = []
     paths = run_generate_profiles(
         project_dir=proj, subjects=subjects, sessions=sessions,
-        backend="gpu", verbose=False,
+        threshold=0.1, backend="gpu", verbose=False,
         avg_accumulator=acc, write_handles=handles,
     )
     assert [p[0] for p in paths] == ["1"]
@@ -208,7 +208,7 @@ def test_multi_subject_joins_per_subject(tmp_path):
     handles: list = []
     paths = run_generate_profiles(
         project_dir=proj, subjects=subjects, sessions=sessions,
-        backend="gpu", verbose=False,
+        threshold=0.1, backend="gpu", verbose=False,
         avg_accumulator=acc, write_handles=handles,
     )
     assert [p[0] for p in paths] == ["1", "2"]
@@ -261,7 +261,7 @@ def test_cpu_backend_rejects_the_accumulator_handoff(tmp_path):
     with pytest.raises(ValueError, match="GPU-only"):
         run_generate_profiles(
             project_dir=tmp_path, subjects=["1"], sessions=["1"],
-            backend="cpu",
+            threshold=0.1, backend="cpu",
             avg_accumulator=_FakeAccumulator(1),
         )
 
@@ -369,7 +369,7 @@ def test_fused_gpu_path_reports_each_subject_when_verbose(
         capsys.readouterr()
         step1_runners.run_generate_profiles(
             project_dir=tmp_path, subjects=["1"], sessions=["1", "2"],
-            backend="gpu", verbose=verbose,
+            threshold=0.1, backend="gpu", verbose=verbose,
         )
         return capsys.readouterr().out
 

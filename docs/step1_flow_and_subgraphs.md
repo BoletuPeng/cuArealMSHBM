@@ -163,8 +163,9 @@ arealmshbm/
 │   ├── _kernels_gpu.py                      CuPy RawKernels: bounded pull-based Bellman-Ford
 │   │                                        (radius mask) + sssp_batch32 (central sulcus)
 │   ├── _common.py                           mesh CSR from vertexNbors, aparc read, mask→csc
-│   ├── radius_mask.py                       CPU supercall + dispatch shim
-│   └── radius_mask_gpu.py                   GPU supercall (classify+truncate stay CPU)
+│   ├── radius_mask.py                       supercall: host frame (mesh/aparc load, .mat write)
+│   │                                        for both backends + the CPU per-hemi body
+│   └── radius_mask_gpu.py                   GPU per-hemi body (classify+truncate stay CPU)
 │
 └── data_io/
     ├── profile_io.py                        per-subject .b2nd writer/reader (blosc2 LZ4+bitshuffle,
@@ -197,7 +198,10 @@ first 642 vertices of each fsaverage6 hemisphere.
 Each runner takes a ``backend ∈ {'cpu', 'gpu'}`` keyword. For
 subgraphs 3–4, and for subgraph 2's disk flow, it passes it straight
 through to the leaf supercall, where a single `if backend == 'gpu':`
-branch lazily imports the `<leaf>_gpu.py` sibling and tail-calls it.
+branch lazily imports the `<leaf>_gpu.py` sibling and tail-calls it
+(`radius_mask` keeps the mesh / aparc load and the `.mat` write in its
+own supercall and takes only the per-hemisphere body from
+`radius_mask_gpu.run_hemi_gpu`).
 Subgraph 2's in-memory GPU flow (the driver's GPU path, where
 subgraph 1 filled the accumulator) does not reach that branch:
 `run_avg_profiles` hands the accumulator to
@@ -325,7 +329,7 @@ clean-8cb68a0 GPU run: compare a GPU candidate against a GPU baseline,
 or pin `backend_step1='cpu'` when a byte-exact A/B is what is
 wanted.
 
-| Subgraph (GPU, warm critical path) | 8cb68a0 | now |
+| Subgraph (GPU, warm critical path) | 8cb68a0 | fused chain (2026-09-04) |
 |---|---:|---:|
 | generate_profiles | 0.61 s | 0.18 s |
 | avg_profiles | 0.32 s | 0.04 s |
@@ -349,10 +353,10 @@ disk-mediated flow.
 ## Wall
 
 **2026-09-26, cohort host memory (40-subject reference cohort, driver step 1,
-gpu, prewarmed).** The cohort average is now accumulated on device
-inside the profile leaf (`on_packed`) instead of from pageable copies
-of every subject's packed slab retained until `avg_profiles` and
-re-uploaded: peak host working set 5.61 → 2.42 GiB. The wall was
+gpu, prewarmed).** Accumulating the cohort average on device inside
+the profile leaf (`on_packed`), with no subject's packed slab held on
+host past its `.b2nd` write, puts the peak host working set at
+2.42 GiB against 5.61 GiB for the 4cd6fe1 flow. The wall was
 9.8 → 8.8 s on one run of each tree, which says "not slower" and no
 more (no noise band was measured); every step-1/2/3 artifact is
 bit-identical to merge-base 4cd6fe1.
@@ -390,15 +394,18 @@ decode of `.nii.gz` ≈ 263 ms, `.b2nd` write (bitpack + LZ4) ≈ 295 ms
 amortized, D2H + MW-zero ≈ 122 ms, vs only ~30 ms of actual GPU work.
 The GPU sits idle ~95 % of the time on the raw per-iter wall.
 
-To collapse this we run `generate_profiles` as a step0-style
-phase-pipeline. Four stages, each on its own worker thread, with
-`queue.Queue(maxsize=2)` backpressure between them:
+The measurement below collapses this with a step0-style
+phase-pipeline: four stages, each on its own worker thread, with
+`queue.Queue(maxsize=2)` backpressure between them. The same
+coordinator is the CPU backend's; its LEAF stage runs the numba leaf,
+where the 2026-05 run had a per-session GPU leaf (the timings below):
 
 ```
-[GZIP pool] → qIN → [Stage GPU] → qPOST → [Stage POST] → qASSEM → [Stage ASSEM] → [WRITE pool]
- 8 workers          1 thread             1 thread            1 thread          1 worker
- ~30 ms / sess      ~180 ms / sess       ~200 ms / sess      buffers 6 sess    295 ms / sess
-                    H2D + sgemm + D2H    (K,V)→(V,K) copy    per sub           bitpack + LZ4
+[GZIP pool] → qIN → [Stage LEAF] → qPOST → [Stage POST] → qASSEM → [Stage ASSEM] → [WRITE pool]
+ 8 workers          1 thread              1 thread            1 thread          1 worker
+ ~30 ms / sess      ~180 ms / sess        ~200 ms / sess      buffers 6 sess    295 ms / sess
+                    (2026-05: H2D +       (K,V)→(V,K) copy    per sub           bitpack + LZ4
+                     sgemm + D2H)
 ```
 
 * **`Step1BoldPrefetcher`** ([`_step1_bold_prefetcher.py`](../arealmshbm/pipeline/_step1_bold_prefetcher.py))

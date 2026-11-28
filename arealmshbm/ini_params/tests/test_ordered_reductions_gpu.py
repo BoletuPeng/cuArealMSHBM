@@ -116,7 +116,7 @@ def test_colnorm_bit_exact_vs_numpy(N, D, L):
     if L == 1:
         # (D, 1) is contiguous along the reduction axis -> numpy uses
         # pairwise summation there. The kernel keeps the CPU-matching
-        # sequential order on purpose (production L is 300-400), so
+        # sequential order on purpose (production L is 100-1000), so
         # only a tight bound is claimed. See colnorm_scale_cupy's
         # docstring.
         rel = np.abs(got - expect) / np.maximum(np.abs(expect), 1e-300)

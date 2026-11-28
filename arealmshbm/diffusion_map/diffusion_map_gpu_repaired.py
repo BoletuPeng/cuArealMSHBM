@@ -33,7 +33,6 @@ if TYPE_CHECKING:  # type-only import — cupy stays a soft dependency at runtim
 def compute_diffusion_map_gpu_repaired(
     dist: "Union[np.ndarray, cp.ndarray]",
     *,
-    alpha: float = 0.5,
     n_components: int = 100,
 ) -> np.ndarray:
     """Repaired GPU diffusion-map embedding of a precomputed distance matrix.
@@ -67,6 +66,5 @@ def compute_diffusion_map_gpu_repaired(
 
     return compute_diffusion_map_gpu(
         L,
-        alpha=alpha,
         n_components=n_components,
     )

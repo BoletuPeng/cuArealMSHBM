@@ -34,8 +34,8 @@ input: BOLD time series for one subject, N sessions
 [step 0]  arealmshbm.step0_pipeline
           → diffusion embedding (gradients/sub<S>/{lh,rh}_emb_100_distance_matrix.npy)
         ↓
-[step 1]  arealmshbm.pipeline.step1_runners.run_generate_profiles  (×N sessions)
-          → RSFC profile (correlation with fsaverage3 seeds, packed (sessions, vertices, ⌈D/8⌉) per subject)
+[step 1]  arealmshbm.pipeline.step1_runners.run_generate_profiles  (per subject, all sessions)
+          → RSFC profile (correlation with fsaverage3 seeds, packed (sessions, vertices, ⌈D/8⌉) .b2nd per subject)
         ↓
 [prior]   group prior must already sit at
           project_dir/priors/gMSHBM/beta<X>/Params_Final.mat
@@ -56,7 +56,7 @@ inputs: BOLD time series for K subjects (K=40 in our fork), N sessions each
         ↓
 [step 0]  arealmshbm.step0_pipeline × K subjects
         ↓
-[step 1]  arealmshbm.pipeline.step1_runners.run_generate_profiles × K × N
+[step 1]  arealmshbm.pipeline.step1_runners.run_generate_profiles (K subjects × N sessions)
         ↓
 [step 2]  arealmshbm.step2_pipeline
           → run a coupled EM across ALL K subjects to estimate
@@ -101,6 +101,8 @@ At run time the driver reads the Mode A prior from **one place only**:
 <project>/priors/<variant>/beta<beta_scalar>/Params_Final.mat
 ```
 
+(dMSHBM has no `beta<beta_scalar>/` folder.)
+
 Putting it there is the project creator's job. The pipeline has no
 `prior_source` knob and never reaches outside the project — no HCP/CBIG
 fallback, no cross-project lookup. Mode B writes this same slot itself
@@ -112,7 +114,7 @@ Sources a creator can copy from (toolkits, never read at run time):
 |---|---|---|
 | `arealmshbm/data/group_priors/HCP_40sub/<K>/...` | optional local staging of CBIG's fsaverage6 priors — not shipped here (see `arealmshbm/data/README.md`) | whatever was staged |
 | `$CBIG_CODE_DIR/.../Kong2022_ArealMSHBM/lib/group_priors/` | CBIG checkout (creator-side; not read at runtime) | full K=100…1000 |
-| another project's `priors/<variant>/beta<X>/Params_Final.mat` | a prior `modeB_train_prior` run | whatever it trained |
+| another project's `priors/<variant>/[beta<X>/]Params_Final.mat` | a prior `modeB_train_prior` run | whatever it trained |
 
 `cp` the chosen `Params_Final.mat` into the project slot above before
 running Mode A. The spatial mask is not staged: step 1 builds it

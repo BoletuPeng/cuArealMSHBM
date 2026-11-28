@@ -14,7 +14,7 @@ Public API:
                            spatial_connect_prior.
     (other small numeric helpers used by the two assemble passes.)
 
-Buffer reference (Mode A, fsaverage6, 300 ROIs):
+Buffer reference (single subject, fsaverage6, 300 ROIs):
     N    = 81924  (bilateral vertex count)
     L    = 300    (clusters; LH parcels = L/2, RH = L/2)
     n_lh = N/2    (left-hemisphere vertex count)
@@ -149,7 +149,7 @@ def col_norms_3xL_f32(lambda_X, out):
     Outputs:
         out      : (L,) float32 rewritten.
     """
-    three, L = lambda_X.shape
+    L = lambda_X.shape[1]
     for k in range(L):
         s = (lambda_X[0, k] * lambda_X[0, k]
              + lambda_X[1, k] * lambda_X[1, k]
@@ -175,7 +175,7 @@ def divide_cols_3xL_inplace_f32(lambda_X, col_norms, out):
     Outputs:
         out       : (3, L) float32 rewritten.
     """
-    three, L = lambda_X.shape
+    L = lambda_X.shape[1]
     for k in range(L):
         c = col_norms[k]
         out[0, k] = lambda_X[0, k] / c
@@ -241,26 +241,6 @@ def cast_f64_to_f32_1d(src, dst):
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# Workspace fp32 cast helper (used by both Sessions when caller hands fp64).
-# Mirrors V_lambda/_kernels.cast_f64_to_f32 — kept here too so each module
-# is self-contained.
-# ─────────────────────────────────────────────────────────────────────────
-@nb.njit(cache=True, fastmath=False, boundscheck=False)
-def cast_f64_to_f32_2d(src, dst):
-    """Single-core fp64 → fp32 cast for a 2D array.
-
-    Inputs:
-        src : (N, M) float64 read-only
-    Outputs:
-        dst : (N, M) float32 rewritten
-    """
-    N, M = src.shape
-    for i in range(N):
-        for j in range(M):
-            dst[i, j] = np.float32(src[i, j])
-
-
-# ─────────────────────────────────────────────────────────────────────────
 # Warmup
 # ─────────────────────────────────────────────────────────────────────────
 def warmup() -> None:
@@ -300,7 +280,3 @@ def warmup() -> None:
     src1d = np.full(L, 0.4, dtype=np.float64)
     dst1d = np.empty(L, dtype=np.float32)
     cast_f64_to_f32_1d(src1d, dst1d)
-
-    src = np.full((N, L), 0.4, dtype=np.float64)
-    dst = np.empty((N, L), dtype=np.float32)
-    cast_f64_to_f32_2d(src, dst)

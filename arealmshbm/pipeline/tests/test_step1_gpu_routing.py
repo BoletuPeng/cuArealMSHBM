@@ -34,7 +34,7 @@ def _project(tmp_path: Path) -> Path:
 def _call(project: Path, **over):
     kwargs = dict(
         project_dir=project, subjects=["1"], sessions=["1"],
-        backend="gpu", verbose=False,
+        threshold=0.1, backend="gpu", verbose=False,
     )
     kwargs.update(over)
     return step1_runners.run_generate_profiles(**kwargs)
