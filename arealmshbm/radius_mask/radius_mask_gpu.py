@@ -1,6 +1,6 @@
 """radius_mask_gpu.py
 
-GPU supercall for the radius_mask supergraph. The two heavy SSSP
+GPU per-hemisphere body of the radius_mask supergraph. The two heavy SSSP
 kernels run different solvers, because the two problems have opposite
 shapes. ``add_spatial_constraint`` is K = L_h ≈ 150 problems bounded
 at 30 mm — a shallow wave over a fifth of the mesh, which the batched
@@ -26,24 +26,18 @@ Hybrid layout per hemi:
                + avg_dis; ~1 ms each).
 
 cupy is imported at module top — this file is only loaded via the
-``backend == 'gpu'`` dispatch branch in :mod:`.radius_mask`.
+``backend == 'gpu'`` dispatch branch in :mod:`.radius_mask`, which
+owns the mesh / aparc load and the ``.mat`` write for both backends.
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """
 
 from __future__ import annotations
 
-import time
-from pathlib import Path
-from typing import Optional
-
 import cupy as cp
 import numpy as np
-import scipy.io as sio
 
-from ..data_io.load_avg_mesh import load_avg_mesh
-from ._common import (_build_mesh_csr, _coerce_labels, _mask_to_csc,
-                      _read_aparc)
+from ._common import _build_mesh_csr
 from ._kernels import (
     build_parcel_csr_kernel,
     classify_central_relevance_kernel,
@@ -58,9 +52,9 @@ from ._kernels_gpu import (
 )
 
 
-def _run_hemi_gpu(hemi: str, mesh_d: dict, labels: np.ndarray,
-                   aparc: np.ndarray, radius: float,
-                   timings: dict, verbose: bool) -> np.ndarray:
+def run_hemi_gpu(hemi: str, mesh_d: dict, labels: np.ndarray,
+                 aparc: np.ndarray, radius: float,
+                 verbose: bool) -> np.ndarray:
     """Per-hemi: GPU SSSPs (bounded for radius mask + unbounded for
     central sulcus) + CPU classify/truncate. Returns a (V, L_h) uint8
     host array — the post-truncate boundary mask.
@@ -71,7 +65,6 @@ def _run_hemi_gpu(hemi: str, mesh_d: dict, labels: np.ndarray,
         print(f"==> {hemi} (gpu) ...")
 
     # ── Mesh CSR build (CPU) + H2D ──
-    t = time.perf_counter()
     indptr_h, indices_h, weights_h = _build_mesh_csr(
         mesh_d["vertices"], mesh_d["faces"], mesh_d["vertexNbors"],
     )
@@ -79,18 +72,15 @@ def _run_hemi_gpu(hemi: str, mesh_d: dict, labels: np.ndarray,
     indices_dev = cp.asarray(indices_h)
     weights_dev = cp.asarray(weights_h)
     labels_dev = cp.asarray(labels)
-    timings[f"build_csr_{hemi}_s"] = time.perf_counter() - t
 
     parcel_offs, parcel_inds = build_parcel_csr_kernel(labels, L_h)
     pre_verts = np.flatnonzero(aparc == 25).astype(np.int64)
     post_verts = np.flatnonzero(aparc == 23).astype(np.int64)
 
     # ── Classify (CPU; needs aparc + labels) ──
-    t = time.perf_counter()
     relevant_parcels, relevant_verts = classify_central_relevance_kernel(
         labels, aparc, L_h,
     )
-    timings[f"classify_{hemi}_s"] = time.perf_counter() - t
 
     # ── central_sulcus on GPU (batched delta-stepping SSSP) ──
     # Nsrc single-source problems, 32 sources per CTA. Only the rows at
@@ -101,7 +91,6 @@ def _run_hemi_gpu(hemi: str, mesh_d: dict, labels: np.ndarray,
     src_concat = np.concatenate([pre_verts, post_verts]).astype(np.int32)
     rel_verts = np.flatnonzero(relevant_verts).astype(np.int32)
 
-    t = time.perf_counter()
     tab_dev = build_edge_table(indptr_h, indices_h, weights_h)
     delta = _SSSP_DELTA_MULT * float(weights_h.mean(dtype=np.float64))
     dist_rel_dev = central_sulcus_distances_cupy(
@@ -137,10 +126,8 @@ def _run_hemi_gpu(hemi: str, mesh_d: dict, labels: np.ndarray,
         rows = row_of[parcel_inds[ps:pe]]
         avg_dis[0, l_idx] = float(sum_pre_rel[rows].sum()) / (float(n_v) * Npre_f)
         avg_dis[1, l_idx] = float(sum_post_rel[rows].sum()) / (float(n_v) * Npost_f)
-    timings[f"central_sulcus_{hemi}_s"] = time.perf_counter() - t
 
     # ── add_spatial_constraint on GPU (batched BF, bounded by radius) ──
-    t = time.perf_counter()
     dist_parc_dev = cp.empty((V, L_h), dtype=cp.float32)
     scratch_parc_dev = cp.empty_like(dist_parc_dev)
     init_dist_for_parcels_cupy(labels_dev, dist_parc_dev)
@@ -153,62 +140,7 @@ def _run_hemi_gpu(hemi: str, mesh_d: dict, labels: np.ndarray,
     out_mask_dev = (dist_parc_dev <= cp.float32(radius)).astype(cp.uint8)
     out_mask = cp.asnumpy(out_mask_dev)
     del dist_parc_dev, scratch_parc_dev, out_mask_dev
-    timings[f"add_spatial_constraint_{hemi}_s"] = time.perf_counter() - t
 
     # ── truncate (CPU; small + heavy control-flow) ──
-    t = time.perf_counter()
     truncate_kernel(out_mask, avg_dis, labels, aparc)
-    timings[f"truncate_{hemi}_s"] = time.perf_counter() - t
     return out_mask
-
-
-def generate_radius_mask_gpu(lh_labels: np.ndarray,
-                              rh_labels: np.ndarray,
-                              radius,
-                              out_dir,
-                              verbose: bool = True,
-                              atlas_dir: Optional[str] = None,
-                              ) -> dict:
-    """GPU port of :func:`radius_mask.generate_radius_mask`. Same output
-    schema (``lh_boundary``, ``rh_boundary`` as csc_matrix in
-    ``spatial_mask.mat``). ``atlas_dir`` is an atlas-dir
-    override for the ``fsaverage6/label/<hemi>.aparc.annot``
-    lookup; ``None`` ⇒ ``MSHBM_ATLAS_DIR``. Mesh geometry comes from the
-    shipped avg_mesh bundles, not from here.
-    """
-    radius_f = float(radius)
-    timings: dict = {}
-
-    lh_mesh = load_avg_mesh("lh", "inflated")
-    rh_mesh = load_avg_mesh("rh", "inflated")
-    lh_aparc = _read_aparc("lh", atlas_dir=atlas_dir)
-    rh_aparc = _read_aparc("rh", atlas_dir=atlas_dir)
-
-    lh_labels = _coerce_labels(lh_labels)
-    rh_labels = _coerce_labels(rh_labels)
-
-    if verbose:
-        print("1. compute geodesic + per-parcel mask (gpu Bellman-Ford)")
-    lh_out = _run_hemi_gpu("lh", lh_mesh, lh_labels, lh_aparc, radius_f,
-                           timings, verbose)
-    rh_out = _run_hemi_gpu("rh", rh_mesh, rh_labels, rh_aparc, radius_f,
-                           timings, verbose)
-
-    # Save as csc_matrix(double) — matches the CPU supercall's on-disk schema.
-    lh_sparse = _mask_to_csc(lh_out)
-    rh_sparse = _mask_to_csc(rh_out)
-    out_dir = Path(out_dir)
-    out_subdir = out_dir / "spatial_mask"
-    out_subdir.mkdir(parents=True, exist_ok=True)
-    mat_path = out_subdir / "spatial_mask.mat"
-    sio.savemat(str(mat_path),
-                {"lh_boundary": lh_sparse, "rh_boundary": rh_sparse},
-                do_compression=True)
-    if verbose:
-        print(f"Saved: {mat_path}")
-    return {
-        "lh_boundary": lh_sparse,
-        "rh_boundary": rh_sparse,
-        "mat_path": str(mat_path),
-        "timings": timings,
-    }

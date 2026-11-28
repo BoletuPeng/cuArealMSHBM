@@ -1,9 +1,11 @@
 """radius_mask.py
 
-Supercall for the radius_mask supergraph.
+Supercall for the radius_mask supergraph: one host frame (mesh and
+aparc load, label coercion, ``.mat`` write) around a per-hemisphere
+body picked by ``backend``.
 
-CPU path: numba kernels in :mod:`._kernels` called directly.
-Dispatch on ``backend='gpu'`` defers to :mod:`.radius_mask_gpu` — a
+CPU body: numba kernels in :mod:`._kernels` called directly.
+``backend='gpu'`` takes the body from :mod:`.radius_mask_gpu` — a
 frontier delta-stepping SSSP for the central-sulcus family and a
 batched pull-based Bellman-Ford on a (V, L_h) distance matrix for the
 bounded radius mask. cupy is imported lazily — the CPU path never
@@ -14,9 +16,7 @@ Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """
 from __future__ import annotations
 
-import time
 from pathlib import Path
-from typing import Optional
 
 import numba
 import numpy as np
@@ -36,28 +36,23 @@ from ._kernels import (
 
 def _run_hemi(hemi: str, mesh_d: dict, labels: np.ndarray,
               aparc: np.ndarray, radius: float,
-              timings: dict, verbose: bool) -> np.ndarray:
+              verbose: bool) -> np.ndarray:
     L_h = int(labels.max())
     V = labels.shape[0]
     if verbose:
         print(f"==> {hemi} ...")
 
-    t = time.perf_counter()
     indptr, indices, weights = _build_mesh_csr(
         mesh_d["vertices"], mesh_d["faces"], mesh_d["vertexNbors"])
-    timings[f"build_csr_{hemi}_s"] = time.perf_counter() - t
 
     parcel_offs, parcel_inds = build_parcel_csr_kernel(labels, L_h)
     pre_verts = np.flatnonzero(aparc == 25).astype(np.int64)
     post_verts = np.flatnonzero(aparc == 23).astype(np.int64)
 
-    t = time.perf_counter()
     relevant_parcels, relevant_verts = classify_central_relevance_kernel(
         labels, aparc, L_h)
-    timings[f"classify_{hemi}_s"] = time.perf_counter() - t
 
     avg_dis = np.empty((2, L_h), dtype=np.float64)
-    t = time.perf_counter()
     central_sulcus_kernel(
         indptr, indices, weights,
         pre_verts, post_verts,
@@ -67,10 +62,8 @@ def _run_hemi(hemi: str, mesh_d: dict, labels: np.ndarray,
         avg_dis,
         numba.get_num_threads(),
     )
-    timings[f"central_sulcus_{hemi}_s"] = time.perf_counter() - t
 
     out_mask = np.zeros((V, L_h), dtype=np.uint8)
-    t = time.perf_counter()
     add_spatial_constraint_kernel(
         indptr, indices, weights,
         labels,
@@ -80,82 +73,70 @@ def _run_hemi(hemi: str, mesh_d: dict, labels: np.ndarray,
         out_mask,
         numba.get_num_threads(),
     )
-    timings[f"add_spatial_constraint_{hemi}_s"] = time.perf_counter() - t
 
-    t = time.perf_counter()
     truncate_kernel(out_mask, avg_dis, labels, aparc)
-    timings[f"truncate_{hemi}_s"] = time.perf_counter() - t
 
     return out_mask
 
 
 def generate_radius_mask(lh_labels: np.ndarray,
                          rh_labels: np.ndarray,
-                         radius,
+                         radius: float,
                          out_dir,
                          verbose: bool = True,
                          backend: str = "cpu",
-                         atlas_dir: Optional[str] = None,
                          ) -> dict:
     """Per-parcel radius mask + central-sulcus truncation on the
     fsaverage6 mesh.
 
-    Pipeline (per hemi; numba kernels after the numpy mesh-CSR build):
+    Pipeline (per hemi):
 
       build_mesh_csr → classify_central_relevance → central_sulcus
       → add_spatial_constraint → truncate.
 
-    ``backend='gpu'`` dispatches to :func:`radius_mask_gpu.generate_radius_mask_gpu`.
+    The mesh / aparc load, the label coercion and the ``.mat`` write
+    are the same host code on both backends; ``backend`` picks the
+    per-hemisphere body (:func:`_run_hemi`, numba, or
+    :func:`.radius_mask_gpu.run_hemi_gpu`).
 
     Parameters
     ----------
     lh_labels, rh_labels : (V,) int — per-hemi parcel labels, 1..L
                            with 0 = medial wall.
-    radius  : float or string mm (e.g. 30 or '30').
+    radius  : mm.
     out_dir : path; output written to
               ``<out_dir>/spatial_mask/spatial_mask.mat``.
     verbose : print per-stage banners.
-    atlas_dir : atlas-dir override for the
-                ``fsaverage6/label/<hemi>.aparc.annot`` lookup; ``None`` ⇒
-                ``MSHBM_ATLAS_DIR``. Mesh geometry comes from the
-                    shipped avg_mesh bundles, not from here.
 
-    Returns a dict with ``lh_boundary``, ``rh_boundary`` (csc_matrix),
-    ``mat_path``, and per-stage ``timings``.
+    Returns a dict with ``lh_boundary``, ``rh_boundary`` (csc_matrix)
+    and ``mat_path``.
     """
     if backend == "gpu":
-        from .radius_mask_gpu import generate_radius_mask_gpu
-        return generate_radius_mask_gpu(
-            lh_labels=lh_labels, rh_labels=rh_labels,
-            radius=radius, out_dir=out_dir, verbose=verbose,
-            atlas_dir=atlas_dir,
-        )
-    if backend != "cpu":
+        from .radius_mask_gpu import run_hemi_gpu as run_hemi
+    elif backend == "cpu":
+        run_hemi = _run_hemi
+    else:
         raise ValueError(f"generate_radius_mask: unknown backend {backend!r}")
     radius_f = float(radius)
-    timings: dict = {}
 
     lh_mesh = load_avg_mesh("lh", "inflated")
     rh_mesh = load_avg_mesh("rh", "inflated")
-    lh_aparc = _read_aparc("lh", atlas_dir=atlas_dir)
-    rh_aparc = _read_aparc("rh", atlas_dir=atlas_dir)
+    lh_aparc = _read_aparc("lh")
+    rh_aparc = _read_aparc("rh")
 
     lh_labels = _coerce_labels(lh_labels)
     rh_labels = _coerce_labels(rh_labels)
 
     if verbose:
-        print("1. compute geodesic + per-parcel mask (numba kernels)")
-    lh_out = _run_hemi("lh", lh_mesh, lh_labels, lh_aparc, radius_f,
-                       timings, verbose)
-    rh_out = _run_hemi("rh", rh_mesh, rh_labels, rh_aparc, radius_f,
-                       timings, verbose)
+        print(f"1. compute geodesic + per-parcel mask ({backend})")
+    lh_out = run_hemi("lh", lh_mesh, lh_labels, lh_aparc, radius_f, verbose)
+    rh_out = run_hemi("rh", rh_mesh, rh_labels, rh_aparc, radius_f, verbose)
 
     # MATLAB stores boundary as double sparse; mirror that for read-compat.
     lh_sparse = _mask_to_csc(lh_out)
     rh_sparse = _mask_to_csc(rh_out)
 
-    out_dir = Path(out_dir)
-    out_subdir = out_dir / "spatial_mask"
+    out_subdir = Path(out_dir) / "spatial_mask"
     out_subdir.mkdir(parents=True, exist_ok=True)
     mat_path = out_subdir / "spatial_mask.mat"
     sio.savemat(str(mat_path),
@@ -169,5 +150,4 @@ def generate_radius_mask(lh_labels: np.ndarray,
         "lh_boundary": lh_sparse,
         "rh_boundary": rh_sparse,
         "mat_path": str(mat_path),
-        "timings": timings,
     }

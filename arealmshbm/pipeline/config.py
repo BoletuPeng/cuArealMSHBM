@@ -179,7 +179,6 @@ class Step3Knobs:
 # ─────────────────────────────────────────────────────────────────────
 @dataclass(frozen=True)
 class PipelineConfig:
-    schema_version: str
     mode: PipelineMode
     variant: PipelineVariant
     num_clusters: int
@@ -325,19 +324,18 @@ def _enum_in(
             f"pipeline_config.json: missing required key {prefix!r}"
         )
     v = d[key]
-    if allowed:
-        expected_type = type(allowed[0])
-        if expected_type is int and isinstance(v, bool):
-            raise ValueError(
-                f"pipeline_config.json: {prefix} must be int "
-                f"(got bool); allowed = {allowed}"
-            )
-        if not isinstance(v, expected_type):
-            raise ValueError(
-                f"pipeline_config.json: {prefix} must be "
-                f"{expected_type.__name__} (got {type(v).__name__}); "
-                f"allowed = {allowed}"
-            )
+    expected_type = type(allowed[0])
+    if expected_type is int and isinstance(v, bool):
+        raise ValueError(
+            f"pipeline_config.json: {prefix} must be int "
+            f"(got bool); allowed = {allowed}"
+        )
+    if not isinstance(v, expected_type):
+        raise ValueError(
+            f"pipeline_config.json: {prefix} must be "
+            f"{expected_type.__name__} (got {type(v).__name__}); "
+            f"allowed = {allowed}"
+        )
     if v not in allowed:
         raise ValueError(
             f"pipeline_config.json: {prefix} must be one of {allowed} "
@@ -528,7 +526,7 @@ def _validate_step1(k: Step1Knobs) -> None:
         )
     if k.radius_mask_radius_mm <= 0.0:
         raise ValueError(
-            f"pipeline_config.json: step1.radius_mask_radius_mm must be positive"
+            "pipeline_config.json: step1.radius_mask_radius_mm must be positive"
         )
 
 
@@ -545,7 +543,7 @@ def _validate_step2(k: Step2Knobs) -> None:
             raise ValueError(f"pipeline_config.json: step2.{name} must be positive")
     if k.gpu_cache_safety_margin_gb < 0.0:
         raise ValueError(
-            f"pipeline_config.json: step2.gpu_cache_safety_margin_gb must be >= 0"
+            "pipeline_config.json: step2.gpu_cache_safety_margin_gb must be >= 0"
         )
 
 
@@ -562,8 +560,8 @@ def _validate_step3(k: Step3Knobs) -> None:
             raise ValueError(f"pipeline_config.json: step3.{name} must be positive")
     if k.cMSHBM_isolated_component_min_size <= 0:
         raise ValueError(
-            f"pipeline_config.json: step3.cMSHBM_isolated_component_min_size "
-            f"must be positive"
+            "pipeline_config.json: step3.cMSHBM_isolated_component_min_size "
+            "must be positive"
         )
 
 
@@ -613,7 +611,8 @@ def read_pipeline_config(path: Path | str) -> PipelineConfig:
             f"pipeline_config.json: mode={mode!r} does not run step2; "
             f"remove {step2_keys}. (Mode A reads a pre-staged group "
             f"prior from project-local "
-            f"priors/<variant>/beta<X>/Params_Final.mat. See "
+            f"priors/<variant>/beta<X>/Params_Final.mat (no beta<X>/ "
+            f"for dMSHBM). See "
             f"projects/sample_modeA_single/pipeline_config.json or "
             f"projects/sample_modeA_batch/pipeline_config.json for "
             f"Mode A templates.)"
@@ -693,7 +692,6 @@ def read_pipeline_config(path: Path | str) -> PipelineConfig:
     _validate_step3(step3)
 
     return PipelineConfig(
-        schema_version=sv,
         mode=mode,  # type: ignore[arg-type]
         variant=variant,  # type: ignore[arg-type]
         num_clusters=num_clusters,

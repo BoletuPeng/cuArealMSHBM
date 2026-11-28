@@ -101,15 +101,9 @@ def _validate_session_ctor_args(
     if mode == "gMSHBM":
         if grad_loader is None:
             raise ValueError("mode='gMSHBM' requires grad_loader")
-        # Mirror the ctor's coercion exactly: gate on the raw
-        # ``D_grad > 0`` (not ``int(D_grad) > 0``) so fractional inputs
-        # produce the same effective value here as in the ctor's
-        # ``self.D_grad`` assignment. Production passes positive ints so
-        # the two gates agree, but mismatched gates would let a 0.5-like
-        # input validate against a different effective D_grad than the
-        # one the ctor would store.
-        D_grad_int = int(D_grad)
-        D_grad_i = D_grad_int if D_grad > 0 else 1
+        D_grad_i = int(D_grad)
+        if D_grad_i < 1:
+            raise ValueError(f"mode='gMSHBM' requires D_grad >= 1; got {D_grad}")
         grd_N, grd_D = grad_loader.dims()
         if grd_N != N_i:
             raise ValueError(

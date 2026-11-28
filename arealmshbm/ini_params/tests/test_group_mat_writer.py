@@ -1,9 +1,8 @@
 """test_group_mat_writer.py — ``group.mat`` write plumbing.
 
 Pins that the sync and background writers produce a file the step-2
-reader accepts, that ``do_compression=False`` round-trips the same
-values as the compressed default (only the file size changes), that the
-background writer snapshots the payload, and that a ``savemat`` failure
+reader accepts, that the background writer snapshots the payload, and
+that a ``savemat`` failure
 reaches ``wait()``. The handle's own failure semantics are pinned in
 ``data_io/tests/test_background_write.py``.
 
@@ -39,12 +38,10 @@ def _payload(D=40, L=6, N=200):
     }
 
 
-@pytest.mark.parametrize("compress", [True, False])
 @pytest.mark.parametrize("background", [False, True])
-def test_round_trips_through_load_group_mtc(tmp_path, compress, background):
+def test_round_trips_through_load_group_mtc(tmp_path, background):
     pay = _payload()
-    handle = write_group_mat(str(tmp_path), pay, compress=compress,
-                             background=background)
+    handle = write_group_mat(str(tmp_path), pay, background=background)
     if background:
         assert isinstance(handle, BackgroundWriteHandle)
         assert handle.wait() == tmp_path / "group" / "group.mat"
@@ -66,25 +63,11 @@ def test_round_trips_through_load_group_mtc(tmp_path, compress, background):
     assert np.array_equal(got["rh_labels"], pay["rh_labels"].ravel())
 
 
-def test_compressed_and_uncompressed_agree_on_values(tmp_path):
-    pay = _payload()
-    a, b = tmp_path / "a", tmp_path / "b"
-    write_group_mat(str(a), pay, compress=True)
-    write_group_mat(str(b), pay, compress=False)
-    ma = loadmat(str(a / "group" / "group.mat"))
-    mb = loadmat(str(b / "group" / "group.mat"))
-    for k in pay:
-        assert np.array_equal(ma[k], mb[k]), k
-    assert (b / "group" / "group.mat").stat().st_size > \
-           (a / "group" / "group.mat").stat().st_size
-
-
 def test_writer_snapshots_the_payload(tmp_path):
     """The background writer must not observe a later mutation."""
     pay = _payload()
     res = IniParamsResult(pay)
-    res.writer = write_group_mat(str(tmp_path), res, compress=False,
-                                 background=True)
+    res.writer = write_group_mat(str(tmp_path), res, background=True)
     res["mtc"] = np.zeros_like(res["mtc"])      # racing mutation
     res.writer.wait()
     got = loadmat(str(tmp_path / "group" / "group.mat"))
@@ -96,8 +79,7 @@ def _bad_payload():
 
 
 def test_wait_reraises_writer_failure(tmp_path):
-    h = write_group_mat(str(tmp_path), _bad_payload(), compress=False,
-                        background=True)
+    h = write_group_mat(str(tmp_path), _bad_payload(), background=True)
     with pytest.raises(Exception):
         h.wait()
     assert h.exception is not None

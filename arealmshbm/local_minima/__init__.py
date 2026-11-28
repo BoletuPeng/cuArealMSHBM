@@ -34,14 +34,9 @@ def __getattr__(name):
     # listed in ``__all__`` so ``from ... import *`` doesn't walk the
     # GPU names and eagerly load cupy on CPU-only environments —
     # wildcard imports of this package stay CPU-clean.
-    if name in ("find_minima_gpu", "prepare_K_neighbors_for_gpu"):
-        from .local_minima_gpu import (
-            find_minima_gpu, prepare_K_neighbors_for_gpu,
-        )
-        return {
-            "find_minima_gpu": find_minima_gpu,
-            "prepare_K_neighbors_for_gpu": prepare_K_neighbors_for_gpu,
-        }[name]
+    if name == "find_minima_gpu":
+        from .local_minima_gpu import find_minima_gpu
+        return find_minima_gpu
     raise AttributeError(name)
 
 

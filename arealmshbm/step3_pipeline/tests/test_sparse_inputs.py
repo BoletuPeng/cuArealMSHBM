@@ -364,14 +364,8 @@ def test_sub001_packed_bold_and_gradient():
     assert np.array_equal(mw_rh, np.flatnonzero(rh_inf["MARS_label"] == 1))
 
     grad = si.fetch_gradient(cfg.project_dir, cfg.subid,
-                             packed.shape[1], cfg.n_grad_components)
+                             cfg.n_grad_components)
     assert np.array_equal(grad, ref["gradient_mat"])
-
-    # precomputed passthrough
-    g2 = si.fetch_gradient(cfg.project_dir, cfg.subid,
-                           packed.shape[1], cfg.n_grad_components,
-                           precomputed_gradient_mat=grad)
-    assert np.array_equal(g2, grad)
 
 
 @pytestmark_sub001

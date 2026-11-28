@@ -93,7 +93,7 @@ def test_rejects_unknown_suffix(tmp_path: Path):
         read_bold_inputs(p)
 
 
-@pytest.mark.parametrize("key", ["targ_mesh", "seed_mesh", "notes"])
+@pytest.mark.parametrize("key", ["surface", "mesh", "notes"])
 def test_rejects_unknown_top_level_key(tmp_path: Path, key):
     """The manifest names subjects and nothing else: the surface space
     is not a choice, so a key that tries to pick one is an error rather

@@ -48,18 +48,23 @@ Step0Pipeline.run(cfg)                                         [arealmshbm/step0
 │         (cpu: prange all-pairs Dijkstra; gpu: Δ-stepping SSSP)
 │
 ├── subgraph C — diffusion embedding (per hemi)
-│   └── compute_diffusion_map_repaired(dist, alpha=0.5, n_components)  diffusion_map
-│       (A = exp(-D/D.max()) → alpha-norm → partial Lanczos eigsh;
+│   └── compute_diffusion_map_repaired(dist, n_components)    diffusion_map
+│       (A = exp(-D/D.max()) → alpha-norm (alpha = 0.5) → partial Lanczos eigsh;
 │        cpu | gpu backend dispatch — scipy / cupyx)
 │
 ├── subgraph D — upsample emb (per hemi)
 │   └── linear_interpolate_sphere(emb_down → full sphere)     interpolate_sphere
 │
 └── save()
-    ├── edge_density.npy
-    ├── {lh,rh}_gradient_distance_matrix.npy
+    ├── edge_density.npy                     (only with cfg.save_edge_density)
+    ├── {lh,rh}_gradient_distance_matrix.npy (only with cfg.save_geodesic_distance)
     └── {lh,rh}_emb_<num_comp>_distance_matrix.npy   (default; .mat via cfg.emb_output_format)
 ```
+
+The embedding files are step 0's whole hand-off: `cohort.json` records
+their paths and steps 2 and 3 read them back (33 MB per subject at
+fsaverage6 × 100 components). The driver keeps no gradient in memory
+between steps.
 
 For `sub_FC=100`, `sub_verts=200`, `downsample=3.2`:
 
@@ -67,11 +72,11 @@ For `sub_FC=100`, `sub_verts=200`, `downsample=3.2`:
 |---|---|
 | `N` (full mesh per hemi) | 40962 |
 | `N` (concat L+R) | 81924 |
-| medial wall mask (lh+rh) | ~3592 verts → cortex ≈ 78332 |
-| `num_sample_FC` (N2) | round(78332/100) = 783 |
-| `num_sample_S` (N1) | round(78332/200) = 392 |
-| `iter_a` (FC_A blocks) | 4 |
-| `iter_b` (FC_B blocks) | 11 |
+| medial wall mask (lh+rh) | 6977 verts → cortex = 74947 |
+| `num_sample_FC` (N2) | round(74947/100) = 749 |
+| `num_sample_S` (N1) | round(74947/200) = 375 |
+| `iter_a` (FC_A blocks) | 3 (block_size_a = 125) |
+| `iter_b` (FC_B blocks) | 11 (block_size_b = 7494) |
 | downsample sphere verts | round(81924 / 6.4) = 12801 → icosphere: **12962** |
 | diffusion components | 100 |
 
@@ -147,8 +152,7 @@ archived internally.
 End-to-end wall on the production GPU path: step 0 — **227.41 s** ·
 step 1 — 223.85 s · step 2 — 373.94 s · step 3 — 129.35 s ·
 **total 954.84 s (15.91 min)**. Step 0 is 24 % of the end-to-end
-total — per-subject independent, the unified driver runs all 40 in
-sequence (no per-subject parallelism wrapping the driver yet).
+total.
 
 ### Per-subject wall (3 representative subjects, warm cache except sub-001)
 
@@ -218,8 +222,9 @@ this section).
   `graph_distance/tests/test_gpu_delta_correctness.py`, which keeps a
   transcribed pull-based Bellman-Ford as its oracle. Δ only decides how
   relaxations are bucketed, never their fixed point, so the throughput
-  knobs (`delta_mult`, `blocks_per_sm`, `threads`, `cap`) are all
-  bit-neutral.
+  settings (the `_kernels_gpu.py` constants `DEFAULT_DELTA_MULT`,
+  `DEFAULT_BLOCKS_PER_SM`, `DEFAULT_TPB` and the `cap` parameter) are
+  all bit-neutral.
 * **Cross-leaf fusion.** Sub-B's GPU output stays device-resident;
   subgraph-C's ``compute_diffusion_map_gpu_repaired`` consumes the
   device ``cp.ndarray`` directly, skipping a 670 MB D2H per hemi
@@ -427,7 +432,7 @@ semantics:
   V/F counts and a valid sphere triangulation, rotated by an
   implementation-defined transform.
 
-sub-005 historically had a stuck-vertex session whose dynamic-range
-collapse made the subgraph-C Lanczos eigensolver operate near a
-dense-cluster eigenvalue. The fc_similarity NaN-clamp keeps the
-gradient field in range so the cohort runs cleanly end-to-end.
+A stuck (zero-variance) BOLD vertex, as in one YS sub-005 session,
+yields 0/0 = NaN FC-similarity cells; the fc_similarity NaN-clamp
+keeps the gradient field in range so subgraph C's Lanczos eigensolver
+sees a well-formed input.

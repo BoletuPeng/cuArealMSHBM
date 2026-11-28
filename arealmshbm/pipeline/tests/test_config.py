@@ -510,10 +510,9 @@ def test_sample_modeA_single_parses() -> None:
     cfg = read_pipeline_config(p)
     assert cfg.mode == "modeA_single"
     assert cfg.step2 is None  # Mode A omits step2
-    # connect_th was changed to explicit 15.0 (gMSHBM canonical) per
-    # the round-2 reviewer feedback — exercises the "project creator
-    # writes concrete number, __post_init__ resolution branch unused"
-    # contract.
+    # connect_th is the explicit 15.0 (gMSHBM canonical) — exercises
+    # the "project creator writes concrete number, __post_init__
+    # resolution branch unused" contract.
     assert cfg.step3.connect_th == 15.0
 
 

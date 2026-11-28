@@ -35,7 +35,7 @@ def _cpu_ref(lh_labels, rh_labels, lh_mesh, rh_mesh, L):
     """(parcel_components fp64, eucli fp32) exactly as the EM body computes."""
     pc, lh_ci, rh_ci = compute_components_general(
         lh_labels, rh_labels,
-        lh_mesh["vertexNbors"], rh_mesh["vertexNbors"], L, return_ci=True,
+        lh_mesh["vertexNbors"], rh_mesh["vertexNbors"], L,
     )
     eucli = component_distance(
         lh_labels, rh_labels, lh_mesh, rh_mesh, L,

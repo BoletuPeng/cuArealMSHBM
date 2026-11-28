@@ -68,7 +68,7 @@ def test_synthetic_project_round_trip(tmp_path: Path, grad_fmt: str,
 
     # layout == the dense pipeline's boundary mask
     ref_lay = build_step2_layout_dense(build_step2_boundary_mask(
-        refs["lh_b"], refs["rh_b"], "gMSHBM"))
+        refs["lh_b"], refs["rh_b"]))
     assert layouts_equal(inp.layout, ref_lay)
 
     # packed BOLD: bit-identical to what the writer packed
@@ -223,8 +223,7 @@ def test_bench_inputs_match_the_dense_path() -> None:
 
     lh_b, rh_b = load_spatial_mask(
         _BENCH_PROJ / "spatial_mask" / "spatial_mask.mat")
-    bm = build_step2_boundary_mask(lh_boundary=lh_b, rh_boundary=rh_b,
-                                   mode="gMSHBM")
+    bm = build_step2_boundary_mask(lh_boundary=lh_b, rh_boundary=rh_b)
     assert layouts_equal(inp.layout, build_step2_layout_dense(bm))
 
     assert np.array_equal(

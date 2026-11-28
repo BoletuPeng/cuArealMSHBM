@@ -1,12 +1,12 @@
 """surface_smoothing_gpu.py
 
 CuPy mirror of the per-call hot path in :mod:`.surface_smoothing`: the
-SpMV + per-row scale + ROI mask on device, over the gather that
+SpMV + per-row scale + cortex re-mask on device, over the gather that
 ``Step0Pipeline.load_inputs`` reads from the step-0 inputs bundle.
 
 Hot path:
     out[j, k] = sum_i gather_W[j, i] * data[i, k] / weight_sum[j]
-                where j outside ROI -> 0.
+                for every ROI (cortex) target j.
 
 The CPU path uses fp64 throughout (matches scipy's default SpMV dtype),
 but the gather matrix has values in (0, area_max] and the smoothing
@@ -123,18 +123,14 @@ def cifti_smoothing_gpu(data: Union[np.ndarray, cp.ndarray],
 
     lh_full_d = full_d[:n_lh]
     rh_full_d = full_d[n_lh:]
-    lh_roi_d = cortex_bool_d[:n_lh]
-    rh_roi_d = cortex_bool_d[n_lh:]
 
-    # Per-hemi: SpMM + scale + ROI mask.
+    # Per-hemi: SpMM + scale (non-ROI rows are dropped by the re-mask).
     lh_gW_d, lh_inv_d = lh_gather_gpu
     rh_gW_d, rh_inv_d = rh_gather_gpu
     lh_out_d = lh_gW_d @ lh_full_d
     lh_out_d *= lh_inv_d[:, None]
-    lh_out_d[~lh_roi_d] = 0.0
     rh_out_d = rh_gW_d @ rh_full_d
     rh_out_d *= rh_inv_d[:, None]
-    rh_out_d[~rh_roi_d] = 0.0
 
     out_full_d = cp.concatenate([lh_out_d, rh_out_d], axis=0)
     # Re-mask: gather cortex rows → (N_cortex, K) fp32. Output stays on

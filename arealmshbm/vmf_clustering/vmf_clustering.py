@@ -1,6 +1,6 @@
 """vmf_clustering.py
 
-The full step-3 EM body, single-subject (Mode A). One ``run()`` call
+The full step-3 EM body, single subject (S = 1). One ``run()`` call
 corresponds to one ``intra_em`` outer-loop iteration.
 
 Public API:
@@ -71,7 +71,7 @@ from .e_step_lambda import ELambdaSession
 # ─────────────────────────────────────────────────────────────────────────
 # A lightweight Params container — mirrors the MATLAB struct's fields we
 # actually use inside vmf_clustering_subject_session.
-# Caller hands in a dict-like (e.g. h5py-backed dict) at the entry boundary;
+# Caller hands in a dict at the entry boundary;
 # the Session updates the relevant fields and returns an updated dict.
 # ─────────────────────────────────────────────────────────────────────────
 def _get(params: Dict[str, Any], key: str) -> Any:
@@ -154,7 +154,7 @@ def _check_connectedness_step(
     parcel_components, lh_ci, rh_ci = compute_components_general(
         lh_labels, rh_labels,
         lh_mesh["vertexNbors"], rh_mesh["vertexNbors"],
-        num_clusters, return_ci=True,
+        num_clusters,
     )
     eucli_dist = component_distance(
         lh_labels, rh_labels, lh_mesh, rh_mesh, num_clusters,
@@ -398,7 +398,6 @@ class VmfClusteringSession:
 
     def run(self,
             params_in: Dict[str, Any],
-            time_stages: bool = False,
             ) -> Dict[str, Any]:
         """Run one full vmf_clustering_subject_session.
 
@@ -412,16 +411,15 @@ class VmfClusteringSession:
             ``spatial_xyz_vmf`` (N, L) [pre-EM zeros are typical].
             All 1-D vectors are flat (L,); (1, L) is also accepted at
             the entry boundary and flattened.
-        time_stages : if True, populate ``self.last_timings`` with per-stage
-            wall times.
+
+        Per-stage wall times of the call land in ``self.last_timings``.
 
         Returns
         -------
         params_out : dict — Params at function exit. Same shapes as input:
             ``s_lambda`` (N, L), ``s_t_nu`` (D, L, T), ``s_psi`` (D, L),
             1-D vectors flat (L,) — kappa/sigma/epsil/xyz_gamma all
-            ravelled. Also includes ``max_connectedness``,
-            ``max_components``, ``s_muc``, ``u``, ``spatial_connect_vmf``,
+            ravelled. Also includes ``max_components``,
             ``spatial_xyz_vmf``, ``cost_em``.
         """
         import time as _time
@@ -438,17 +436,15 @@ class VmfClusteringSession:
         # epsil + mu are not directly read inside vmf_clustering; carried for output.
         epsil    = _stage_1d(_get(params_in, "epsil"), self.L, "epsil", np.float32)
         mu       = np.asarray(_get(params_in, "mu"))
-        theta    = self.theta_f32   # session-cached
         xyz_gamma = _stage_1d(_get(params_in, "xyz_gamma"), self.L,
                                "xyz_gamma", np.float64)
         spatial_xyz_vmf = np.ascontiguousarray(_get(params_in, "spatial_xyz_vmf"),
                                                 dtype=np.float32)
 
-        # spatial_connect_vmf is set inside the loop (first call to
-        # spatial_connect_prior); not read from params_in.
-        spatial_connect_vmf = np.zeros((self.N, self.L), dtype=np.float32)
-        u_centroid = None    # set by spatial_connect_prior
-        s_muc = None         # set by spatial_xyz_prior
+        # spatial_connect_vmf (gMSHBM only) is set at the top of every EM
+        # iter by spatial_connect_prior, before any reader; not read from
+        # params_in.
+        spatial_connect_vmf = None
 
         # Track the EM stop block's last V_temp (needed to build cost_em).
         V_temp_last = np.zeros((self.N, self.L), dtype=np.float32)
@@ -474,12 +470,6 @@ class VmfClusteringSession:
             "iter_count_check_conn": 0,
             "iter_count_spatial_xyz": 0,
         }
-        # Per-substep timing for the E-step lambda loop body. Populated only
-        # when time_stages=True; the inner loop accumulates each substep's
-        # wall time across all (comp_iter, lambda_iter) pairs.
-        sub_timings_lambda: Optional[Dict[str, float]] = (
-            {} if time_stages else None
-        )
 
         # Variant-routing slot semantics:
         #   The E-step kernel does ``v += β[l]·scv[n,l] + sxv[n,l]``. We
@@ -519,7 +509,6 @@ class VmfClusteringSession:
             self.e_lambda_session.prepare_em_iter(
                 s_t_nu=s_t_nu,
                 kappa=kappa,
-                sub_timings=sub_timings_lambda,
             )
             timings["e_step_lambda_loop"] += _time.perf_counter() - t0
 
@@ -536,14 +525,12 @@ class VmfClusteringSession:
             # dMSHBM: no spatial prior at all.
             if self.variant.use_connect_prior:
                 t0 = _time.perf_counter()
-                u_centroid_v, scv_v = self.connect_session.compute(s_lambda)
-                u_centroid = u_centroid_v
+                _, scv_v = self.connect_session.compute(s_lambda)
                 spatial_connect_vmf = scv_v
                 timings["spatial_connect_prior"] += _time.perf_counter() - t0
             elif self.variant.use_xyz_prior:
                 t0 = _time.perf_counter()
-                s_muc_v, sxv_v = self.xyz_session.compute(s_lambda, xyz_gamma)
-                s_muc = s_muc_v
+                _, sxv_v = self.xyz_session.compute(s_lambda, xyz_gamma)
                 spatial_xyz_vmf = sxv_v
                 timings["spatial_xyz_prior"] += _time.perf_counter() - t0
                 timings["iter_count_spatial_xyz"] += 1
@@ -557,7 +544,6 @@ class VmfClusteringSession:
                     s_lambda=s_lambda,
                     spatial_connect_vmf=self._zero_NL,
                     spatial_xyz_vmf=self._zero_NL,
-                    sub_timings=sub_timings_lambda,
                 )
                 timings["e_step_lambda_loop"] += _time.perf_counter() - t0
                 timings["iter_count_lambda_total"] += lambda_iter
@@ -593,7 +579,6 @@ class VmfClusteringSession:
                         s_lambda=s_lambda,
                         spatial_connect_vmf=scv_estep,
                         spatial_xyz_vmf=sxv_estep,
-                        sub_timings=sub_timings_lambda,
                     )
                     timings["e_step_lambda_loop"] += _time.perf_counter() - t0
                     timings["iter_count_lambda_total"] += lambda_iter
@@ -618,8 +603,7 @@ class VmfClusteringSession:
 
                         if self.variant.use_xyz_prior:
                             t0 = _time.perf_counter()
-                            s_muc_v, sxv_v = self.xyz_session.compute(s_lambda, xyz_gamma)
-                            s_muc = s_muc_v
+                            _, sxv_v = self.xyz_session.compute(s_lambda, xyz_gamma)
                             spatial_xyz_vmf = sxv_v
                             timings["spatial_xyz_prior"] += _time.perf_counter() - t0
                             timings["iter_count_spatial_xyz"] += 1
@@ -669,7 +653,7 @@ class VmfClusteringSession:
             timings["em_stop_criterion"] += _time.perf_counter() - t0
 
             if stop_em:
-                cost_em_out = cost_em_view.copy() if cost_em_view is not None else cost.copy()
+                cost_em_out = cost_em_view.copy()
                 break
             if iter_em > self.max_iter_em:
                 # Forced stop — cost_em is the *update_cost* in MATLAB's branch.
@@ -678,22 +662,13 @@ class VmfClusteringSession:
 
             cost = update_cost
 
-        if time_stages:
-            self.last_timings = dict(timings)
-            if sub_timings_lambda is not None:
-                self.last_timings["e_step_lambda_substeps"] = dict(sub_timings_lambda)
+        self.last_timings = dict(timings)
 
         # ── Build output Params dict ──
-        # Several locals (s_lambda, spatial_xyz_vmf, spatial_connect_vmf,
-        # u_centroid, s_muc) are VIEWS into Sub-session-internal buffers
-        # to skip per-iter memcpy. At the boundary we copy them ONCE so
-        # the caller holds independent buffers safe across future
-        # ``run()`` calls (which would overwrite the underlying state).
-        # These end-of-call copies cost ~94 MB × 4 ≈ 380 MB (one-shot,
-        # not per-iter).
         params_out = dict(params_in)   # shallow copy — preserves any extras
-        # s_lambda is a (N, L) view of e_lambda_session's ping-pong buffer;
-        # the next ``run()`` call would overwrite it, so copy at the boundary.
+        # s_lambda is handed out as e_lambda_session's own (N, L)
+        # ping-pong buffer, not a copy: it is valid until the next
+        # ``run()`` call, which overwrites it.
         params_out["s_lambda"] = np.ascontiguousarray(s_lambda)
         params_out["s_t_nu"] = s_t_nu
         params_out["s_psi"] = s_psi
@@ -702,19 +677,10 @@ class VmfClusteringSession:
         params_out["epsil"] = epsil
         params_out["mu"] = mu
         params_out["kappa"] = kappa
-        params_out["theta"] = theta
         params_out["xyz_gamma"] = xyz_gamma
-        # spatial_*_vmf are views of XyzSession / ConnectSession internal
-        # buffers; copy out so the caller holds independent storage.
+        # spatial_xyz_vmf is a view of the XyzSession internal buffer;
+        # copy out so the caller holds independent storage.
         params_out["spatial_xyz_vmf"] = np.ascontiguousarray(spatial_xyz_vmf).copy()
-        params_out["spatial_connect_vmf"] = np.ascontiguousarray(spatial_connect_vmf).copy()
-        if u_centroid is not None:
-            params_out["u"] = np.ascontiguousarray(u_centroid).copy()
-        if s_muc is not None:
-            params_out["s_muc"] = np.ascontiguousarray(s_muc).copy()
-        params_out["max_connectedness"] = max_connectedness
         params_out["max_components"] = max_components
-        if cost_em_out is not None:
-            params_out["cost_em"] = cost_em_out
-        params_out["iter_em"] = iter_em
+        params_out["cost_em"] = cost_em_out
         return params_out

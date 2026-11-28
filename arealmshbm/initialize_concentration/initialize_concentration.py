@@ -6,7 +6,7 @@ seeds ``Params.kappa`` at the start of every ``intra_em`` iteration.
 
 Implementation note:
     ``scipy.special.iv(nu, x)`` overflows fp64 around ``x ≈ 700`` for
-    the typical D=1175 (ν ≈ 587), and ``scipy.special.ive`` underflows
+    the typical D=1174 (ν = 586), and ``scipy.special.ive`` underflows
     for small x at large ν. We compute ``log(I_ν(x))`` directly via the
     Debye asymptotic expansion (DLMF 10.41) — same closed form as
     :mod:`arealmshbm.em_stop_criterion._cdln`, kept dependency-free
@@ -76,8 +76,9 @@ def initialize_concentration(D: float) -> float:
 
     Parameters
     ----------
-    D : float — feature dimension. ``setting_params.dim + 1`` in step3
-                (e.g. 1175 for fsaverage6 RSFC profiles).
+    D : float — the value stock MATLAB passes: ``setting_params.dim``,
+                the profile width minus one (1174 for the 1175-wide
+                fsaverage6 RSFC profiles).
 
     Returns
     -------

@@ -17,7 +17,8 @@ with ``sparse_inputs.load_step3_sparse_inputs`` +
     7. ``pipeline_setup.build_pipeline_setup`` — boundary_mask + neighborhood + …
     8. ``vmf_clustering.VmfClusteringSession`` — the EM body super-call.
     9. ``intra_em.intra_subject_var`` + ``intra_em_cost`` — outer-loop math.
-   10. ``data_io.save_parcellation``          — argmax + savemat.
+   10. ``data_io.derive_labels``              — argmax labels.
+   11. ``data_io.save_parcellation``          — savemat of the labels.
 
 Public API:
     Step3Inputs   — bundled outputs of the load + setup stages.
@@ -74,12 +75,8 @@ if TYPE_CHECKING:  # annotations only — see the import-placement note above
 @dataclass
 class Step3Inputs:
     """Loaded + derived inputs that feed the EM."""
-    group_prior: Dict[str, np.ndarray]
     data: Dict[str, Any]                   # fetch_data output: series (N, T, ⌈D/8⌉) uint8 bit-packed, D_unpacked (int), gradient_mat (N, Dg) when gMSHBM
     boundary_mask: np.ndarray              # (N, L)
-    neighborhood: np.ndarray               # (M1, N_active) int64
-    row_idx: np.ndarray                    # (P,) int64 0-indexed
-    col_idx: np.ndarray
     lh_inflated: Dict[str, np.ndarray]
     rh_inflated: Dict[str, np.ndarray]
     lh_sphere: Dict[str, np.ndarray]
@@ -92,7 +89,13 @@ class Step3Inputs:
 
 @dataclass
 class Step3Result:
-    """Outputs of one Pipeline.run()."""
+    """Outputs of one Pipeline.run().
+
+    ``Params`` holds ``s_lambda``, ``mu`` and ``max_components`` on
+    both backends; the cpu backend's dict is its whole EM state and
+    carries more keys, the gpu backend's has only these three.
+    ``s_lambda`` is the session's own buffer on both.
+    """
     Params: Dict[str, Any]
     lh_labels: np.ndarray
     rh_labels: np.ndarray
@@ -110,7 +113,7 @@ class Step3Pipeline:
       * ``load_inputs() -> Step3Inputs``         — read everything the EM needs.
       * ``build_session(inputs)``                — construct VmfClusteringSession
         (gpu: VmfClusteringSessionSparseCUDA).
-      * ``run(time_stages=True) -> Step3Result`` — load + build (both cached), then the intra_em loop + argmax.
+      * ``run() -> Step3Result``                 — load + build (both cached), then the intra_em loop + argmax.
       * ``save(result, out_path=None) -> Path``  — (cMSHBM cleanup +) savemat of the result's labels.
       * ``close()``                              — release Session + Inputs refs and the
         cupy device-memory pool. **Required** between sequential subjects on
@@ -130,20 +133,11 @@ class Step3Pipeline:
 
     def __init__(self, cfg: Step3Config,
                  *,
-                 precomputed_gradient_mat: Optional[np.ndarray] = None,
                  sparse_cohort: Optional["Step3SparseCohort"] = None):
         """
         Parameters
         ----------
         cfg : Step3Config
-        precomputed_gradient_mat : (N, n_grad_components) fp32, optional
-            In-memory gradient array. When set, fetch_data (cpu) /
-            fetch_gradient (gpu) skips the per-hemi gradient .npy/.mat
-            disk reads named in cohort.json and uses this array
-            directly. The unified pipeline driver passes step0's
-            ``Step0Result.lh_emb_up``/``rh_emb_up`` (concatenated) here
-            so step3 reads gradients from memory instead of re-reading
-            the .npy step0 just wrote. Validated by the same reader.
         sparse_cohort : Step3SparseCohort, optional
             ``backend='gpu'`` only. The group prior + spatial masks +
             candidate layout, already loaded for this cohort. The step3
@@ -163,9 +157,6 @@ class Step3Pipeline:
                 f"backend='gpu' (got backend={cfg.backend!r})"
             )
         self.cfg = cfg
-        self._precomputed_gradient_mat: Optional[np.ndarray] = (
-            precomputed_gradient_mat
-        )
         self._sparse_cohort = sparse_cohort
 
         # Lazy state.
@@ -179,9 +170,8 @@ class Step3Pipeline:
     def close(self) -> None:
         """Release Session + Inputs and free the cupy memory pool.
 
-        Idempotent. The cupy free-blocks call runs on either backend
-        whenever ``cupy`` is importable (it is skipped only when the
-        import fails) and is a no-op when the default pool is already
+        Idempotent. The cupy free-blocks call runs on the ``gpu``
+        backend only and is a no-op when the default pool is already
         empty.
 
         After ``close()`` the Pipeline is unusable — calling ``run()``
@@ -196,14 +186,10 @@ class Step3Pipeline:
         self._session = None
         self._inputs = None
         self._sparse_cohort = None
-        # Free cupy memory pools if cupy is importable. Importing inside
-        # the function (not at module top) keeps a box without cupy
-        # working on the cpu backend; with cupy installed, the cpu
-        # backend imports it here too.
-        try:
-            import cupy as cp  # type: ignore[import-not-found]
-        except ImportError:
+        if self.cfg.backend != "gpu":
             return
+        # Function-local import: the cpu backend never imports cupy.
+        import cupy as cp
         cp.get_default_memory_pool().free_all_blocks()
         cp.get_default_pinned_memory_pool().free_all_blocks()
 
@@ -228,9 +214,7 @@ class Step3Pipeline:
             from .sparse_inputs import load_step3_sparse_inputs
             t0 = time.perf_counter()
             sp_inputs = load_step3_sparse_inputs(
-                cfg, precomputed_gradient_mat=self._precomputed_gradient_mat,
-                cohort=self._sparse_cohort,
-            )
+                cfg, cohort=self._sparse_cohort)
             self.timings.update(sp_inputs.timings)
             self.timings["load_total"] = time.perf_counter() - t0
             self._inputs = sp_inputs
@@ -272,7 +256,6 @@ class Step3Pipeline:
             rh_mesh=rh_inflated,
             n_grad_components=cfg.n_grad_components,
             with_gradient=cfg.variant.use_connect_prior,
-            precomputed_gradient_mat=self._precomputed_gradient_mat,
         )
         self.timings["fetch_data"] = time.perf_counter() - t0
 
@@ -341,12 +324,8 @@ class Step3Pipeline:
         self.timings["load_total"] = time.perf_counter() - t_load_total
 
         self._inputs = Step3Inputs(
-            group_prior=group_prior,
             data=data,
             boundary_mask=boundary_mask,
-            neighborhood=setup["neighborhood"],
-            row_idx=setup["row_idx"],
-            col_idx=setup["col_idx"],
             lh_inflated=lh_inflated,
             rh_inflated=rh_inflated,
             lh_sphere=lh_sphere,
@@ -492,16 +471,11 @@ class Step3Pipeline:
         )
 
     # ── Stage 3: run intra_em outer loop ──
-    def run(self, time_stages: bool = True) -> Step3Result:
+    def run(self) -> Step3Result:
         """Execute the full pipeline: load + build + intra_em loop.
 
-        Parameters
-        ----------
-        time_stages : if True (default), record per-stage wall times for
-            the inner :class:`VmfClusteringSession.run` calls. The
-            aggregate is summed across intra_em iterations and stored on
-            ``self.timings`` under ``per_stage_em``. The ``gpu`` backend
-            always records it.
+        Per-stage EM wall times, summed across intra_em iterations, are
+        stored on ``self.timings`` under ``per_stage_em``.
 
         Returns
         -------
@@ -557,11 +531,10 @@ class Step3Pipeline:
             ).copy()
 
             # MATLAB driver: ``vmf_clustering_subject_session`` (the EM body).
-            Params = sess.run(Params, time_stages=time_stages)
-            if time_stages and sess.last_timings:
-                for k, v in sess.last_timings.items():
-                    if k in per_stage_em and isinstance(v, (int, float)):
-                        per_stage_em[k] += v
+            Params = sess.run(Params)
+            for k, v in sess.last_timings.items():
+                if k in per_stage_em and isinstance(v, (int, float)):
+                    per_stage_em[k] += v
 
             # MATLAB driver: ``intra_subject_var``.
             Params["s_psi"] = intra_subject_var(
@@ -579,7 +552,7 @@ class Step3Pipeline:
                 mu=Params["mu"],
                 sigma=Params["sigma"],
                 epsil=Params["epsil"],
-                cost_em=Params.get("cost_em", 0.0),
+                cost_em=Params["cost_em"],
                 dim=dim,
             )
             record.append(update_cost)
@@ -647,55 +620,35 @@ class Step3Pipeline:
         )
 
         # cMSHBM: argmax → RemoveIsolated(5) on lh / rh labels before
-        # save. gMSHBM / dMSHBM emit raw argmax (the existing path).
+        # save. gMSHBM / dMSHBM write the argmax labels :meth:`run`
+        # returned.
         if cfg.variant.final_remove_isolated:
             inputs = self.load_inputs()  # cached; just retrieves
             lh_nbors = inputs.lh_inflated["vertexNbors"]
             rh_nbors = inputs.rh_inflated["vertexNbors"]
             thr = int(cfg.cMSHBM_isolated_component_min_size)
-            lh_clean = remove_isolated_surface_components(
+            result.lh_labels = remove_isolated_surface_components(
                 result.lh_labels, lh_nbors, abs_threshold=thr,
             )
-            rh_clean = remove_isolated_surface_components(
+            result.rh_labels = remove_isolated_surface_components(
                 result.rh_labels, rh_nbors, abs_threshold=thr,
             )
-            result.lh_labels = lh_clean
-            result.rh_labels = rh_clean
-            out_path = save_parcellation(
-                s_lambda=result.Params["s_lambda"],
-                out_dir=cfg.out_dir,
-                subid=cfg.out_subid or str(int(cfg.subid)),
-                w=cfg.w,
-                c=cfg.c,
-                beta=beta_for_filename,
-                out_path=out_path,
-                lh_labels_override=lh_clean,
-                rh_labels_override=rh_clean,
-            )
-        else:
-            # ``result.lh_labels`` / ``rh_labels`` are the argmax of the
-            # same ``s_lambda`` :meth:`run` returned. On cpu passing them
-            # through skips a second (N, L) argmax; on gpu it is
-            # REQUIRED: ``Params["s_lambda"]`` there aliases a reusable
-            # pinned host buffer that a later call may overwrite.
-            out_path = save_parcellation(
-                s_lambda=result.Params["s_lambda"],
-                out_dir=cfg.out_dir,
-                subid=cfg.out_subid or str(int(cfg.subid)),
-                w=cfg.w,
-                c=cfg.c,
-                beta=beta_for_filename,
-                out_path=out_path,
-                lh_labels_override=result.lh_labels,
-                rh_labels_override=result.rh_labels,
-            )
+        out_path = save_parcellation(
+            lh_labels=result.lh_labels,
+            rh_labels=result.rh_labels,
+            out_dir=cfg.out_dir,
+            subid=cfg.out_subid or str(int(cfg.subid)),
+            w=cfg.w,
+            c=cfg.c,
+            beta=beta_for_filename,
+            out_path=out_path,
+        )
         result.out_path = Path(out_path)
         return Path(out_path)
 
     # ── Convenience ──
-    def run_and_save(self, time_stages: bool = True,
-                     out_path: Optional[Path] = None) -> Step3Result:
+    def run_and_save(self, out_path: Optional[Path] = None) -> Step3Result:
         """``run() + save()`` in one call. Returns the populated Result."""
-        result = self.run(time_stages=time_stages)
+        result = self.run()
         self.save(result, out_path=out_path)
         return result

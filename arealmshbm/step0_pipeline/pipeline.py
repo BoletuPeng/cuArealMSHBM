@@ -43,7 +43,6 @@ import warnings
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
-from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
 import numpy as np
@@ -87,11 +86,9 @@ _POS_GRAD_THRESHOLD = 1e-10
 # Process-wide memo of the subject-invariant ``load_inputs`` output: a
 # batch driver running K subjects pays the bundle read exactly once
 # instead of K times.
-# The memo is the CPU portion of Step0Inputs (GPU gathers are
-# NOT cached — ``Step0Pipeline.close()`` calls
-# ``cp.get_default_memory_pool().free_all_blocks()`` on the GPU
-# backend, which would invalidate any device-resident cache anyway,
-# and the GPU gather H2D itself is ~10 ms — cheap to rebuild).
+# The memo is the CPU portion of Step0Inputs. The GPU mirrors are
+# rebuilt per pipeline by ``load_inputs`` (~10 ms of H2D) and dropped
+# with the pipeline at ``close()``.
 _INPUTS_CPU: Optional["Step0Inputs"] = None
 
 
@@ -215,11 +212,8 @@ class Step0Result:
     # :class:`Step0Config.save_geodesic_distance` for the gate.
     lh_dist: Optional[np.ndarray]             # (N_down, N_down) fp32 or None
     rh_dist: Optional[np.ndarray]             # (N_down, N_down) fp32 or None
-    lh_emb_down: np.ndarray                   # (N_down, num_components) fp32
-    rh_emb_down: np.ndarray                   # (N_down, num_components) fp32
     lh_emb_up: np.ndarray                     # (N_lh, num_components) fp32
     rh_emb_up: np.ndarray                     # (N_rh, num_components) fp32
-    out_paths: Dict[str, Optional[Path]] = field(default_factory=dict)
     timings: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -235,8 +229,8 @@ class Step0Result:
 #     concurrently with subject K's GPU compute, so ``bold_provider``
 #     pulls return near-instantly.
 #
-#   * Internal — fallback for standalone ``Step0Pipeline`` usage
-#     (ad-hoc single-subject runs, leaf tests). Spins up a per-subject
+#   * Internal — standalone ``Step0Pipeline.run`` usage (the
+#     single-subject profilers). Spins up a per-subject
 #     bounded sliding-window pool inside this contextmanager. The
 #     cold-start latency that the external path hides is unavoidable
 #     here because there's no driver to manage cross-subject overlap.
@@ -267,8 +261,7 @@ def _prefetch_session_bold(
     seam — cheap, fully overlapped.
     """
     lh_path, rh_path = cfg.bold_paths(sess_idx)
-    # expected_n guards against a silent reshape mis-layout if a
-    # future BOLD converter changes the (I, J, K) decomposition.
+    # expected_n refuses a GIFTI whose vertex count is not the mesh's.
     lh_bold = read_surface_bold(lh_path, expected_n=ti.n_lh)
     rh_bold = read_surface_bold(rh_path, expected_n=ti.n_rh)
     return concat_hemis_drop_medial(lh_bold, rh_bold, ti.medial_mask)
@@ -348,7 +341,7 @@ class Step0Pipeline:
       * ``__init__(cfg)``                       — store config; no IO.
       * ``load_inputs() -> Step0Inputs``         — read fsaverage6 meshes + neighbors.
       * ``run(inputs=None) -> Step0Result``      — execute subgraphs A→B→C→D.
-      * ``save(result) -> dict[str, Path]``      — write .mat / .npy artifacts.
+      * ``save(result)``                         — write .mat / .npy artifacts.
       * ``close()``                              — drop refs; on gpu, free the CuPy pools.
 
     Pipeline is also a context manager.
@@ -357,7 +350,6 @@ class Step0Pipeline:
     def __init__(self, cfg: Step0Config):
         self.cfg = cfg
         self._inputs: Optional[Step0Inputs] = None
-        self.timings: Dict[str, Any] = {}
 
     # ---- context manager -------------------------------------------
     def __enter__(self):
@@ -403,23 +395,19 @@ class Step0Pipeline:
 
         GPU mirrors are populated via :func:`_build_gpu_mirrors`.
         """
-        cfg = self.cfg
-        t0 = time.perf_counter()
-
         global _INPUTS_CPU
         if _INPUTS_CPU is None:
             _INPUTS_CPU = load_inputs_bundle()
         cpu = _INPUTS_CPU
 
-        self._inputs = replace(cpu, **_build_gpu_mirrors(cpu, cfg.backend))
-        self.timings["load_inputs"] = time.perf_counter() - t0
+        self._inputs = replace(
+            cpu, **_build_gpu_mirrors(cpu, self.cfg.backend))
         return self._inputs
 
     # =================================================================
     # Stage 2: run the four subgraphs
     # =================================================================
-    def run(self, inputs: Optional[Step0Inputs] = None,
-            *, time_stages: bool = True) -> Step0Result:
+    def run(self, inputs: Optional[Step0Inputs] = None) -> Step0Result:
         """Sequential composition of the four subgraphs.
 
         Each subgraph is also exposed as ``_subgraph_{A,B,C,D}`` so the
@@ -448,18 +436,14 @@ class Step0Pipeline:
         )
 
         timings: Dict[str, Any] = {
-            "load_inputs": self.timings.get("load_inputs", 0.0),
-            "per_stage": per_stage if time_stages else {},
-            "num_sample_S": a_out["num_sample_S"],
+            "per_stage": per_stage,
             "iter_a": a_out["iter_a"],
             "block_size_a": a_out["block_size_a"],
-            "n_cortex": ti.n_cortex,
             "n_down_sphere": int(b_out["down_v"].shape[0]),
         }
         return Step0Result(
             edge_density=a_out["edge_density"],
             lh_dist=c_out["lh_dist_h"], rh_dist=c_out["rh_dist_h"],
-            lh_emb_down=c_out["lh_emb_down"], rh_emb_down=c_out["rh_emb_down"],
             lh_emb_up=d_out["lh_emb_up"], rh_emb_up=d_out["rh_emb_up"],
             timings=timings,
         )
@@ -485,7 +469,7 @@ class Step0Pipeline:
         the cpu backend runs the numba / BLAS / scipy twins.
 
         Returns dict with: edge_density (N_cortex,) fp32, iter_a,
-        num_sample_S, block_size_a.
+        block_size_a.
         """
         cfg = self.cfg
         num_sample_S = int(round(ti.n_cortex / cfg.sub_verts))
@@ -604,13 +588,12 @@ class Step0Pipeline:
         if cfg.backend == "gpu":
             from arealmshbm.watershed import prepare_neighbors_for_gpu
             from arealmshbm.local_minima.local_minima_gpu import (
-                find_minima_gpu, prepare_K_neighbors_for_gpu,
+                find_minima_gpu,
             )
+            # Both tables are subject-invariant on a fixed mesh, so we pay
+            # the int32 encode + H2D once across all iter_a in this subject.
             neighbors_int_d = prepare_neighbors_for_gpu(ti.neighbors_table)
-            # Same hoist pattern as watershed's neighbors prep: K_neighbors
-            # is subject-invariant on a fixed mesh, so we pay the int32
-            # encode + H2D once across all iter_a in this subject.
-            K_neighbors_int_d = prepare_K_neighbors_for_gpu(ti.K_neighbors)
+            K_neighbors_int_d = prepare_neighbors_for_gpu(ti.K_neighbors)
         for i in range(iter_a):
             if cfg.backend == "gpu":
                 # ``cp`` already in local scope from the gpu-branch
@@ -670,7 +653,6 @@ class Step0Pipeline:
                 ec_local = watershed_edge_count_gpu(
                     edge_metrics=smoothed,
                     minima=minima,
-                    neighbors=None,
                     stepnum=cfg.watershed_steps,
                     fracmaxh=cfg.watershed_frac,
                     neighbors_int_d=neighbors_int_d,
@@ -693,7 +675,6 @@ class Step0Pipeline:
         return {
             "edge_density": edge_density,
             "iter_a": iter_a,
-            "num_sample_S": num_sample_S,
             "block_size_a": block_size_a,
         }
 
@@ -755,12 +736,10 @@ class Step0Pipeline:
             del vn_d, lh_grad_d, rh_grad_d
         else:
             lh_dist = gradient_geodesic_distance(
-                verts=down_v,
                 vertex_nbors=down_vn,
                 grad_data=lh_grad_edge_down.ravel(),
             )
             rh_dist = gradient_geodesic_distance(
-                verts=down_v,
                 vertex_nbors=down_vn,
                 grad_data=rh_grad_edge_down.ravel(),
             )
@@ -771,7 +750,6 @@ class Step0Pipeline:
             "down_v": down_v,
             "down_f": down_f,
             "down_vf": down_vf,
-            "down_vn": down_vn,
         }
 
     def _subgraph_C(
@@ -807,10 +785,10 @@ class Step0Pipeline:
             lh_in = lh_dist.copy() if need_dist_host else lh_dist
             rh_in = rh_dist.copy() if need_dist_host else rh_dist
             lh_emb_down = diffmap(
-                lh_in, alpha=0.5, n_components=cfg.num_components,
+                lh_in, n_components=cfg.num_components,
             ).astype(np.float32)
             rh_emb_down = diffmap(
-                rh_in, alpha=0.5, n_components=cfg.num_components,
+                rh_in, n_components=cfg.num_components,
             ).astype(np.float32)
         else:
             # CPU diffmap does NOT need a matching ``.copy()`` — its
@@ -823,10 +801,10 @@ class Step0Pipeline:
             # so the host D2H ``need_dist_host`` branch below sees the
             # untouched distances.
             lh_emb_down = diffmap(
-                lh_dist, alpha=0.5, n_components=cfg.num_components,
+                lh_dist, n_components=cfg.num_components,
             ).astype(np.float32)
             rh_emb_down = diffmap(
-                rh_dist, alpha=0.5, n_components=cfg.num_components,
+                rh_dist, n_components=cfg.num_components,
             ).astype(np.float32)
         if need_dist_host:
             if cfg.backend == "gpu":
@@ -890,11 +868,10 @@ class Step0Pipeline:
     # =================================================================
     # Stage 3: persist
     # =================================================================
-    def save(self, result: Step0Result,
-             *, out_dir: Optional[Path] = None) -> Dict[str, Path]:
+    def save(self, result: Step0Result) -> None:
         """Write the artifacts step-3 reads.
 
-        Outputs (under ``out_dir`` or ``cfg.gradients_out_dir``):
+        Outputs (under ``cfg.gradients_out_dir``):
             edge_density.npy                                 (N_cortex,) fp32 — opt-in
             {lh,rh}_gradient_distance_matrix.npy             (N_down, N_down) fp32  — opt-in
             {lh,rh}_emb_<num_comp>_distance_matrix.npy       (N_full, num_comp) fp32
@@ -908,15 +885,13 @@ class Step0Pipeline:
         ``cfg.save_geodesic_distance`` (default False) — these are
         step0 intermediate outputs (~672 MB per hemi per subject) that
         no production downstream step reads. Skipping the dump removes
-        ~53.6 GB of writes on a 40-subject fsa6 run. Toggle on for
-        ad-hoc cohort-comparison archaeology
-        (via the internal step-0 CPU/GPU diff harness).
+        ~53.6 GB of writes on a 40-subject fsa6 run. Its reader is
+        the internal step-0 CPU/GPU diff harness.
         """
-        out_dir = Path(out_dir) if out_dir is not None else self.cfg.gradients_out_dir
+        out_dir = self.cfg.gradients_out_dir
         out_dir.mkdir(parents=True, exist_ok=True)
         nc = self.cfg.num_components
 
-        paths: Dict[str, Path] = {}
         # edge_density.npy is a step-0 intermediate with no production
         # downstream consumer (subgraph B reads it in-memory; the disk
         # artifact is consumed only by the internal CPU/GPU diff harness).
@@ -925,12 +900,9 @@ class Step0Pipeline:
         # intermediate dump.
         if self.cfg.save_edge_density:
             np.save(out_dir / "edge_density.npy", result.edge_density)
-            paths["edge_density"] = out_dir / "edge_density.npy"
         if self.cfg.save_geodesic_distance:
             np.save(out_dir / "lh_gradient_distance_matrix.npy", result.lh_dist)
-            paths["lh_dist"] = out_dir / "lh_gradient_distance_matrix.npy"
             np.save(out_dir / "rh_gradient_distance_matrix.npy", result.rh_dist)
-            paths["rh_dist"] = out_dir / "rh_gradient_distance_matrix.npy"
 
         emb_fmt = self.cfg.emb_output_format
         if emb_fmt in ("npy", "both"):
@@ -938,30 +910,16 @@ class Step0Pipeline:
             rh_npy = out_dir / f"rh_emb_{nc}_distance_matrix.npy"
             np.save(lh_npy, result.lh_emb_up, allow_pickle=False)
             np.save(rh_npy, result.rh_emb_up, allow_pickle=False)
-            paths["lh_emb_npy"] = lh_npy
-            paths["rh_emb_npy"] = rh_npy
-            # Stable aliases — ``lh_emb`` / ``rh_emb`` always point at the
-            # primary output (the format the new readers prefer).
-            paths.setdefault("lh_emb", lh_npy)
-            paths.setdefault("rh_emb", rh_npy)
         if emb_fmt in ("mat", "both"):
             from scipy.io import savemat
             lh_mat = out_dir / f"lh_emb_{nc}_distance_matrix.mat"
             rh_mat = out_dir / f"rh_emb_{nc}_distance_matrix.mat"
             savemat(lh_mat, {"emb": result.lh_emb_up}, do_compression=False)
             savemat(rh_mat, {"emb": result.rh_emb_up}, do_compression=False)
-            paths["lh_emb_mat"] = lh_mat
-            paths["rh_emb_mat"] = rh_mat
-            if emb_fmt == "mat":
-                paths["lh_emb"] = lh_mat
-                paths["rh_emb"] = rh_mat
-        result.out_paths = paths
-        return paths
 
     def run_and_save(self) -> Step0Result:
         result = self.run()
-        if self.cfg.save_artifacts:
-            self.save(result)
+        self.save(result)
         return result
 
     # =================================================================

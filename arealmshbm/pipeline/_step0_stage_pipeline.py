@@ -54,17 +54,14 @@ from __future__ import annotations
 
 import queue
 import threading
-import time
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import numpy as np
-
 from arealmshbm.step0_pipeline import Step0Config, Step0Pipeline
 from arealmshbm.step0_pipeline.pipeline import (
-    Step0Result, _bold_session_getter, _new_per_stage_dict,
+    Step0Result, _new_per_stage_dict,
 )
 
 from ._progress import ProgressEmitter
@@ -82,7 +79,6 @@ class _StageWork:
     from stage A through stage D so all stages see the same
     Step0Inputs (fresh GPU mirrors per subject).
     """
-    sub_idx: int
     sub_id: str
     cfg: Optional[Step0Config] = None
     pipe: Optional[Step0Pipeline] = None
@@ -93,7 +89,6 @@ class _StageWork:
     # before consuming lh_dist / rh_dist on its own stream.
     b_event: Optional[Any] = None
     c_out: Optional[Dict[str, Any]] = None
-    grad_mat: Optional[np.ndarray] = None
     failure: Optional[BaseException] = None
 
 
@@ -113,7 +108,11 @@ class Step0StagePipeline:
             sess_paths_per_sub=...,
             lookahead=...,
         )
-        gradients = coord.run(subjects)
+        coord.run(subjects)
+
+    Each subject's embedding is written under
+    ``project_dir/gradients/sub<id>/`` before the subject reports done;
+    nothing is returned.
     """
 
     def __init__(
@@ -153,7 +152,7 @@ class Step0StagePipeline:
             else ProgressEmitter.disabled()
         )
 
-    def run(self, subjects: List[Any]) -> Dict[str, np.ndarray]:
+    def run(self, subjects: List[Any]) -> None:
         # Backpressure: each queue holds at most 2 subjects so a
         # fast upstream stage can't pile up unbounded buffers.
         # Stage A → B: edge_density (small), 2 in flight is fine
@@ -195,17 +194,13 @@ class Step0StagePipeline:
         for t in threads:
             t.start()
 
-        # Collect from qDone in subject-id order (insertion order of
-        # gradients dict). Each subject ends up here exactly once
-        # (success or failure).
-        gradients: Dict[str, np.ndarray] = {}
+        # Each subject ends up on qDone exactly once (success or
+        # failure).
         failures: List[BaseException] = []
         for _ in range(len(subjects)):
             work: _StageWork = qDone.get()
             if work.failure is not None:
                 failures.append(work.failure)
-                continue
-            gradients[work.sub_id] = work.grad_mat
 
         for t in threads:
             t.join()
@@ -214,19 +209,6 @@ class Step0StagePipeline:
             # Re-raise the first failure; later ones get lost but the
             # stage's stderr printed them.
             raise failures[0]
-
-        # Belt-and-braces: drain the cupy pool one last time. Per-
-        # subject stage-D close() already did this 40×, but the
-        # seed inputs from the driver still pin a few MB.
-        if self.is_gpu:
-            try:
-                import cupy as cp
-                cp.get_default_memory_pool().free_all_blocks()
-                cp.get_default_pinned_memory_pool().free_all_blocks()
-            except Exception:
-                pass
-
-        return gradients
 
     # ─────────────────────────────────────────────────────────────────
     # Stage A — RSFC gradients (subgraph A)
@@ -254,8 +236,7 @@ class Step0StagePipeline:
                     bold_provider=self.prefetcher.get_provider(sub.id),
                     **extra_knob_kwargs,
                 )
-                work = _StageWork(
-                    sub_idx=sub_idx, sub_id=sub.id, cfg=cfg)
+                work = _StageWork(sub_id=sub.id, cfg=cfg)
                 # Subject enters the pipeline here — stage A is the
                 # first to touch it. Emitting at the head of this
                 # iteration tags ``running`` slightly before the
@@ -267,9 +248,8 @@ class Step0StagePipeline:
                     ti = pipe.load_inputs()
                     work.pipe = pipe
                     with ctx:
-                        with _bold_session_getter(cfg, ti) as get_bold:
-                            work.a_out = pipe._subgraph_A(
-                                ti, get_bold, work.per_stage)
+                        work.a_out = pipe._subgraph_A(
+                            ti, cfg.bold_provider, work.per_stage)
                 except BaseException as e:
                     work.failure = e
 
@@ -381,34 +361,16 @@ class Step0StagePipeline:
                         work.b_out["down_vf"],
                         work.per_stage,
                     )
-                    # Assemble the (N_full, n_components) gradient
-                    # matrix the driver returns to step3.
-                    work.grad_mat = np.ascontiguousarray(
-                        np.concatenate(
-                            [d_out["lh_emb_up"], d_out["rh_emb_up"]],
-                            axis=0),
-                        dtype=np.float32,
-                    )
-
-                    # Persist artifacts if requested. We reconstruct a
-                    # ``Step0Result`` ad-hoc so Step0Pipeline.save()
-                    # keeps its existing contract.
-                    if work.cfg.save_artifacts:
-                        result = Step0Result(
-                            edge_density=work.a_out["edge_density"],
-                            lh_dist=work.c_out["lh_dist_h"],
-                            rh_dist=work.c_out["rh_dist_h"],
-                            lh_emb_down=work.c_out["lh_emb_down"],
-                            rh_emb_down=work.c_out["rh_emb_down"],
-                            lh_emb_up=d_out["lh_emb_up"],
-                            rh_emb_up=d_out["rh_emb_up"],
-                            timings={
-                                "load_inputs": work.pipe.timings.get(
-                                    "load_inputs", 0.0),
-                                "per_stage": work.per_stage,
-                            },
-                        )
-                        work.pipe.save(result)
+                    # The embedding files are the hand-off to steps 2
+                    # and 3: written here, before the subject reports
+                    # done.
+                    work.pipe.save(Step0Result(
+                        edge_density=work.a_out["edge_density"],
+                        lh_dist=work.c_out["lh_dist_h"],
+                        rh_dist=work.c_out["rh_dist_h"],
+                        lh_emb_up=d_out["lh_emb_up"],
+                        rh_emb_up=d_out["rh_emb_up"],
+                    ))
 
                     # Close the pipe: drops _inputs reference and
                     # calls free_all_blocks. ``free_all_blocks`` only

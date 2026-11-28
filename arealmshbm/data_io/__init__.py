@@ -61,12 +61,6 @@ def __getattr__(name):
 def __dir__():
     return sorted(set(list(globals()) + __all__))
 
-from .cohort import (
-    CohortManifest, CohortSubject,
-    backfill_cohort_json, cohort_json_path, compute_run_id,
-    read_cohort, resolve_path, relpath_or_abs,
-    write_cohort, write_cohort_partial,
-)
 
 __all__ = [
     "fetch_data",
@@ -76,14 +70,4 @@ __all__ = [
     "save_parcellation",
     "derive_labels",
     "read_surface_gifti",
-    "CohortManifest",
-    "CohortSubject",
-    "backfill_cohort_json",
-    "cohort_json_path",
-    "compute_run_id",
-    "read_cohort",
-    "resolve_path",
-    "relpath_or_abs",
-    "write_cohort",
-    "write_cohort_partial",
 ]

@@ -39,9 +39,6 @@ from . import _kernels
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# Step functions — one per algorithmic step in the MATLAB source.
-# ─────────────────────────────────────────────────────────────────────────
-# ─────────────────────────────────────────────────────────────────────────
 # ConnectSession — block-diagonal hot path.
 #
 # Three structural exploits driven by step-3 invariants:
@@ -75,12 +72,9 @@ class ConnectSession:
     __slots__ = (
         "N", "L", "D", "n_lh", "L_lh",
         # Cached gradient + per-vertex sq norms (session-invariant).
-        "grad_data_f32",                # (N, D) fp32 C-contig — owns memory
         "_grad_lh",                     # (n_lh, D) view
         "_grad_rh",                     # (n_lh, D) view
         "_grad_sq_norms",               # (N,) fp32 — cached
-        "_grad_sq_lh",                  # (n_lh,) view
-        "_grad_sq_rh",                  # (n_lh,) view
         # Per-call scratch.
         "_u_update_lh",                 # (D, L_lh) fp32 — scratch
         "_u_update_rh",                 # (D, L_lh) fp32 — scratch
@@ -94,8 +88,6 @@ class ConnectSession:
         "_spatial_connect_vmf_f32",     # (N, L) fp32 C-contig — output
         "_vmf_lh",                      # (n_lh, L_lh) view (LH-LH block)
         "_vmf_rh",                      # (n_lh, L_lh) view (RH-RH block)
-        # Cast destination for fp64 callers.
-        "_s_lambda_f32_buf",            # (N, L) fp32 C-contig — scratch
     )
 
     def __init__(self,
@@ -126,16 +118,13 @@ class ConnectSession:
         self.n_lh = N // 2
         self.L_lh = L // 2
 
-        # Gradient + LH/RH views.
-        self.grad_data_f32 = g
+        # Gradient LH/RH views.
         self._grad_lh = g[:self.n_lh]
         self._grad_rh = g[self.n_lh:]
         # Per-vertex ||grad[n]||^2 — session-invariant, computed once.
         self._grad_sq_norms = np.ascontiguousarray(
             (g ** 2).sum(axis=1).astype(np.float32),
         )
-        self._grad_sq_lh = self._grad_sq_norms[:self.n_lh]
-        self._grad_sq_rh = self._grad_sq_norms[self.n_lh:]
 
         # Per-half scratch.
         self._u_update_lh = np.empty((D, self.L_lh), dtype=np.float32)
@@ -160,8 +149,6 @@ class ConnectSession:
         self._vmf_lh = vmf[:self.n_lh, :self.L_lh]
         self._vmf_rh = vmf[self.n_lh:, self.L_lh:]
 
-        self._s_lambda_f32_buf = np.empty((N, L), dtype=np.float32)
-
     # ────────── Per-call API ──────────
     def compute(self,
                 s_lambda: np.ndarray,
@@ -170,7 +157,7 @@ class ConnectSession:
 
         Parameters
         ----------
-        s_lambda : (N, L) array, fp32 or fp64.
+        s_lambda : (N, L) array, fp32 contiguous.
             Cross-hemi entries assumed zero (boundary_mask upstream).
 
         Returns
@@ -194,11 +181,8 @@ class ConnectSession:
         np.matmul(self._grad_rh.T, s_lam_rh, out=self._u_update_rh)
 
         # sum_axis0 via numpy: a per-call ~1 ms ufunc on the (non-contig)
-        # block, vs ~7 ms in our naive numba kernel. numpy's reduction
-        # auto-dispatches to a SIMD-vectorized inner loop along the contig
-        # axis (k) within each row. Critical correction: the previous
-        # numba ``sum_axis0_f32`` on the non-C-contig slice forced a
-        # scalar-loop — measured 7-8 ms per hemi (15 ms total / call).
+        # block. numpy's reduction auto-dispatches to a SIMD-vectorized
+        # inner loop along the contig axis (k) within each row.
         np.sum(s_lam_lh, axis=0, dtype=np.float32, out=self._sum_lam_lh)
         np.sum(s_lam_rh, axis=0, dtype=np.float32, out=self._sum_lam_rh)
         _kernels.divide_uupdate_f32(self._u_update_lh, self._sum_lam_lh, self._u_lh)
@@ -218,11 +202,7 @@ class ConnectSession:
         # ── Step 4 (FULL contig assemble — auto-vectorized) ──
         # In-place over the (N, L) C-contig buffer. Cross-hemi cells were
         # pre-filled with -Inf at __init__; the full kernel re-asserts the
-        # mask per-call. Two explicit sub-loops (``_diag2`` variant) measure
-        # within noise of the full kernel here — branch prediction on the
-        # cross-hemi check costs ~0 once warm, and the full kernel keeps
-        # the code path simple. Diag-2 is kept in ``_kernels`` for the
-        # case where pre-fill alone needs to hold (no per-call -Inf write).
+        # mask per-call.
         _kernels.assemble_connect_vmf(
             self._spatial_connect_vmf_f32,
             self._grad_sq_norms,
@@ -233,7 +213,7 @@ class ConnectSession:
 
     # ────────── Internal ──────────
     def _stage_s_lambda(self, s_lambda: np.ndarray) -> np.ndarray:
-        """Get an ``(N, L)`` float32 contiguous view of ``s_lambda``."""
+        """Check ``s_lambda`` is an ``(N, L)`` float32 contiguous array."""
         if s_lambda.shape != (self.N, self.L):
             raise ValueError(
                 f"s_lambda shape mismatch: expected ({self.N}, {self.L}), "
@@ -243,9 +223,7 @@ class ConnectSession:
             s_lambda.flags["C_CONTIGUOUS"] or s_lambda.flags["F_CONTIGUOUS"]
         ):
             return s_lambda
-        if s_lambda.dtype == np.float64 and s_lambda.flags["C_CONTIGUOUS"]:
-            _kernels.cast_f64_to_f32_2d(s_lambda, self._s_lambda_f32_buf)
-            return self._s_lambda_f32_buf
-        np.copyto(self._s_lambda_f32_buf,
-                  np.ascontiguousarray(s_lambda, dtype=np.float32))
-        return self._s_lambda_f32_buf
+        raise ValueError(
+            f"s_lambda must be contiguous float32; got {s_lambda.dtype}, "
+            f"contiguous={s_lambda.flags['C_CONTIGUOUS'] or s_lambda.flags['F_CONTIGUOUS']}"
+        )

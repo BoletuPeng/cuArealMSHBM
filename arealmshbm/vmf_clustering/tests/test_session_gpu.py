@@ -88,7 +88,7 @@ def _run(backend: str, variant: str, save_dir: Optional[Path] = None) -> Run:
     from arealmshbm.step3_pipeline import Step3Pipeline
     saved_lh = saved_rh = None
     with Step3Pipeline(_config(backend, variant)) as pipe:
-        res = pipe.run(time_stages=True)
+        res = pipe.run()
         stages = dict(pipe.timings.get("per_stage_em", {}))
         sl = np.array(res.Params["s_lambda"], copy=True)   # pinned view → own copy
         lh, rh = res.lh_labels.copy(), res.rh_labels.copy()  # save() rewrites them (cMSHBM)

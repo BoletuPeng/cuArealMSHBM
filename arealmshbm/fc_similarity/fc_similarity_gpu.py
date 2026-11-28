@@ -55,9 +55,7 @@ def _demean_norm_columns(x_d: cp.ndarray) -> cp.ndarray:
 
     Backed by a fused RawKernel in ``_kernels_fused_gpu.py`` —
     accumulates mean + SS in fp64 registers across two passes through
-    the fp32 buffer, no fp64 intermediate materialization. ~7x faster
-    than an ``astype(fp64).mean / .sum`` chain at the
-    fc_similarity FC_B shape (T=240, K=7833).
+    the fp32 buffer, no fp64 intermediate materialization.
 
     Precision: ``x_d`` post-demean is bit-identical per cell to
     ``x - float(mean64)``. ``mag`` differs by ≤1 ULP fp32 from an

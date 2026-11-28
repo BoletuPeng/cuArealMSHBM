@@ -4,7 +4,7 @@ Read the step-1 ``group.mat`` written by
 :func:`arealmshbm.ini_params.ini_params.generate_ini_params` (or its
 GPU twin) through ``ini_params/_group_mat_writer.py``. Used by step-2 group-prior
 estimation to seed the EM (``setting_params.dim = size(mtc, 1) - 1``;
-the loader returns mtc verbatim, downstream code slices as needed).
+the loader returns mtc verbatim).
 
 MATLAB source: implicit — step 2's sequential driver loads this via
 ``load(fullfile(work_dir, 'group', 'group.mat'))``.
@@ -32,9 +32,9 @@ def load_group_mtc(group_mat_path: str | Path) -> Dict[str, Any]:
     Returns
     -------
     dict with keys:
-        ``mtc``        : (D+1, L) fp64 array — bytewise-identical to
-                         ``scipy.io.loadmat(...)["mtc"]``. Downstream
-                         consumers slice along axis 0 as ``D = mtc.shape[0] - 1``.
+        ``mtc``        : (D, L) fp64 array — bytewise-identical to
+                         ``scipy.io.loadmat(...)["mtc"]``; ``D`` is the
+                         profile length, the vMF dim is ``D - 1``.
         ``epsil``      : scalar float — vMF concentration init.
         ``lh_labels``  : (N_lh,) int — flattened to 1-D (file stores
                          column vector).
@@ -42,8 +42,8 @@ def load_group_mtc(group_mat_path: str | Path) -> Dict[str, Any]:
 
     Sanity
     ------
-    Asserts ``mtc`` is 2-D and that ``L = mtc.shape[1]`` columns and
-    ``D+1 = mtc.shape[0]`` rows are sane positive integers.
+    Asserts ``mtc`` is 2-D with at least 2 rows (``D``) and 1 column
+    (``L``).
     """
     p = Path(group_mat_path)
     if not p.exists():
@@ -63,11 +63,11 @@ def load_group_mtc(group_mat_path: str | Path) -> Dict[str, Any]:
     mtc = np.asarray(m["mtc"])
     if mtc.ndim != 2:
         raise ValueError(f"group.mat 'mtc' must be 2-D; got shape {mtc.shape}")
-    Dp1, L = mtc.shape
-    if Dp1 < 2 or L < 1:
+    D, L = mtc.shape
+    if D < 2 or L < 1:
         raise ValueError(
             f"group.mat 'mtc' shape {mtc.shape} is degenerate "
-            f"(expected D+1 >= 2 rows and L >= 1 cols)"
+            f"(expected D >= 2 rows and L >= 1 cols)"
         )
 
     epsil_arr = np.asarray(m["epsil"])

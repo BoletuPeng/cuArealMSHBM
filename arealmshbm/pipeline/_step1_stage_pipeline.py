@@ -44,9 +44,9 @@ from __future__ import annotations
 import queue
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -56,6 +56,8 @@ from ._step1_bold_prefetcher import Step1BoldPrefetcher
 
 # Sentinel pushed through each queue to signal end-of-stream.
 _SENTINEL = "__step1_pipeline_sentinel__"
+# Sessions the prime loop keeps decoding ahead of the LEAF consumer.
+_LOOKAHEAD = 8
 
 
 @dataclass
@@ -102,8 +104,8 @@ class Step1GenerateProfilesStagePipeline:
         with Step1BoldPrefetcher(n_workers=8) as prefetcher:
             coord = Step1GenerateProfilesStagePipeline(
                 project_dir=..., bold_paths=..., schedule=...,
-                sess_per_sub=..., out_paths=..., threshold=...,
-                prefetcher=prefetcher, lookahead=8, verbose=True,
+                out_paths=..., threshold=...,
+                prefetcher=prefetcher, verbose=True,
             )
             results = coord.run()  # -> [(sub_id, out_path), ...]
     """
@@ -113,24 +115,18 @@ class Step1GenerateProfilesStagePipeline:
         project_dir: Path,
         schedule: List[Tuple[str, str]],
         bold_paths: Dict[Tuple[str, str], Tuple[List[str], List[str]]],
-        sess_per_sub: Dict[str, int],
         out_paths: Dict[str, Path],
         threshold: float,
         prefetcher: Step1BoldPrefetcher,
-        lookahead: int = 8,
-        write_workers: int = 1,
         verbose: bool = True,
         progress: Optional[ProgressEmitter] = None,
     ):
         self.project_dir = project_dir
         self.schedule = schedule
         self.bold_paths = bold_paths
-        self.sess_per_sub = sess_per_sub
         self.out_paths = out_paths
         self.threshold = threshold
         self.prefetcher = prefetcher
-        self.lookahead = int(lookahead)
-        self.write_workers = int(write_workers)
         self.verbose = bool(verbose)
         # Optional frontend progress sink. Per-subject ``step1``
         # running fires from _prime_loop on the first session of each
@@ -143,15 +139,6 @@ class Step1GenerateProfilesStagePipeline:
             progress if progress is not None
             else ProgressEmitter.disabled()
         )
-        # Pre-compute per-(schedule index) → sess-index-within-subject in
-        # one O(N) pass so _prime_loop's per-iter lookup is O(1) instead
-        # of an O(n_sess) backward scan. Cheap for YS (6 sess/sub) but
-        # noticeable on 1000-sub × 12-sess cohorts.
-        self._sess_idx_table: List[int] = []
-        _sub_counts: Dict[str, int] = {}
-        for sub_id, _sess_id in self.schedule:
-            self._sess_idx_table.append(_sub_counts.get(sub_id, 0))
-            _sub_counts[sub_id] = _sub_counts.get(sub_id, 0) + 1
 
     def run(self) -> List[Tuple[str, Path]]:
         # Backpressure caps.
@@ -168,13 +155,10 @@ class Step1GenerateProfilesStagePipeline:
         qASSEM: queue.Queue = queue.Queue(maxsize=2)
         qDone: queue.Queue = queue.Queue()
 
-        # 1-worker write pool by default — bitpack + blosc2
-        # (LZ4 + bitshuffle) saturates one core. The driver can pass
-        # write_workers=2 if profiling shows the write stage gating
-        # throughput.
-        n_write_workers = max(1, self.write_workers)
+        # One write worker — bitpack + blosc2 (LZ4 + bitshuffle)
+        # saturates one core.
         write_pool = ThreadPoolExecutor(
-            max_workers=n_write_workers,
+            max_workers=1,
             thread_name_prefix="b2nd-write-pl",
         )
 
@@ -190,7 +174,7 @@ class Step1GenerateProfilesStagePipeline:
                 name="step1-stagePOST", daemon=True),
             threading.Thread(
                 target=self._stage_ASSEM,
-                args=(qASSEM, qDone, write_pool, n_write_workers),
+                args=(qASSEM, qDone, write_pool),
                 name="step1-stageASSEM", daemon=True),
         ]
         for t in threads:
@@ -200,7 +184,7 @@ class Step1GenerateProfilesStagePipeline:
         # ASSEM-thread submits the WRITE future and the future
         # resolves (the ASSEM thread blocks on .result() before
         # pushing to qDone).
-        n_subjects = len(self.sess_per_sub)
+        n_subjects = len(self.out_paths)
         out: List[Tuple[str, Path]] = []
         failures: List[BaseException] = []
         for _ in range(n_subjects):
@@ -222,41 +206,40 @@ class Step1GenerateProfilesStagePipeline:
     # ─────────────────────────────────────────────────────────────────
     # Prime loop — main coordination: feed qIN with (sub, sess) work
     # items in schedule order, and maintain the prefetcher's sliding
-    # lookahead window of ``self.lookahead`` items ahead of the LEAF
+    # lookahead window of ``_LOOKAHEAD`` items ahead of the LEAF
     # consumer. Runs in its own thread so qIN's backpressure (maxsize)
     # naturally throttles us to the LEAF consumer's pace.
     # ─────────────────────────────────────────────────────────────────
     def _prime_loop(self, qIN: queue.Queue) -> None:
         # Prime the first lookahead window so the LEAF consumer never
         # blocks on a cold prime.
-        for k in range(min(self.lookahead, len(self.schedule))):
+        for k in range(min(_LOOKAHEAD, len(self.schedule))):
             sub_id, sess_id = self.schedule[k]
             lh_p, rh_p = self.bold_paths[(sub_id, sess_id)]
             self.prefetcher.prime(sub_id, sess_id, lh_p, rh_p)
 
+        n = len(self.schedule)
         try:
             for i, (sub_id, sess_id) in enumerate(self.schedule):
-                # Prime the item `lookahead` steps ahead of i (if any),
-                # so by the time LEAF consumes (i+lookahead)'s entry
+                # Prime the item ``_LOOKAHEAD`` steps ahead of i (if any),
+                # so by the time LEAF consumes (i+_LOOKAHEAD)'s entry
                 # via prefetcher.get(...), it's already decoded.
-                ahead = i + self.lookahead
-                if ahead < len(self.schedule):
+                ahead = i + _LOOKAHEAD
+                if ahead < n:
                     a_sub, a_sess = self.schedule[ahead]
                     a_lh, a_rh = self.bold_paths[(a_sub, a_sess)]
                     self.prefetcher.prime(a_sub, a_sess, a_lh, a_rh)
 
-                n_sess = self.sess_per_sub[sub_id]
-                # O(1) lookup into the precomputed table (built once in
-                # __init__ from the schedule). Robust to mixed-cohort
-                # schedules — no modulo-uniformity assumption.
-                sess_idx_in_sub = self._sess_idx_table[i]
-                is_last = (sess_idx_in_sub + 1 == n_sess)
+                # The schedule is subject-major: a subject's sessions
+                # are one contiguous run of entries, of any length.
+                is_first = i == 0 or self.schedule[i - 1][0] != sub_id
+                is_last = i + 1 == n or self.schedule[i + 1][0] != sub_id
 
                 # First session of this subject enters the pipeline:
                 # tag the user-visible ``step1`` slot as running. Done/
                 # failed transitions happen at the WRITE-future drain
                 # in _stage_ASSEM (the terminal stage for a subject).
-                if sess_idx_in_sub == 0:
+                if is_first:
                     self.progress.emit_state("step1", sub_id, "running")
 
                 work = _SessionWork(
@@ -293,7 +276,7 @@ class Step1GenerateProfilesStagePipeline:
                         sub=work.sub_id,
                         sess=work.sess_id,
                         threshold=self.threshold,
-                        precomputed_bold_runs=bold_runs,
+                        bold_runs=bold_runs,
                     )
                     # Drop the prefetched host buffer eagerly — the
                     # leaf has taken what it needs.
@@ -339,7 +322,7 @@ class Step1GenerateProfilesStagePipeline:
     # ─────────────────────────────────────────────────────────────────
     def _stage_ASSEM(
         self, qASSEM: queue.Queue, qDone: queue.Queue,
-        write_pool: ThreadPoolExecutor, max_inflight_writes: int,
+        write_pool: ThreadPoolExecutor,
     ) -> None:
         # Per-subject session-buffers, keyed by sub_id. The same sub's
         # entries arrive in sess-order (the schedule is sub-major and
@@ -347,9 +330,8 @@ class Step1GenerateProfilesStagePipeline:
         buffers: Dict[
             str, Tuple[List[np.ndarray], List[np.ndarray]],
         ] = {}
-        # Cap on in-flight WRITE futures (= pool worker count). >1 =
-        # parallel blosc2 compression; default 1.
-        pending_writes: List[Tuple[str, Path, Future, np.ndarray]] = []
+        # In-flight WRITE futures: at most one (the pool has one worker).
+        pending_writes: List[Tuple[str, Path, Future]] = []
         # Per-subject "first terminal state wins" set — sub_ids that
         # have already had a terminal (done/failed) state emitted +
         # qDone result pushed. Guards against the buffer-logic edge
@@ -396,7 +378,7 @@ class Step1GenerateProfilesStagePipeline:
             ))
 
         def _drain_oldest_write() -> None:
-            sub_id, op, fut, _arr = pending_writes.pop(0)
+            sub_id, op, fut = pending_writes.pop(0)
             try:
                 fut.result()
                 _finish(sub_id, op)
@@ -474,8 +456,8 @@ class Step1GenerateProfilesStagePipeline:
                         flush=True,
                     )
 
-                # Cap in-flight writes by draining oldest if needed.
-                while len(pending_writes) >= max_inflight_writes:
+                # One write in flight: drain the previous subject's.
+                while pending_writes:
                     _drain_oldest_write()
 
                 # Lazy import — keeps this module independent of
@@ -486,9 +468,7 @@ class Step1GenerateProfilesStagePipeline:
                 fut = write_pool.submit(
                     write_subject_profile_tnd, work.out_path, arr,
                 )
-                pending_writes.append(
-                    (work.sub_id, work.out_path, fut, arr),
-                )
+                pending_writes.append((work.sub_id, work.out_path, fut))
             except BaseException as e:
                 # Pop any partial bucket if the exception fired BEFORE
                 # the inline ``buffers.pop`` above (e.g., shape

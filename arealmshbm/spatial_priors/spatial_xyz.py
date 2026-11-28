@@ -130,8 +130,6 @@ class XyzSession:
         # Output buffer — full sgemm overwrites every cell on every call;
         # the np.empty allocation here is pure scratch.
         "_spatial_xyz_vmf_f32",     # (N, L)    fp32 C-contig — output
-        # Cast destination for fp64 callers.
-        "_s_lambda_f32_buf",        # (N, L)    fp32 C-contig — scratch
     )
 
     def __init__(self, sphere_xyz: np.ndarray, L: int):
@@ -176,9 +174,6 @@ class XyzSession:
         # is correct, no memset needed at construction.
         self._spatial_xyz_vmf_f32 = np.empty((N, L), dtype=np.float32)
 
-        # fp64 caller cast destination.
-        self._s_lambda_f32_buf = np.empty((N, L), dtype=np.float32)
-
     # ────────── Per-call API ──────────
     def compute(self,
                 s_lambda: np.ndarray,
@@ -188,9 +183,8 @@ class XyzSession:
 
         Parameters
         ----------
-        s_lambda : (N, L) array, fp32 or fp64.
-            Soft posterior. Cast to fp32 (zero-copy if already fp32 contig).
-            Cross-hemi entries assumed zero (boundary_mask upstream).
+        s_lambda : (N, L) array, fp32 contiguous.
+            Soft posterior. Cross-hemi entries assumed zero (boundary_mask upstream).
         xyz_gamma : (L,) or (1, L) or (L, 1) array, any float dtype.
             Per-parcel concentration; 0 at inactive parcels (stays 0 across
             calls — monotonic).
@@ -270,17 +264,8 @@ class XyzSession:
 
     # ────────── Internal ──────────
     def _stage_s_lambda(self, s_lambda: np.ndarray) -> np.ndarray:
-        """Get an ``(N, L)`` float32 contiguous view of ``s_lambda``.
-
-        Zero-copy fast paths:
-          * float32 C-contiguous   (the canonical numpy-side pattern)
-          * float32 F-contiguous   (MATLAB→Python boundary; numpy will
-                                    materialize a transposed view that
-                                    sgemm handles natively)
-        Cast paths:
-          * float64 C-contig → ``cast_f64_to_f32_2d`` into _s_lambda_f32_buf
-          * everything else  → ``np.ascontiguousarray(..., float32)`` (copy)
-        """
+        """Check ``s_lambda`` is an ``(N, L)`` float32 contiguous array
+        (C- or F-contiguous; sgemm takes either without a copy)."""
         if s_lambda.shape != (self.N, self.L):
             raise ValueError(
                 f"s_lambda shape mismatch: expected ({self.N}, {self.L}), "
@@ -290,10 +275,7 @@ class XyzSession:
             s_lambda.flags["C_CONTIGUOUS"] or s_lambda.flags["F_CONTIGUOUS"]
         ):
             return s_lambda
-        if s_lambda.dtype == np.float64 and s_lambda.flags["C_CONTIGUOUS"]:
-            _kernels.cast_f64_to_f32_2d(s_lambda, self._s_lambda_f32_buf)
-            return self._s_lambda_f32_buf
-        # Fallback for unusual dtypes / non-contig.
-        np.copyto(self._s_lambda_f32_buf,
-                  np.ascontiguousarray(s_lambda, dtype=np.float32))
-        return self._s_lambda_f32_buf
+        raise ValueError(
+            f"s_lambda must be contiguous float32; got {s_lambda.dtype}, "
+            f"contiguous={s_lambda.flags['C_CONTIGUOUS'] or s_lambda.flags['F_CONTIGUOUS']}"
+        )

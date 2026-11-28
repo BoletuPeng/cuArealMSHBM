@@ -224,7 +224,6 @@ def test_em_body_hits_the_cap_without_converging() -> None:
     assert r.em_iters == 4
     assert r.converged is False
     assert r.m_iters_per_em == [2, 2, 2, 2]
-    assert r.cost_S.dtype == np.float64
 
 
 def test_em_body_rel_matches_the_dense_formula() -> None:

@@ -97,7 +97,6 @@ class DeflateBatch:
             # Keeps the handle alive for the process; the directory also
             # holds the library's own dependencies.
             self._dll_dir = os.add_dll_directory(dirname)
-        self.path = path
         try:
             lib = ctypes.CDLL(path)
             lib.nvcompBatchedDeflateDecompressGetRequiredAlignments
@@ -147,8 +146,6 @@ class DeflateBatch:
         self._check(rc, "nvcompBatchedDeflateDecompressGetRequiredAlignments")
         #: Alignment nvCOMP wants for each chunk's start ADDRESS.
         self.input_align = int(al.input) or 1
-        self.output_align = int(al.output) or 1
-        self.temp_align = int(al.temp) or 1
 
     @staticmethod
     def _check(rc: int, what: str) -> None:

@@ -53,16 +53,12 @@ def _read_b2nd_series_packed(b2nd_path: Path,
     (``series(medial_mask, :) = 0;`` right after ``CBIG_MSHBM_read_fmri``,
     before demean+normalize) — it is the algorithm's MW-zero-before-
     normalize step, not a defensive guard, and it is stated here at
-    the reader for MATLAB parity. Files written by the current step-1
-    binarize writer already satisfy it — ``_apply_mw_zero`` /
+    the reader for MATLAB parity. Files written by the step-1 binarize
+    writer already satisfy it — ``_apply_mw_zero`` /
     ``binarize_mwzero_pack_cupy`` zero MW on the source before packing
-    (clamp landed 2026-05-18) — so on those the pass is a no-op.
-    Stores packed before that clamp are **not** MW-zero and the pass
-    is load-bearing there: an internal sub-001 dev store written
-    2026-05-17 has 1 098 864 of 6 153 714 MW bytes non-zero,
-    measured 2026-09-07. The step-3
-    ``gpu`` backend does not come through here and zeros MW on device
-    instead.
+    — so on those the pass is a no-op; a ``.b2nd`` from any other
+    writer is not guaranteed MW-zero. The step-3 ``gpu`` backend does
+    not come through here and zeros MW on device instead.
 
     Returns ``(packed_NTD_bytes, D_unpacked)``. Raises ``ValueError``
     on shape mismatch.
@@ -112,9 +108,8 @@ def read_gradient_emb(path: str | Path, n_components: int = 100) -> np.ndarray:
       * ``.mat`` — CBIG MATLAB file with an ``emb`` field. Both v5/v7
         (``scipy.io.loadmat``) and v7.3 (``h5py``) are supported.
 
-    The cohort.json roster records the exact path written by step0 /
-    backfilled by :func:`backfill_cohort_json` — there is no runtime
-    sibling-suffix probing.
+    The cohort.json roster records the exact path step0 wrote; there
+    is no runtime sibling-suffix probing.
     """
     p = Path(path)
     suffix = p.suffix.lower()
@@ -158,8 +153,6 @@ def fetch_data(project_dir: str | Path,
                rh_mesh: Dict[str, np.ndarray],
                n_grad_components: int = 100,
                with_gradient: bool = True,
-               *,
-               precomputed_gradient_mat: Optional[np.ndarray] = None,
                ) -> Dict[str, Any]:
     """Single-subject data ingest.
 
@@ -188,15 +181,6 @@ def fetch_data(project_dir: str | Path,
                         ``gradient_mat``. If False (cMSHBM / dMSHBM),
                         the cohort's gradient fields are not read and
                         ``gradient_mat`` is omitted from the output.
-    precomputed_gradient_mat
-                        Optional in-memory ``(N, n_grad_components)``
-                        fp32 array. When set AND ``with_gradient=True``,
-                        the gradient_lh/rh disk reads are skipped and
-                        this array is used verbatim — the in-memory
-                        pass from step0's output to step3's input.
-                        Shape and column count are validated. Cohort
-                        gradient paths still exist on disk as cache;
-                        this just skips re-reading them.
 
     Returns
     -------
@@ -242,16 +226,11 @@ def fetch_data(project_dir: str | Path,
             f"on disk: {b2nd_path}"
         )
 
-    # If a precomputed gradient was provided in-memory, validate it and
-    # skip the disk-read planning entirely. The cohort gradient paths
-    # are still cache on disk (step0 writes them), but the driver's
-    # in-memory pass means we don't re-read for this run.
-    use_precomputed_gradient = (
-        with_gradient and precomputed_gradient_mat is not None
-    )
-    lh_grad_path: Optional[Path] = None
-    rh_grad_path: Optional[Path] = None
-    if with_gradient and not use_precomputed_gradient:
+    gradient_mat: Optional[np.ndarray] = None
+
+    # BOLD: always packed; consumer-side unpack+normalize. The two
+    # gradient reads run on a 2-worker pool beside it.
+    if with_gradient:
         if sub_entry.gradient_lh is None or sub_entry.gradient_rh is None:
             raise ValueError(
                 f"fetch_data: with_gradient=True but cohort "
@@ -260,32 +239,6 @@ def fetch_data(project_dir: str | Path,
             )
         lh_grad_path = resolve_path(project_dir, sub_entry.gradient_lh)
         rh_grad_path = resolve_path(project_dir, sub_entry.gradient_rh)
-    elif use_precomputed_gradient:
-        g = precomputed_gradient_mat
-        if g.ndim != 2 or g.shape[0] != N:
-            raise ValueError(
-                f"fetch_data: precomputed_gradient_mat shape {g.shape} "
-                f"incompatible with N={N} (expected (N, n_grad_components))"
-            )
-        if g.shape[1] < n_grad_components:
-            raise ValueError(
-                f"fetch_data: precomputed_gradient_mat has "
-                f"{g.shape[1]} cols; need >= {n_grad_components}"
-            )
-
-    gradient_mat: Optional[np.ndarray] = None
-
-    # BOLD: always packed; consumer-side unpack+normalize. Gradient
-    # reads run concurrently on a 2-worker pool when both are needed.
-    if use_precomputed_gradient:
-        packed_NTD, D_unpacked = _read_b2nd_series_packed(
-            b2nd_path, T, N, lh_mw, rh_mw,
-        )
-        gradient_mat = np.ascontiguousarray(
-            precomputed_gradient_mat[:, :n_grad_components],
-            dtype=np.float32,
-        )
-    elif with_gradient:
         with ThreadPoolExecutor(max_workers=2) as ex:
             f_lh = ex.submit(read_gradient_emb, lh_grad_path,
                               n_grad_components)

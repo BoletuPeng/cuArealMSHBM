@@ -8,7 +8,7 @@ accumulates set bits into a fp32 buffer, divides by
 ``profiles/avg_profile/{lh,rh}_avg_profile.npy`` pair.
 
 Output format: raw ``.npy`` ``(V_h, D)`` fp32 C-contig. A project-level
-single-shot output (~192 MB / hemi at fsa6 schaefer-400) consumed only
+single-shot output (~192 MB / hemi at fsa6, D = 1175) consumed only
 by :mod:`arealmshbm.ini_params` — no streaming benefit from
 chunked blosc2, no external MATLAB consumer in the Mode-A pipeline.
 
@@ -88,17 +88,6 @@ def _avg_paths(out_dir: Path) -> Tuple[Path, Path]:
     return base / "lh_avg_profile.npy", base / "rh_avg_profile.npy"
 
 
-def _load_subject_packed_TND(b2nd_p: Path) -> Tuple[np.ndarray, int]:
-    """Full-decode one bitpacked subject as ``(T, N, ⌈D/8⌉) uint8`` +
-    the original D.
-
-    ~8× smaller in-RAM footprint than the fp32 path; the trailing host
-    ``np.unpackbits`` + cast is skipped — averaging happens directly
-    over packed bits via :func:`_accum_packed_session_inplace_kernel`.
-    """
-    return read_subject_profile_packed_tnd(b2nd_p)
-
-
 def _discover_and_decode_subjects(
     out_dir: Path,
     num_sub: int,
@@ -130,7 +119,7 @@ def _discover_and_decode_subjects(
     packed_arrs: List[Optional[np.ndarray]] = [None] * len(sub_paths)
     D_vals: List[Optional[int]] = [None] * len(sub_paths)
     with ThreadPoolExecutor(max_workers=min(len(sub_paths), 8)) as pool:
-        futures = [pool.submit(_load_subject_packed_TND, p)
+        futures = [pool.submit(read_subject_profile_packed_tnd, p)
                    for _, p in sub_paths]
         for i, fut in enumerate(futures):
             packed_arrs[i], D_vals[i] = fut.result()

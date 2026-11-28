@@ -360,14 +360,14 @@ extern "C" __global__ void transpose_scale(
 _MODULE_CACHE: dict = {}
 
 
-def get_delta_module(N: int, M: int, tpb: int = DEFAULT_TPB,
-                     cap: int = DEFAULT_CAP):
+def get_delta_module(N: int, M: int, cap: int = DEFAULT_CAP):
     """Compile (and cache) the Δ-stepping module for this graph shape.
 
     The shape parameters are baked in as macros, so the frontier
     bitmasks are statically sized shared arrays and the slot loops
-    unroll; one module per ``(NW, M, tpb, cap)``.
+    unroll; one module per ``(NW, M, cap)`` (``TPB = DEFAULT_TPB``).
     """
+    tpb = DEFAULT_TPB
     if not (1 <= M <= EDGE_SLOTS):
         raise ValueError(
             f"delta-stepping kernel supports valence 1..{EDGE_SLOTS}; got M={M}")
@@ -398,11 +398,8 @@ def get_delta_module(N: int, M: int, tpb: int = DEFAULT_TPB,
 
 def build_edge_table_cupy(vertex_nbors_d: cp.ndarray,
                           grad_data_d: cp.ndarray,
-                          N: int, M: int,
-                          mod=None) -> cp.ndarray:
+                          N: int, mod) -> cp.ndarray:
     """Return the packed ``(N, EDGE_SLOTS, 2)`` int32 edge table."""
-    if mod is None:
-        mod = get_delta_module(N, M)
     tab = cp.empty((N, EDGE_SLOTS, 2), dtype=cp.int32)
     k = mod.get_function("build_edge_table")
     block = 128
@@ -412,15 +409,13 @@ def build_edge_table_cupy(vertex_nbors_d: cp.ndarray,
 
 
 def probe_topology_cupy(vertex_nbors_d: cp.ndarray,
-                        N: int, M: int,
-                        mod=None) -> int:
+                        N: int, M: int) -> int:
     """Flag word over the 1-indexed neighbour table: bit 1 (2) set iff
     some slot lies outside ``[0, N]``, bit 0 (1) iff the listed relation
     is not symmetric; ``0`` for a table the solver accepts. Building the
     module first also applies the shared-memory bound on ``N``.
     """
-    if mod is None:
-        mod = get_delta_module(N, M)
+    mod = get_delta_module(N, M)
     bad = cp.zeros(1, dtype=cp.int32)
     k = mod.get_function("probe_topology")
     block = 128

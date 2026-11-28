@@ -29,7 +29,7 @@ Buffer reference:
     N_active  : active vertex count (rows of masked s_lambda; sub-001 ~74,947)
     N_full    : total vertex count (sub-001 fsaverage6: 81,924)
     M1        : max neighbors per vertex (6 on fsaverage6)
-    K         : number of clusters (Mode A: 300)
+    K         : number of clusters (e.g. 300)
     P         : candidate (m, k) pairs (= nnz(masked theta); sub-001 ~251k)
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
@@ -132,7 +132,7 @@ def v_lambda_potts_closeform_fused_full_lam_f32(
 # ─────────────────────────────────────────────────────────────────────────
 def warmup() -> None:
     """Compile the kernel once with realistic dtypes/shapes. ~30 ms one-shot."""
-    M1, N_active, K, P = 6, 4, 3, 2
+    M1, N_active, K = 6, 4, 3
     N_full = N_active + 2
 
     nbh_NM = np.zeros((N_active, M1), dtype=np.int64)

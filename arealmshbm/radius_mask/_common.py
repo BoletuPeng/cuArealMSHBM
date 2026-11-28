@@ -8,7 +8,7 @@ drift ~1.45x and per-parcel Jaccard collapses to ~0.6 on fsaverage6) in
 one place.
 
 Four helpers:
-    _read_aparc(hemi, atlas_dir=None) -> (V,) int64
+    _read_aparc(hemi) -> (V,) int64
         Resolve & parse a FreeSurfer aparc.annot at
         ``<atlas>/fsaverage6/label/<hemi>.aparc.annot``. Returns labels
         offset by +1 (so precentral=25, postcentral=23, insula=36 — the
@@ -35,7 +35,7 @@ Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Tuple
 
 import numpy as np
 import scipy.sparse as sp
@@ -44,13 +44,12 @@ from ..data_io.annot_io import read_annot_labels
 from ..data_io.load_avg_mesh import atlas_label_dir
 
 
-def _read_aparc(hemi: str,
-                atlas_dir: Optional[str] = None) -> np.ndarray:
+def _read_aparc(hemi: str) -> np.ndarray:
     """Read the fsaverage6 aparc.annot as a (V,) integer label vector
     with MATLAB's 1-indexed convention (insula=36, precentral=25,
     postcentral=23). Unmapped vertices (-1) become 0.
     """
-    p = atlas_label_dir(atlas_dir) / f"{hemi}.aparc.annot"
+    p = atlas_label_dir() / f"{hemi}.aparc.annot"
     if not p.exists():
         raise FileNotFoundError(f"aparc.annot for {hemi} not found: {p}")
     # numpy-only parser; equal to nibabel's ``read_annot(...)[0]``

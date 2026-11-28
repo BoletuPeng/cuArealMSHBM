@@ -69,9 +69,9 @@ class Step0BoldPrefetcher:
             thread_name_prefix="bold-io-driver",
         )
         self._futures: Dict[Tuple[str, int], Future] = {}
-        # Guards _futures dict mutation across compute-side workers
-        # (the dual-stream concurrent step0 driver primes from inside
-        # worker threads after consuming a subject; without this lock
+        # Guards _futures dict mutation across threads (the driver
+        # primes from its own thread, Step0StagePipeline's stage-A
+        # thread primes after consuming a subject; without this lock
         # the ``if key in self._futures`` / ``self._futures[key] = ...``
         # check-then-set could race on duplicate keys).
         self._lock = threading.Lock()
@@ -94,8 +94,8 @@ class Step0BoldPrefetcher:
         sess_paths: List[Tuple[Path, Path]],
     ) -> None:
         """Submit all sessions for one subject. Idempotent on
-        ``(sub_id, sess_idx)``. Thread-safe so the dual-stream concurrent
-        step0 driver can prime from inside compute worker threads."""
+        ``(sub_id, sess_idx)``. Thread-safe so Step0StagePipeline's
+        stage-A thread can prime while the driver holds the prefetcher."""
         with self._lock:
             for sess_offset, paths in enumerate(sess_paths, start=1):
                 key = (sub_id, sess_offset)

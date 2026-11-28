@@ -11,9 +11,10 @@ parameter set used by CBIG step-0
         skip_checks=True, overwrite=True)
 
 That call shows the upstream ``mapalign`` signature; this port exposes
-only ``dist`` / ``alpha`` / ``n_components`` and always returns just the
-embedding array (the ``return_result`` / ``skip_checks`` / ``overwrite``
-knobs are not surfaced).
+only ``dist`` / ``n_components`` (``alpha`` is the constant
+``_ALPHA = 0.5``) and always returns just the embedding array (the
+``return_result`` / ``skip_checks`` / ``overwrite`` knobs are not
+surfaced).
 
 Algorithm (mapalign, ``skip_checks=True, overwrite=True`` branch):
 
@@ -64,10 +65,11 @@ Connectedness precondition:
 
 Memory note:
     For N=12962 the dense fp64 affinity is ~1.35 GB. With
-    ``overwrite=True`` semantics we modify the upcast working copy in
-    place. The original input is left untouched (we always upcast,
-    and the upcast itself produces a new array regardless of input
-    dtype).
+    ``overwrite=True`` semantics the fp64 working array is modified in
+    place: an fp64 input is overwritten, any other dtype is upcast
+    into a new array first. The only caller,
+    :func:`.diffusion_map_repaired.compute_diffusion_map_repaired`,
+    hands in its private fp64 affinity.
 
 Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 """
@@ -78,10 +80,13 @@ import numpy as np
 from scipy.sparse.linalg import eigsh
 
 
+# Anisotropic diffusion exponent of the CBIG call (``alpha=0.5``).
+_ALPHA = 0.5
+
+
 def compute_diffusion_map(
     dist: np.ndarray,
     *,
-    alpha: float = 0.5,
     n_components: int = 100,
 ) -> np.ndarray:
     """Diffusion-map embedding of a dense (dis)similarity matrix.
@@ -92,9 +97,8 @@ def compute_diffusion_map(
         Symmetric, non-negative kernel matrix. In the CBIG step-0
         caller this is the gradient distance matrix in [0, 1]; the
         function treats whatever it gets as the kernel ``L``
-        directly (mirrors mapalign).
-    alpha : float, default 0.5
-        Anisotropic diffusion exponent.
+        directly (mirrors mapalign). An fp64 array is overwritten in
+        place; any other dtype is upcast into a private copy.
     n_components : int, default 100
         Number of non-trivial diffusion components to return.
 
@@ -109,28 +113,21 @@ def compute_diffusion_map(
             f"dist must be a square 2D matrix, got shape {dist.shape}"
         )
     ndim = dist.shape[0]
-    if n_components is None:
-        raise ValueError("n_components must be a positive int")
     if n_components < 1 or n_components >= ndim:
         raise ValueError(
             f"n_components={n_components} out of range for N={ndim}"
         )
 
-    # 1. Upcast to fp64 working copy. We always copy so the caller's
-    #    input is never mutated; this is the closest match to
-    #    mapalign's `overwrite=True` branch given that we need fp64
-    #    precision for the eigensolve regardless of input dtype.
+    # 1. fp64 working array, modified in place (mapalign's
+    #    `overwrite=True` branch).
     L_alpha = np.asarray(dist, dtype=np.float64)
-    if L_alpha is dist:  # already fp64; force a private copy
-        L_alpha = L_alpha.copy()
 
     # 2. Alpha-normalization (mirrors mapalign's dense branch).
-    if alpha > 0:
-        d = L_alpha.sum(axis=1)
-        d_alpha = np.power(d, -alpha)
-        # L_alpha = d_alpha[:, None] * L_alpha; L_alpha = L_alpha * d_alpha[None, :]
-        L_alpha *= d_alpha[:, np.newaxis]
-        L_alpha *= d_alpha[np.newaxis, :]
+    d = L_alpha.sum(axis=1)
+    d_alpha = np.power(d, -_ALPHA)
+    # L_alpha = d_alpha[:, None] * L_alpha; L_alpha = L_alpha * d_alpha[None, :]
+    L_alpha *= d_alpha[:, np.newaxis]
+    L_alpha *= d_alpha[np.newaxis, :]
 
     # 3. Row-stochastic normalization. mapalign computes
     #    `d2 = L_alpha.sum(axis=1)` then forms M = D2^-1 L_alpha. We

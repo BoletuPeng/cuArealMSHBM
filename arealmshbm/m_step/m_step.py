@@ -1,6 +1,6 @@
 """m_step.py
 
-M-step inner-while loop body. Single-subject (Mode A, S=1).
+M-step inner-while loop body. Single subject (S = 1).
 
 The M-step does two things per inner iter:
     1. Update the kappa scalar (vMF concentration) via a 3-D mean-
@@ -106,8 +106,8 @@ def _compute_X_dot_sl_TDL(
 ) -> None:
     """Per-t gemm: ``out_TDL[t] = X[:, t, :].T @ s_lambda``.
 
-    Mirrors the per-t ``X' * s_lambda`` in step3 line 514 (Mode A:
-    S=1). Pre-computed once per M-step call so the inner iter_m loop
+    Mirrors the per-t ``X' * s_lambda`` in step3 line 514 (single
+    subject, S = 1). Pre-computed once per M-step call so the inner iter_m loop
     doesn't recompute it (MATLAB recomputes every iter_m).
 
     The per-t slice ``data_series_NTD[:, t, :]`` is a (N, D) strided

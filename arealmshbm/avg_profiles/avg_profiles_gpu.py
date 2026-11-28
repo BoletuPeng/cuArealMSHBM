@@ -372,7 +372,7 @@ def avg_profiles_gpu(
       of this entry point consumes device buffers -- the disk path
       exists for callers that go on to re-read the ``.npy`` pair or use
       the host arrays -- so retaining the two ``(V_h, D)`` fp32
-      accumulators (~385 MB together at fsa6 / Schaefer-400) would just
+      accumulators (~385 MB together at fsa6, D = 1175) would just
       pin device memory that ``cp.get_default_memory_pool()
       .free_all_blocks()`` could otherwise reclaim. The accumulator's
       result is rebuilt with those fields cleared and its own reference

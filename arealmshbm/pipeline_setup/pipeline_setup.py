@@ -68,7 +68,7 @@ def build_pipeline_setup(theta: np.ndarray,
                          rh_boundary: np.ndarray,
                          lh_vertex_nbors: np.ndarray,
                          rh_vertex_nbors: np.ndarray) -> Dict[str, Any]:
-    """One-stop setup for step-3 EM (Mode A).
+    """One-stop setup for step-3 EM (single subject).
 
     Mirrors MATLAB step3 lines 228-287. Output is a dict ready to merge
     into ``setting_params`` (modulo the scalar params w/c/beta/etc. the

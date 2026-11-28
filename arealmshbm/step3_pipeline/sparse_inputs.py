@@ -664,26 +664,12 @@ def fetch_packed_bold_TND(project_dir: str | Path,
 
 def fetch_gradient(project_dir: str | Path,
                    subid: int,
-                   N: int,
                    n_grad_components: int = 100,
-                   *,
-                   precomputed_gradient_mat: Optional[np.ndarray] = None,
                    ) -> np.ndarray:
-    """``fetch_data``'s ``gradient_mat``, with the same passthrough rule."""
+    """``fetch_data``'s ``gradient_mat``: the subject's two gradient
+    files named in ``cohort.json``, stacked lh over rh."""
     from arealmshbm.data_io.cohort import resolve_path
     from arealmshbm.data_io.fetch_data import read_gradient_emb
-
-    if precomputed_gradient_mat is not None:
-        g = precomputed_gradient_mat
-        if g.ndim != 2 or g.shape[0] != N:
-            raise ValueError(
-                f"fetch_gradient: precomputed_gradient_mat shape {g.shape} "
-                f"incompatible with N={N}")
-        if g.shape[1] < n_grad_components:
-            raise ValueError(
-                f"fetch_gradient: precomputed_gradient_mat has "
-                f"{g.shape[1]} cols; need >= {n_grad_components}")
-        return np.ascontiguousarray(g[:, :n_grad_components], dtype=np.float32)
 
     project_dir = Path(project_dir)
     sub_entry, idx = _cohort_entry(project_dir, subid)
@@ -823,7 +809,6 @@ def load_step3_sparse_cohort(cfg, *, overlap: bool = True,
 
 
 def load_step3_sparse_inputs(cfg,
-                             precomputed_gradient_mat: Optional[np.ndarray] = None,
                              *,
                              overlap: bool = True,
                              cohort: Optional[Step3SparseCohort] = None,
@@ -862,8 +847,6 @@ def load_step3_sparse_inputs(cfg,
     sphere_xyz_bilateral = np.concatenate(
         [lh_sphere["vertices"].T, rh_sphere["vertices"].T], axis=0)
 
-    n_lh = int(lh_inflated["MARS_label"].shape[0])
-    N_expect = n_lh + int(rh_inflated["MARS_label"].shape[0])
     want_grad = bool(cfg.variant.use_connect_prior)
 
     def _cohort():
@@ -880,9 +863,8 @@ def load_step3_sparse_inputs(cfg,
         if not want_grad:
             return None
         t = time.perf_counter()
-        r = fetch_gradient(cfg.project_dir, cfg.subid, N_expect,
-                           cfg.n_grad_components,
-                           precomputed_gradient_mat=precomputed_gradient_mat)
+        r = fetch_gradient(cfg.project_dir, cfg.subid,
+                           cfg.n_grad_components)
         timings["fetch_gradient"] = time.perf_counter() - t
         return r
 

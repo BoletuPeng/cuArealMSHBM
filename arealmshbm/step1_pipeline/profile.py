@@ -56,6 +56,9 @@ from arealmshbm.pipeline.step1_runners import (
 
 
 _DEFAULT_PROJECT = Path("profile_runs/modeA/sub-001")
+# The sample projects' ``step1`` knobs.
+_THRESHOLD = 0.1
+_RADIUS_MM = 30.0
 
 _STAGES = ("generate_profiles", "avg_profiles", "ini_params",
            "radius_mask", "join_writes")
@@ -82,7 +85,7 @@ def _release_cupy_pool(*, pinned: bool = False) -> None:
         cp.get_default_pinned_memory_pool().free_all_blocks()
 
 
-def _stage_inputs(src: Path, dst: Path, sessions: List[str]) -> None:
+def _stage_inputs(src: Path, dst: Path) -> None:
     """Stage the ``data_list/fMRI_list`` BOLD lists from ``src`` into
     ``dst`` for subgraph 1 (generate_profiles). No BOLD bytes are
     copied — the lists carry absolute paths to the source GIFTI, which
@@ -148,6 +151,7 @@ def _run_once(out: Path, args) -> Dict[str, float]:
             project_dir=out,
             subjects=args.subjects,
             sessions=args.sessions,
+            threshold=_THRESHOLD,
             backend=args.backend,
             verbose=False,
             avg_accumulator=avg_acc,
@@ -202,6 +206,7 @@ def _run_once(out: Path, args) -> Dict[str, float]:
                 project_dir=out,
                 lh_labels=lh_labels,
                 rh_labels=rh_labels,
+                radius_mm=_RADIUS_MM,
                 backend=args.backend,
                 verbose=False,
             )
@@ -235,7 +240,7 @@ def profile_run(args) -> Dict[str, object]:
 
     _info(f"  source: {src}")
     _info(f"  out:    {out}")
-    _stage_inputs(src, out, args.sessions)
+    _stage_inputs(src, out)
 
     if args.prewarm and args.backend == "gpu":
         t = time.perf_counter()
@@ -303,8 +308,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                             "ini_params", "radius_mask"])
     p.add_argument("--runs", type=int, default=1)
     p.add_argument("--backend", default="cpu", choices=["cpu", "gpu"],
-                   help="Compute backend (per-subgraph dispatch; falls "
-                        "back to CPU for subgraphs without a GPU port).")
+                   help="Compute backend for all four subgraphs.")
     p.add_argument("--prewarm", action="store_true",
                    help="GPU: pay the one-time RawKernel / cuBLAS / nvCOMP "
                         "costs before the timed runs (the driver does this "

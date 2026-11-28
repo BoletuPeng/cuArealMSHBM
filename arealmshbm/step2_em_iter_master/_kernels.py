@@ -60,7 +60,6 @@ Written by Boletu Peng <zesheng.peng.21@ucl.ac.uk>
 from __future__ import annotations
 
 import math
-from typing import Tuple
 
 import numpy as np
 from numba import njit, prange

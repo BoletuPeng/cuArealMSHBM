@@ -10,9 +10,7 @@ slip through: ``NIFTI_TYPE_FLOAT32`` / ``GZipBase64Binary`` /
 :mod:`arealmshbm.data_io.gifti_bold_gpu` has the whole-subject
 device-stay one.
 
-Two rules: handing :func:`read_surface_gifti` the very pool whose
-worker is calling it would deadlock (detected, demoted to serial), and
-a chunk the strict base64 kernel refuses falls back to
+A chunk the strict base64 kernel refuses falls back to
 ``base64.b64decode``, so line-wrapped payloads still read. The decode's
 own layout is ``(T, N)`` (one darray per row); ``time_major=True``
 returns it as is, the default transposes to ``(N, T)``.
@@ -23,9 +21,8 @@ from __future__ import annotations
 
 import base64
 import re
-import threading
 from pathlib import Path
-from typing import List, Optional, Tuple, Union
+from typing import List, Union
 
 import numpy as np
 
@@ -218,11 +215,11 @@ def _scan_gifti_spans(data: bytes, path):
 def _decode_chunk_range(buf, starts, lens, stage, N, path, t0, t1):
     """Decode timepoints ``[t0, t1)`` into rows of the ``(T, N)`` stage.
 
-    One scratch buffer per call, so concurrent tasks share no state.
+    One scratch buffer per call, so concurrent calls share no state.
     The strict numba base64 kernel decodes a canonical single-line
     payload in place; a chunk it refuses (line-wrapped, pretty-printed,
-    odd length) goes through ``base64.b64decode`` instead, which keeps
-    the accepted-input set of the pre-kernel reader.
+    odd length) goes through ``base64.b64decode`` instead, so the
+    accepted-input set is ``base64.b64decode``'s.
     """
     if t1 <= t0:
         return
@@ -247,63 +244,7 @@ def _decode_chunk_range(buf, starts, lens, stage, N, path, t0, t1):
         copy_row_f32(arr, stage, t)
 
 
-#: How long a submitted chunk task may sit unscheduled before the
-#: calling thread assumes the pool is starved and runs it itself.
-_POOL_STARVE_TIMEOUT = 1.0
-
-
-def _current_thread_belongs_to(pool) -> bool:
-    """Is the calling thread a worker of ``pool``?
-
-    Submitting into a pool and blocking on the result from one of its
-    own workers deadlocks, so :func:`read_surface_gifti` checks and
-    takes the serial path. Two probes, because ``_threads`` is
-    populated only *after* ``Thread.start()``: membership in
-    ``pool._threads``, and the weakref to the owning executor in the
-    worker's ``_args``. Best-effort reads of CPython internals; the
-    authoritative guard is :func:`_await_or_run`.
-    """
-    cur = threading.current_thread()
-    threads = getattr(pool, "_threads", None)
-    if threads:
-        try:
-            if cur in threads:
-                return True
-        except TypeError:      # pragma: no cover — exotic executor
-            pass
-    args = getattr(cur, "_args", None)
-    if args:
-        ref = args[0]
-        try:
-            if callable(ref) and ref() is pool:
-                return True
-        except Exception:      # pragma: no cover — not a weakref
-            pass
-    return False
-
-
-def _await_or_run(futs, tasks):
-    """Collect ``futs``, executing any the pool never scheduled.
-
-    A future still *pending* after :data:`_POOL_STARVE_TIMEOUT` is
-    cancelled and run on the calling thread, so a starved pool cannot
-    hang. ``tasks[i]`` is the ``(fn, args)`` pair behind ``futs[i]``.
-    """
-    from concurrent.futures import TimeoutError as _FTimeout
-
-    for f, (fn, args) in zip(futs, tasks):
-        try:
-            f.result(timeout=_POOL_STARVE_TIMEOUT)
-        except _FTimeout:
-            if f.cancel():
-                fn(*args)
-            else:
-                f.result()
-
-
 def read_surface_gifti(path: PathLike, *,
-                       pool=None,
-                       n_workers: Optional[int] = None,
                        time_major: bool = False,
                        ) -> np.ndarray:
     """Read a surface BOLD ``.func.gii`` → ``(N, T) fp32`` host array
@@ -313,15 +254,6 @@ def read_surface_gifti(path: PathLike, *,
     ----------
     path : str | Path
         A ``.func.gii`` meeting the module docstring's BOLD contract.
-    pool : concurrent.futures.Executor, optional
-        Caller-owned pool to split this **one** file's chunks across;
-        use it only when there is no outer file-level parallelism.
-        **Passing the pool whose worker is making this very call would
-        deadlock**; that is detected and demoted to the serial path.
-    n_workers : int, optional
-        Chunk sub-ranges to split the file into. ``None`` or ``1`` is
-        the serial path (the default, and what the prefetchers use);
-        with ``pool=None`` a private pool is created for the call.
     time_major : bool, optional
         Return ``(T, N)`` -- the decode's own layout, one darray per
         row -- and skip the transpose pass. Step 1 consumes BOLD
@@ -336,8 +268,7 @@ def read_surface_gifti(path: PathLike, *,
     Notes
     -----
     No arithmetic is performed on the payload — base64 and DEFLATE are
-    byte-exact — so every route through this function returns the same
-    bytes.
+    byte-exact.
     """
     with open(path, "rb") as f:
         data = f.read()
@@ -350,38 +281,8 @@ def read_surface_gifti(path: PathLike, *,
     stage = np.empty((T, N), dtype=np.float32)
     out = None if time_major else np.empty((N, T), dtype=np.float32)
 
-    if (pool is None and (n_workers is None or int(n_workers) <= 1)) or (
-            pool is not None and _current_thread_belongs_to(pool)):
-        _decode_chunk_range(buf, starts, lens, stage, N, path, 0, T)
-        if time_major:
-            return stage
-        transpose_f32(stage, out, 0, N)
-        return out
-
-    from concurrent.futures import ThreadPoolExecutor
-
-    nw = int(n_workers) if n_workers else int(
-        getattr(pool, "_max_workers", 4))
-    nw = max(1, min(nw, T))
-    own_pool = None
-    if pool is None:
-        own_pool = ThreadPoolExecutor(
-            max_workers=nw, thread_name_prefix="gifti-chunk")
-        pool = own_pool
-    try:
-        bounds = [int(round(k * T / nw)) for k in range(nw + 1)]
-        tasks = [(_decode_chunk_range,
-                  (buf, starts, lens, stage, N, path, bounds[k],
-                   bounds[k + 1]))
-                 for k in range(nw)]
-        _await_or_run([pool.submit(fn, *a) for fn, a in tasks], tasks)
-        if time_major:
-            return stage
-        nbounds = [int(round(k * N / nw)) for k in range(nw + 1)]
-        ttasks = [(transpose_f32, (stage, out, nbounds[k], nbounds[k + 1]))
-                  for k in range(nw)]
-        _await_or_run([pool.submit(fn, *a) for fn, a in ttasks], ttasks)
-    finally:
-        if own_pool is not None:
-            own_pool.shutdown(wait=True)
+    _decode_chunk_range(buf, starts, lens, stage, N, path, 0, T)
+    if time_major:
+        return stage
+    transpose_f32(stage, out, 0, N)
     return out

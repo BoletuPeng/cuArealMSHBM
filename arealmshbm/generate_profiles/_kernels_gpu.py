@@ -45,6 +45,8 @@ from __future__ import annotations
 import cupy as cp
 import numpy as _np
 
+from .profiles import top_fraction_rank
+
 
 # ─────────────────────────────────────────────────────────────────────
 # Fused binarize + MW-zero + transpose-pack-along-K
@@ -480,16 +482,11 @@ def threshold_top_fraction_exact_cupy(corr_dev: cp.ndarray,
                                        fraction: float) -> float:
     """Value at rank ``round(N*fraction)`` (1-indexed, descending).
 
-    Same rank arithmetic as :func:`profiles._threshold_top_fraction`
-    (half-away-from-zero rounding, clipped to ``[1, numel]``) and the
-    same k-th order statistic -- only the selection algorithm differs.
+    The rank is :func:`profiles.top_fraction_rank`, the k-th order
+    statistic the one :func:`profiles._threshold_top_fraction` takes
+    -- only the selection algorithm differs.
     """
     flat = corr_dev.reshape(-1)
     numel = int(flat.size)
-    raw = numel * float(fraction)
-    if raw >= 0.0:
-        idx_1based = int(_np.floor(raw + 0.5))
-    else:
-        idx_1based = -int(_np.floor(-raw + 0.5))
-    idx_1based = max(1, min(idx_1based, numel))
-    return exact_kth_smallest_cupy(flat, numel - idx_1based)
+    return exact_kth_smallest_cupy(
+        flat, numel - top_fraction_rank(numel, fraction))

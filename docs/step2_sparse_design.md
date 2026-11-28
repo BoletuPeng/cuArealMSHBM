@@ -511,11 +511,7 @@ class Step2SparseSession:
     def inter_closure(self) -> None           # L18 on device
     @property kappa(self) -> float            # last kappa_final (fp64) for logging / Params['kappa']
     def export_params(self) -> Dict[str, Any] # host: sigma/epsil/kappa (1,L) f32, mu (L,D) f32, cost_em (S,) f64,
-                                              # theta (scipy.sparse.csc_matrix (N,L) fp64), ini_val.
-                                              # The theta key is exactly 'theta' — there is no 'theta_csc'
-                                              # spelling anywhere; `_run_em_sparse` reads `exported['theta']`.
-    def sync_to_host(self, fields) -> Dict    # tests/A-B: 's_t_nu' (S,T,L,D), 's_lambda' dense (S,N,L), 'theta' dense (N,L),
-                                              # 's_psi', 'sigma', 'epsil', 'mu', 'lv_sum', 'log_connect', 'scr', 'rmax' (per-subject dense)
+                                              # theta (scipy.sparse.csc_matrix (N,L) fp64).
     timings: Dict[str, float]                 # host wall, seconds, cumulative: session_ctor,
                                               # initialize_state, intra_closure, inter_closure
 ```
@@ -636,8 +632,10 @@ build rather than materialising the matrix this module returns.
   thread. `_run_em_sparse` calls it inline as well, so the per-step API and the
   profiling harnesses (which never prewarm) do not pay it inside `em_total`.
 * `arealmshbm/__init__.py` → PEP-562 lazy re-exports; `step2_pipeline/pipeline.py`
-  imports the CPU session / outer leaves lazily inside the CPU branch so a
-  GPU run never imports `step2_em_outer` (eager `_cdln` numba signatures, ~0.2 s).
+  imports the outer leaves inside the CPU branch, so a GPU run never imports
+  `step2_em_outer`. Both backends import the `step2_em_iter_master` package,
+  whose numba master loads `em_stop_criterion._cdln` (explicit signatures,
+  compiled / cache-loaded at import).
 * Harness: `arealmshbm/step2_pipeline/profile.py` — `--project`, `--backend`,
   `--runs`, `--prewarm`, `--num-sub/--num-session/--num-clusters`, `--beta`;
   prints the per-stage table (load, init, ctor, em_total with per-iter mean and
@@ -648,7 +646,7 @@ build rather than materialising the matrix this module returns.
   `_densify` shim before any comparison, reports per-inter `Record`, `kappa`,
   `sigma`, `epsil`, `mu` deltas, theta argmax flips / support-diff rows /
   dead-alive rows (alive from the packed BOLD), EM iter counts, and run-to-run
-  identity on `(theta.indptr, theta.indices, theta.data)` + every other field.
+  `np.array_equal` identity on every saved field.
 * Docs: this file; `docs/step2_flow_and_subgraphs.md` "Backends" + wall table;
   `docs/step2_em_iter_master_kernel.md` (LOG_EPS20 value, `(N,T,D)` layout);
   `lib/hyperparameters/step2.json` description text for `backend_step2`.

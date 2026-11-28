@@ -16,9 +16,9 @@ one is per-session and returns arrays, the GPU one owns the whole
 subject and writes the file itself.
 
 Public API:
-    compute_profile_arrays(out_dir, sub, sess, …)
+    compute_profile_arrays(out_dir, sub, sess, threshold, bold_runs)
         — CPU only. numba ``@njit(parallel=True)`` kernels + numpy/MKL
-          BLAS. Pure compute, one (sub, sess) at a time, returning
+          BLAS. Pure compute on one (sub, sess)'s decoded runs, returning
           ``(lh_KxV_fp32, rh_KxV_fp32)``; the writer still owes the
           transpose + packbits.
 
@@ -36,6 +36,9 @@ Public API:
 
 Reads:
     <out_dir>/data_list/fMRI_list/{lh,rh}_sub<sub>_sess<sess>.txt
+        (GPU path, when no ``bold_paths`` are handed over; the step-1
+        runner resolves them for both paths)
+    <out_dir>/data_list/censor_list/sub<sub>_sess<sess>.txt (if present)
 
 Writer (caller-side, in the step-1 pipeline):
     <out_dir>/profiles_raw/sub<sub>/sub<sub>.profile.b2nd

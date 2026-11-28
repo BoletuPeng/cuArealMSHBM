@@ -25,8 +25,7 @@ from arealmshbm.step3_pipeline import Step3Config
 class _StubPipe:
     """Records the cohort it was handed; every stage method is a no-op."""
 
-    def __init__(self, cfg, *, precomputed_gradient_mat=None,
-                 sparse_cohort=None):
+    def __init__(self, cfg, *, sparse_cohort=None):
         self.cfg = cfg
         self.sparse_cohort = sparse_cohort
 
@@ -57,7 +56,7 @@ def _configs(n):
 def _coordinator(n):
     return sp.Step3StagePipeline(
         subject_ids=[str(i + 1) for i in range(n)],
-        configs=_configs(n), gradients={},
+        configs=_configs(n),
     )
 
 

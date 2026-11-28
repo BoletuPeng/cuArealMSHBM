@@ -60,7 +60,8 @@ class Step1BoldPrefetcher:
     lh_paths, rh_paths)`` submits one session's runs (idempotent on
     key) → ``get(sub, sess)`` blocks then pops the future (host numpy
     tuples) → ``close()`` drains + frees. Usable as a context manager.
-    Lock is precautionary; the driver consumes from the main thread.
+    The lock is load-bearing: the stage pipeline primes from its
+    prime thread and consumes from its LEAF thread.
     """
 
     def __init__(self, *, n_workers: int = 8):
@@ -106,7 +107,7 @@ class Step1BoldPrefetcher:
         """Block until (sub, sess) is decoded; pop the future.
 
         Returns the list-of-runs the leaf's
-        ``compute_profile_arrays(precomputed_bold_runs=...)`` consumes.
+        ``compute_profile_arrays(bold_runs=...)`` consumes.
         Raises ``KeyError`` (explicit message) if the key was never
         primed or already consumed — surfaces the scheduling bug at the
         consumer.

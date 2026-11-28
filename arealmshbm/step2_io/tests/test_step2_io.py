@@ -25,10 +25,10 @@ from arealmshbm.step2_io import load_group_mtc
 
 def test_load_group_mtc_synthetic(tmp_path: Path) -> None:
     """Construct a minimal synthetic group.mat and verify shapes/values."""
-    Dp1, L = 7, 5
+    D, L = 7, 5
     N_lh, N_rh = 11, 13
     rng = np.random.default_rng(0)
-    mtc = rng.standard_normal((Dp1, L)).astype(np.float64)
+    mtc = rng.standard_normal((D, L)).astype(np.float64)
     epsil = np.array([[0.12345]], dtype=np.float64)
     lh_labels = rng.integers(0, L + 1, size=N_lh, dtype=np.int64).reshape(-1, 1)
     rh_labels = rng.integers(0, L + 1, size=N_rh, dtype=np.int64).reshape(-1, 1)
@@ -47,7 +47,7 @@ def test_load_group_mtc_synthetic(tmp_path: Path) -> None:
     assert set(out.keys()) >= {"mtc", "epsil", "lh_labels", "rh_labels"}
 
     # mtc verbatim, fp64, exact bytewise.
-    assert out["mtc"].shape == (Dp1, L)
+    assert out["mtc"].shape == (D, L)
     assert out["mtc"].dtype == np.float64
     np.testing.assert_array_equal(out["mtc"], mtc)
 

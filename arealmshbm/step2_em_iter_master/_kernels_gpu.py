@@ -13,7 +13,7 @@ Module rules (design §3), all load-bearing:
   into FMAs, and the empty-parcel contract needs IEEE ``0*inf``;
 * CUDA source is **ASCII only** (this box is zh-CN) and NVRTC compiles
   without host headers, so ``INFINITY`` / ``NAN`` are undefined — the
-  bit-pattern helpers ``f_inf`` / ``d_inf`` / ``d_nan`` are used instead;
+  bit-pattern helpers ``f_ninf`` / ``d_inf`` / ``d_nan`` are used instead;
 * **no floating-point atomics**; every reduction is a fixed-shape tree over
   a fixed grid, so a run is bit-reproducible;
 * kernels never allocate — the Session owns every buffer;
@@ -78,7 +78,6 @@ _SRC_HELPERS = r"""
 // =====================================================================
 // Bit-pattern literals (NVRTC has no <math.h> macros).
 // =====================================================================
-__device__ __forceinline__ float  f_inf()  { return __int_as_float(0x7f800000); }
 __device__ __forceinline__ float  f_ninf() { return __int_as_float(0xff800000); }
 __device__ __forceinline__ double d_inf()  { return __longlong_as_double(0x7ff0000000000000ULL); }
 __device__ __forceinline__ double d_nan()  { return __longlong_as_double(0x7ff8000000000000ULL); }
@@ -228,32 +227,6 @@ __device__ double dev_invad(double D, double rbar) {
         f1 = exp(lA1) - rbar;
     }
     return asymp;
-}
-
-// Debug hooks for the unit tests (never used by the Session).
-extern "C" __global__
-void probe_invad(const double* rbar, double* out, double D, int n) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    out[i] = dev_invad(D, rbar[i]);
-}
-extern "C" __global__
-void probe_cdln(const double* k, double* out, double v, int n) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    out[i] = dev_cdln_single(k[i], v);
-}
-extern "C" __global__
-void probe_f32_rn(const double* x, float* out, int n) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    out[i] = f32_rn(x[i]);
-}
-extern "C" __global__
-void probe_f32_to_f64(const float* x, double* out, int n) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    out[i] = f32_to_f64(x[i]);
 }
 """
 
@@ -1639,13 +1612,6 @@ void broadcast_LD(const float* __restrict__ src_LD, float* __restrict__ dst,
 }
 
 extern "C" __global__
-void fill_f32(float* __restrict__ x, float v, long long n)
-{
-    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) x[i] = v;
-}
-
-extern "C" __global__
 void eps_mu_kernel(const float* __restrict__ epsil, const float* __restrict__ mu,
                    float* __restrict__ out, int D, long long n)
 {
@@ -1655,6 +1621,9 @@ void eps_mu_kernel(const float* __restrict__ epsil, const float* __restrict__ mu
 }
 """
 
+
+#: NVRTC options of every module built from this source (module rules above).
+COMPILE_OPTIONS = ("-std=c++17", "-fmad=false")
 
 # ``(key, RawModule)`` published as ONE tuple so a concurrent reader can never
 # observe a module paired with a stale key.  ``module()`` is called from the
@@ -1688,7 +1657,7 @@ def module():
                   .replace("INIT_WARPS_VALUE", str(INIT_WARPS))
                   .replace("INIT_RR_VALUE", str(INIT_RR))
                   .replace("INIT_MAXJ_VALUE", str(INIT_MAXJ)))
-        mod = cp.RawModule(code=src, options=("-std=c++17", "-fmad=false"),
+        mod = cp.RawModule(code=src, options=COMPILE_OPTIONS,
                            backend="nvrtc")
         _MODULE_CELL = (key, mod)
         return mod
@@ -1775,6 +1744,7 @@ def check_dims(D: int, Db: int, L: int, dim: int, D_grad: int) -> None:
 
 __all__ = [
     "module", "warmup_step2_gpu", "grid", "init_dt", "check_dims",
+    "COMPILE_OPTIONS",
     "LOG_EPS20_F32", "EPS_F64",
     "XDOT_BLOCK", "XDOT_MAX_NB", "XDOT_CHUNK", "FUSED_BLOCK",
     "REDUCE_BLOCK", "REDUCE_GRID", "ROW_BLOCK", "INIT_ROWS", "INIT_MAXJ",

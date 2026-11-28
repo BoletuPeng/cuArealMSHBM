@@ -35,10 +35,8 @@ def _distance_to_affinity(dist: np.ndarray) -> np.ndarray:
     D = np.asarray(dist, dtype=np.float64)
     m = float(D.max())
     if m <= 0.0:
-        # Pathological all-zero input — return the identity-like matrix
-        # (every point self-similar, no relations). Downstream eigsh
-        # would still work but the embedding would be degenerate;
-        # surface a clear error instead.
+        # Pathological all-zero input: the affinity would be all-ones
+        # and the embedding degenerate, so refuse it.
         raise ValueError(
             "diffusion_map_repaired: input distance matrix has D.max() <= 0; "
             "cannot construct a meaningful affinity matrix."
@@ -49,7 +47,6 @@ def _distance_to_affinity(dist: np.ndarray) -> np.ndarray:
 def compute_diffusion_map_repaired(
     dist: np.ndarray,
     *,
-    alpha: float = 0.5,
     n_components: int = 100,
 ) -> np.ndarray:
     """Repaired diffusion-map embedding of a precomputed distance matrix.
@@ -64,7 +61,7 @@ def compute_diffusion_map_repaired(
         to ``[0, 1]`` so the diagonal is 0 and the most distant pair
         is 1). The function applies ``A = exp(-D / D.max())`` and
         forwards the result to the standard mapalign pipeline.
-    alpha, n_components : see :func:`compute_diffusion_map`.
+    n_components : see :func:`compute_diffusion_map`.
 
     Returns
     -------
@@ -73,6 +70,5 @@ def compute_diffusion_map_repaired(
     A = _distance_to_affinity(dist)
     return compute_diffusion_map(
         A,
-        alpha=alpha,
         n_components=n_components,
     )

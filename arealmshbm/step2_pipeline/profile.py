@@ -133,7 +133,7 @@ def _run_once(args, out_dir: Path) -> Dict[str, object]:
         "timings": timings,
         "inter_iters": int(res.inter_iters),
         "intra_em_iters_per_inter": list(res.intra_em_iters_per_inter),
-        "em_iters_total": int(getattr(res, "em_iters_total", 0)),
+        "em_iters_total": int(res.em_iters_total),
     }
 
 
@@ -233,17 +233,15 @@ def _report(args, res: Dict[str, object]) -> None:
         intra = r["intra_em_iters_per_inter"]           # type: ignore[index]
         tm = r["timings"]                               # type: ignore[index]
         n_batches = int(sum(intra))                     # type: ignore[arg-type]
-        n_iters = int(r.get("em_iters_total", 0))       # type: ignore[union-attr]
+        n_iters = int(r["em_iters_total"])              # type: ignore[index]
         em = float(tm["em_total"])                      # type: ignore[index]
-        per_iter = (f"{em / n_iters * 1e3:.2f} ms" if n_iters
-                    else "n/a (em_iters_total not reported)")
         _info(f"  [run {i+1}] inter={r['inter_iters']}  "     # type: ignore[index]
               f"intra/inter={list(intra)}  "
               f"EM-body calls={n_batches}  "
               f"EM iters={n_iters}  "
               f"em_total={em:.4f} s  "
-              f"mean/EM-body={em / max(1, n_batches) * 1e3:.2f} ms  "
-              f"mean/EM-iter={per_iter}")
+              f"mean/EM-body={em / n_batches * 1e3:.2f} ms  "
+              f"mean/EM-iter={em / n_iters * 1e3:.2f} ms")
 
     # Loader sub-items (means over warm runs).
     sub_keys = sorted({k for t in warm for k in t                 # type: ignore[union-attr]

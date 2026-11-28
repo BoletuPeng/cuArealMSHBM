@@ -28,16 +28,14 @@ SmoothingGather = Tuple[csr_matrix, np.ndarray]
 
 
 def _hemi_smooth_apply(gather: SmoothingGather,
-                       roi: np.ndarray,        # (N_full,) bool
                        data: np.ndarray,       # (N_full, K) fp64
                        ) -> np.ndarray:        # (N_full, K) fp64
-    """Apply a gather: ``out = (gather_W @ data) * inv_weight_sum``
-    then zero non-ROI rows. SpMV + ufuncs only.
+    """Apply a gather: ``out = (gather_W @ data) * inv_weight_sum``.
+    SpMV + ufuncs only; the caller keeps only the ROI rows.
     """
     gather_W, inv_weight_sum = gather
     out = gather_W @ data
     out *= inv_weight_sum[:, None]
-    out[~roi] = 0.0
     return out
 
 
@@ -88,11 +86,9 @@ def cifti_smoothing(data: np.ndarray,
 
     lh_full = full[:n_lh]
     rh_full = full[n_lh:]
-    lh_roi = cortex_bool[:n_lh]
-    rh_roi = cortex_bool[n_lh:]
 
-    lh_sm = _hemi_smooth_apply(lh_gather, lh_roi, lh_full)
-    rh_sm = _hemi_smooth_apply(rh_gather, rh_roi, rh_full)
+    lh_sm = _hemi_smooth_apply(lh_gather, lh_full)
+    rh_sm = _hemi_smooth_apply(rh_gather, rh_full)
 
     out_full = np.concatenate([lh_sm, rh_sm], axis=0)
     return out_full[cortex_bool].astype(np.float32, copy=False)

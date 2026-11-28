@@ -44,9 +44,9 @@ class TestBoundaryMask:
         rh = rng.random((10, 3)).astype(np.float32)
         return lh, rh
 
-    def test_gMSHBM_block_diagonal(self):
+    def test_block_diagonal(self):
         lh, rh = self._build_inputs()
-        bm = build_step2_boundary_mask(lh, rh, mode="gMSHBM")
+        bm = build_step2_boundary_mask(lh, rh)
         assert bm.shape == (20, 6)
         assert bm.dtype == np.float32
         # Top-left block matches lh.
@@ -57,22 +57,6 @@ class TestBoundaryMask:
         np.testing.assert_array_equal(bm[10:, :3], 0)
         # Bottom-right block matches rh.
         np.testing.assert_array_equal(bm[10:, 3:], rh)
-
-    def test_dMSHBM_matches_gMSHBM_on_bilateral(self):
-        # On bilateral meshes the two arms produce identical output;
-        # this is the documented behavior.
-        lh, rh = self._build_inputs()
-        bm_g = build_step2_boundary_mask(lh, rh, mode="gMSHBM")
-        bm_d = build_step2_boundary_mask(lh, rh, mode="dMSHBM")
-        np.testing.assert_array_equal(bm_g, bm_d)
-
-    def test_invalid_mode(self):
-        # cMSHBM was supported in earlier rounds; now rejected.
-        lh, rh = self._build_inputs()
-        with pytest.raises(ValueError):
-            build_step2_boundary_mask(lh, rh, mode="MSHBM")
-        with pytest.raises(ValueError):
-            build_step2_boundary_mask(lh, rh, mode="cMSHBM")
 
 
 class _PrefetchingLoader(InMemoryProfileLoader):

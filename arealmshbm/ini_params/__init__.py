@@ -4,7 +4,7 @@ Step-1 leaf — vMF initial parameters from a group-level parcellation
 + averaged RSFC profile.
 
 For each parcel l ∈ 1..L: average the L2-normalized profile rows over
-all vertices with that label (column-group sum via one-hot λ exploit),
+all vertices with that label (a label-indexed column-group sum),
 column-renormalize → ``mtc``. Solve ``A_d(ε) = mean inner-product of
 each kept row with its parcel's mtc column`` for ε via the Bessel-ratio
 root finder ``invAd`` (D-1 ≈ 1174). Save mtc, ε, dense one-hot λ, and

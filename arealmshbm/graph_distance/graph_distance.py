@@ -26,8 +26,8 @@ Implementation
 Numba ``@njit(parallel=True)`` with ``prange`` over source vertices.
 Each thread owns one row of the (N, N) distance matrix and runs a
 single-source Dijkstra with its own scratch buffers (binary min-heap +
-position back-reference). The 24-core box runs 24 SSSPs concurrently,
-turning the ~30 s scipy single-thread baseline into a ~2 s run.
+position back-reference). The 24-core box runs 24 SSSPs concurrently
+(~2 s per call; a single-thread scipy solve takes ~30 s).
 
 Edge weights are computed on-the-fly inside the SSSP loop (one fp32
 add + multiply per relaxation), so we don't materialise a CSR weight
@@ -159,8 +159,7 @@ def _scale_inplace(dist, inv):
 # so the kernel itself must be @njit; this wrapper does not add
 # meaningful overhead — Python-side cost is shape validation only.)
 # ─────────────────────────────────────────────────────────────────────────
-def gradient_geodesic_distance(verts: np.ndarray,
-                               vertex_nbors: np.ndarray,
+def gradient_geodesic_distance(vertex_nbors: np.ndarray,
                                grad_data: np.ndarray,
                                ) -> np.ndarray:
     """Build the gradient-weighted graph and return all-pairs
@@ -168,11 +167,6 @@ def gradient_geodesic_distance(verts: np.ndarray,
 
     Parameters
     ----------
-    verts : (N, 3) fp32
-        Vertex coordinates. Currently unused inside the function
-        (graph topology comes from ``vertex_nbors``); kept in the
-        signature to mirror MATLAB's ``sbjMesh`` argument and for an
-        optional shape sanity check.
     vertex_nbors : (N, max_neigh) int32
         1-indexed neighbor table. Slot value ``0`` marks an absent
         neighbor.
@@ -194,9 +188,6 @@ def gradient_geodesic_distance(verts: np.ndarray,
     if grad_data.shape != (N,):
         raise ValueError(
             f"grad_data shape {grad_data.shape} must equal (N,) = ({N},)")
-    if verts.ndim != 2 or verts.shape[0] != N or verts.shape[1] != 3:
-        raise ValueError(
-            f"verts must be (N, 3) = ({N}, 3); got {verts.shape}")
 
     vn = np.ascontiguousarray(vertex_nbors, dtype=np.int32)
     gd = np.ascontiguousarray(grad_data, dtype=np.float32)

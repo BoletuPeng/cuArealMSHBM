@@ -93,7 +93,7 @@ def profile_backend(sub: str, backend: str, *,
     pipe.build_session()
     load_total = pipe.timings.get("load_total", 0.0)
     sess_init = pipe.timings.get("session_init", 0.0)
-    _info(f"  Setup wall:")
+    _info("  Setup wall:")
     _info(f"    load_inputs       {load_total:7.3f} s")
     _info(f"    session_init      {sess_init:7.3f} s")
     for k in ("load_group_prior", "load_spatial_mask", "load_avg_mesh",
@@ -116,7 +116,7 @@ def profile_backend(sub: str, backend: str, *,
             pipe.load_inputs()
             pipe.build_session()
         t0 = time.perf_counter()
-        result = pipe.run(time_stages=True)
+        result = pipe.run()
         em_walls.append(time.perf_counter() - t0)
         last_stage_breakdown = pipe.timings.get("per_stage_em", {})
         last_iters = {
@@ -133,7 +133,7 @@ def profile_backend(sub: str, backend: str, *,
     stages = ["m_step", "spatial_connect_prior", "e_step_lambda_loop",
               "check_connectedness", "spatial_xyz_prior", "em_stop_criterion"]
     em_total = sum(last_stage_breakdown.get(s, 0.0) for s in stages)
-    _info(f"  Per-stage breakdown (last run, sum over intra_em rounds):")
+    _info("  Per-stage breakdown (last run, sum over intra_em rounds):")
     for s in stages:
         v = float(last_stage_breakdown.get(s, 0.0))
         _info(f"    {s:24s} {v:7.3f} s   {_fmt_pct(v, em_total)}")

@@ -19,7 +19,7 @@ from __future__ import annotations
 import cupy as cp
 
 
-# Threads-per-block default for the axis-0 kernels; every value is
+# Threads per block for the axis-0 kernels; every value is
 # bit-neutral, so this is a pure occupancy knob.
 _AXIS0_BLOCK = 256
 
@@ -268,14 +268,12 @@ def _require_c_contiguous(x_d: cp.ndarray) -> None:
             "x_d must be C-contiguous; this kernel mutates it in place.")
 
 
-def fused_demean_norm_columns_cupy(x_d: cp.ndarray,
-                                   *,
-                                   block: int = _AXIS0_BLOCK) -> cp.ndarray:
+def fused_demean_norm_columns_cupy(x_d: cp.ndarray) -> cp.ndarray:
     """Column-wise demean + L2 norm of a (T, K) fp32 device array.
 
-    ``x_d`` is demeaned in place; ``block`` is bit-neutral (one thread
-    per column). Returns the (K,) fp32 norms.
+    ``x_d`` is demeaned in place. Returns the (K,) fp32 norms.
     """
+    block = _AXIS0_BLOCK
     assert x_d.dtype == cp.float32, f"x_d must be fp32, got {x_d.dtype}"
     assert x_d.ndim == 2, f"x_d must be 2D, got {x_d.shape}"
     _require_c_contiguous(x_d)
@@ -306,9 +304,7 @@ def fused_demean_norm_rows_cupy(x_d: cp.ndarray) -> cp.ndarray:
 def fused_div_demean_norm_columns_cupy(
         x_d: cp.ndarray,
         mr_d: cp.ndarray,
-        mc_d: cp.ndarray,
-        *,
-        block: int = _AXIS0_BLOCK) -> cp.ndarray:
+        mc_d: cp.ndarray) -> cp.ndarray:
     """Fused divide-by-(mr⊗mc) + column demean + L2 norm.
 
     Equivalent to the CPU ``_scale_demean_norm_inplace``::
@@ -318,8 +314,9 @@ def fused_div_demean_norm_columns_cupy(
 
     ``x_d`` (T, K) is mutated in place. ``mr_d`` (T,) is staged whole in
     dynamic shared memory, so ``T`` is capped at ``_AXIS0_DIV1W_MAX_T``.
-    ``block`` is bit-neutral. Returns the (K,) fp32 column norms.
+    Returns the (K,) fp32 column norms.
     """
+    block = _AXIS0_BLOCK
     assert x_d.dtype == cp.float32, f"x_d must be fp32, got {x_d.dtype}"
     assert mr_d.dtype == cp.float32, f"mr_d must be fp32, got {mr_d.dtype}"
     assert mc_d.dtype == cp.float32, f"mc_d must be fp32, got {mc_d.dtype}"

@@ -77,16 +77,14 @@ def make_icosphere(num_target_verts, radius=100.0):
         T = 1
     else:
         T = int(math.ceil(math.sqrt((num_target_verts - 2) / 10.0)))
-        if T < 1:
-            T = 1
     radius_f = float(radius)
 
     base_verts, base_faces = _icosahedron_unit_njit()
     n_base_v = base_verts.shape[0]
     n_base_f = base_faces.shape[0]
 
-    # --- Edge enumeration in face-major sorted-pair order (matches old
-    # dict insertion order). edge_lookup is the dict replacement.
+    # --- Edge enumeration in face-major sorted-pair order: edge IDs
+    # are assigned on first encounter, stored in edge_lookup.
     edge_lookup = np.full((n_base_v, n_base_v), -1, dtype=np.int32)
     next_edge_id = 0
     for fi in range(n_base_f):
@@ -207,11 +205,10 @@ def make_icosphere(num_target_verts, radius=100.0):
                 a_id = gid[i, j]
                 b_id = gid[i + 1, j]
                 c_id = gid[i, j + 1]
-                if b_id >= 0 and c_id >= 0:
-                    faces_out[next_face_row, 0] = a_id
-                    faces_out[next_face_row, 1] = b_id
-                    faces_out[next_face_row, 2] = c_id
-                    next_face_row += 1
+                faces_out[next_face_row, 0] = a_id
+                faces_out[next_face_row, 1] = b_id
+                faces_out[next_face_row, 2] = c_id
+                next_face_row += 1
                 if i + j < T - 1:
                     faces_out[next_face_row, 0] = gid[i + 1, j + 1]
                     faces_out[next_face_row, 1] = c_id  # (i, j+1)

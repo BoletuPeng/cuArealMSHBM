@@ -87,8 +87,7 @@ class SubjectProfileLoader:
     Attributes
     ----------
     format : str
-        Always ``"b2nd"`` for the disk-backed loader. Preserved for
-        compatibility with code that branches on loader type.
+        Always ``"b2nd"`` (reported in the pipeline's load log).
     """
 
     def __init__(

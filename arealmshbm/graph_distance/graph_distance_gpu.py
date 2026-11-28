@@ -3,8 +3,8 @@
 GPU implementation of :func:`gradient_geodesic_distance` — same
 precision contract and output shape as the CPU function. Its entry
 point, :func:`gradient_geodesic_distance_gpu_device`, takes the
-neighbour table and gradient already on the device (no ``verts``) and
-returns the matrix as a ``cupy.ndarray``.
+neighbour table and gradient already on the device and returns the
+matrix as a ``cupy.ndarray``.
 
 The solver is the per-source Δ-stepping SSSP in :mod:`._kernels_gpu`;
 its bit-identity with pull Bellman-Ford is pinned by the oracle in
@@ -95,7 +95,7 @@ def _gpu_device_delta(vertex_nbors_d, grad_data_d, *, cap: int):
     )
 
     N, M = int(vertex_nbors_d.shape[0]), int(vertex_nbors_d.shape[1])
-    mod = get_delta_module(N, M, tpb=DEFAULT_TPB, cap=cap)
+    mod = get_delta_module(N, M, cap=cap)
     k_sssp = mod.get_function("sssp_delta_rows")
     k_tr = mod.get_function("transpose_scale")
 
@@ -108,7 +108,7 @@ def _gpu_device_delta(vertex_nbors_d, grad_data_d, *, cap: int):
 
     try:
         delta = _delta_for(grad_data_d, DEFAULT_DELTA_MULT)
-        tab = build_edge_table_cupy(vertex_nbors_d, grad_data_d, N, M, mod)
+        tab = build_edge_table_cupy(vertex_nbors_d, grad_data_d, N, mod)
         gmax_d.fill(0)
         k_sssp(grid, block,
                (work, tab, cp.int32(N), cp.int32(N),

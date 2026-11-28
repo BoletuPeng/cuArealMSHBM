@@ -61,19 +61,6 @@ class Step2Layout:
     csc_row: np.ndarray
     csc_pidx: np.ndarray
 
-    # ── dense <-> P-order conversions ──
-    def scatter(self, x_P: np.ndarray, fill: float = 0.0) -> np.ndarray:
-        """CSR-order ``(P,)`` (or ``(..., P)``) → dense ``(..., N, L)``."""
-        x = np.asarray(x_P)
-        out = np.full(x.shape[:-1] + (self.N, self.L), fill, dtype=x.dtype)
-        out[..., self.p_row, self.col] = x
-        return out
-
-    def gather(self, dense: np.ndarray) -> np.ndarray:
-        """Dense ``(..., N, L)`` → CSR-order ``(..., P)``."""
-        d = np.asarray(dense)
-        return np.ascontiguousarray(d[..., self.p_row, self.col])
-
 
 # ─────────────────────────────────────────────────────────────────────
 # Builders

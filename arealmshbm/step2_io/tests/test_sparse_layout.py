@@ -26,7 +26,9 @@ from arealmshbm.step2_io import build_step2_layout
 from arealmshbm.step2_io.sparse_layout import _finish
 from arealmshbm.step2_io.tests._layout_oracle import (
     build_step2_layout_dense,
+    gather,
     layouts_equal,
+    scatter,
 )
 
 
@@ -90,13 +92,13 @@ def test_scatter_gather_round_trip() -> None:
     lay = build_step2_layout(lh, rh)
     rng = np.random.default_rng(1)
     x = rng.standard_normal(lay.P).astype(np.float32)
-    assert np.array_equal(lay.gather(lay.scatter(x)), x)
+    assert np.array_equal(gather(lay, scatter(lay, x)), x)
     # batched
     xb = rng.standard_normal((3, lay.P)).astype(np.float32)
-    assert np.array_equal(lay.gather(lay.scatter(xb)), xb)
+    assert np.array_equal(gather(lay, scatter(lay, xb)), xb)
     # and the dense image is the mask's support
     dense = _dense_from_blocks(lh, rh)
-    assert np.array_equal(lay.scatter(np.ones(lay.P, np.float64)), dense)
+    assert np.array_equal(scatter(lay, np.ones(lay.P, np.float64)), dense)
 
 
 def test_dtypes_and_int32() -> None:
@@ -199,8 +201,7 @@ def test_bench_layout_matches_the_dense_pipeline_path() -> None:
     lay = build_step2_layout(mat5_stream.read_sparse(p, "lh_boundary"),
                              mat5_stream.read_sparse(p, "rh_boundary"))
     lh_b, rh_b = load_spatial_mask(p)
-    bm = build_step2_boundary_mask(lh_boundary=lh_b, rh_boundary=rh_b,
-                                   mode="gMSHBM")
+    bm = build_step2_boundary_mask(lh_boundary=lh_b, rh_boundary=rh_b)
     assert layouts_equal(lay, build_step2_layout_dense(bm))
     assert lay.N == 81924 and lay.L == 300 and lay.n_lh == 40962
     assert lay.P == int((bm != 0).sum())

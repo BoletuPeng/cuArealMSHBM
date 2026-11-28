@@ -1,17 +1,18 @@
 # Step-2 EM-iter master kernel
 
-The step-2 EM-iter loop body (`backend_step2='cpu'`) is one master
-function, a Python orchestrator over numba `@njit` sub-kernels:
-`arealmshbm.step2_em_iter_master.em_iter_master_kernel_streaming`.
-One call executes one outer EM iter — Phase A (precompute `X_dot_sl`)
+The step-2 EM-iter loop body (`backend_step2='cpu'`) is one master call,
+`arealmshbm.step2_em_iter_master.em_iter_master_kernel_streaming`: a
+Python orchestrator over per-phase numba `@njit` sub-kernels, with the
+two per-subject loops in Python. One call executes one outer EM iter — Phase A (precompute `X_dot_sl`)
 → Phase B (M-step inner while-loop) → Phase C (per-subject
 `spatial_connect`, gMSHBM only) → Phase D (per-subject fused E-step)
 → Phase E (`normalize` + `theta`). Convergence (per-subject cost
 rel-diff) is checked Python-side between master calls.
 
-`Step2EmIterSession.run_iter` is the production wrapper — owns every
-scratch buffer, stages caller-facing arrays at the external/internal
-layout boundary, and dispatches the master.
+`Step2EmIterSession.run_iter` is the production wrapper — the Session
+owns every scratch buffer (`Params` aliases its `s_t_nu` / `s_lambda` /
+`theta` buffers), and `run_iter` checks those aliases and dispatches the
+master.
 
 This document covers:
 
@@ -94,7 +95,7 @@ correctness within the 1e-4 EM-convergence bar.
 | Phase | Reduction                                  | Acc dtype | Rationale                                                          |
 |-------|--------------------------------------------|-----------|---------------------------------------------------------------------|
 | B     | `Σ s_t_nu · X_dot_sl` (kappa_sum)          | **fp64**  | fp32 produces 5e-3 κ rel-diff on the 5.6 M-term reduction.          |
-| B     | `Σ s_lambda` (denom)                       | **fp64**  | fp32 serial acc stagnates past `2^23` (`S·N ≈ 1.3e7` at `S=200` fsa6) — running sum stops growing once ULP exceeds the `~1/L` per-element value; biases denom by ≥8%, propagates 1:1 into `rbar = kappa_sum / denom` and `κ`. The original "<1e-9" cost-rel claim was measured at `S=2–3`. |
+| B     | `Σ s_lambda` (denom)                       | **fp64**  | fp32 serial acc stagnates past `2^23` (`S·N ≈ 1.3e7` at `S=200` fsa6) — running sum stops growing once ULP exceeds the `~1/L` per-element value; biases denom by ≥8%, propagates 1:1 into `rbar = kappa_sum / denom` and `κ`. |
 | B     | col-norm `Σ col²`                          | fp32      | safe — cost rel ≤ 1.6e-9.                                           |
 | B     | cosine drift `Σ new · old`                 | fp32      | bit-identical to fp64 at D=1175.                                    |
 | D     | log_vmf pre-softmax composition            | fp32      | log_vmf + log(θ) + β·log_connect all in fp32; cast to fp64 only at exp(). |
